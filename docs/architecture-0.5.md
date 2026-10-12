@@ -2,7 +2,7 @@
 
 `sy` 0.5 is a clean architectural cut, not an incremental migration of the 0.4 internals. Preserve useful user-facing semantics, but do not preserve internal APIs, transport layers, wire compatibility, or implementation structure solely for compatibility.
 
-The target is one bounded synchronization engine that works across local filesystems, SSH hosts, and eventually object stores.
+The 0.5 scope is one bounded synchronization engine for local filesystems and SSH in both directions, including confined source-link following, transactional type transitions, hardlink preservation, and verified deferred source removal. Object stores, bisync, automatic agent bootstrap, and functional Windows synchronization are outside this release. Windows compilation is not a filesystem capability claim.
 
 This document describes the **target**, not a claim that every contract is implemented. Replacement transactions, identity validation, bounded namespace preflight, and endpoint conformance are release requirements; a passing happy-path transfer is not evidence that these contracts hold.
 
@@ -16,7 +16,7 @@ This document describes the **target**, not a claim that every contract is imple
 6. **Cheap metadata first.** Expensive metadata, hashes, signatures, sparse extents, ACLs, and xattrs are demand-driven.
 7. **Strong end-to-end integrity.** Remote transfers are BLAKE3-verified before commit by default. Size alone is never proof of correctness.
 8. **Deletion is a commit phase.** An incomplete source view can never authorize deletion.
-9. **The source is read-only.** `--remove-source-files` is the only exception and runs only after a confirmed destination commit.
+9. **The source is read-only.** `--remove-source-files` is the only exception and runs after terminal destination completion, strong content/requested-preservation proof, and original source-binding validation.
 10. **SSH is the authentication substrate, not the sync architecture.** Use the user's OpenSSH implementation and configuration rather than embedding a second SSH stack.
 
 ## Target module shape
@@ -56,12 +56,11 @@ src/
   metadata/
   filter/
   integrity/
-  bisync/
   main.rs
   lib.rs
 ```
 
-Legacy `sync/`, `streaming/`, `transport/`, and `sy-remote` are temporary scaffolding only while equivalent 0.5 components come online.
+Delete superseded 0.4 engines, `streaming/`, `transport/`, and `sy-remote` once their required behavior is migrated. Thin direction/CLI adapters may remain; a directory name is not itself evidence of a second engine. `object.rs` and `bootstrap.rs` above describe later extensions, not 0.5 deliverables.
 
 ## Core pipeline
 
@@ -157,6 +156,36 @@ Additional metadata is requested only when policy requires it:
 
 Do not eagerly compute sparse layout, xattrs, ACLs, block signatures, or whole-file hashes for every scan entry.
 
+## Original SOURCE authority
+
+Extend the existing run-owned source root; do not create separate authority systems for scanning, following, exclusion, and removal. One owner retains the original root policy, an authenticated disk-backed observation catalogue, and bounded active native readers. Derived plan, discard, and removal journals reference those original observations rather than establishing competing identities.
+
+Keep three kinds of evidence distinct:
+
+- **Object identity** identifies the observed inode/content object. A genuine opened file owns byte reads and demand-driven preservation.
+- **Binding evidence** records how that object was selected: original directory ancestors, parent/name, and any followed link identities and literal targets. Equal inode/content under a foreign parent is not the original binding.
+- **Completion evidence** records the destination outcome, byte/preservation proof, and outstanding group/subtree/parent barriers. Neither of the first two proves publication or removal eligibility.
+
+### Capture and validation
+
+Capture each considered source name through the original root before filter, ignore, `.git`, depth, comparison, or planning omission. Record the original named kind/identity and opening parent; share directory ancestor records instead of copying a chain into every entry. An excluded or traversal-pruned directory protects its physical subtree without enumerating its descendants. Logical reconciliation paths and physical source bindings remain separate.
+
+Following adds a resolution transcript and effective data observation; it never replaces the original selected binding. Every selected hardlink member retains its own binding even when one opened representative supplies bytes. Link retargeting invalidates the observation even when both targets are hardlinks to the same inode.
+
+Before omission, required data/metadata reads, completion, and eventual unlink, validate the applicable original records. Reopening is permitted to validate recorded provenance, not to adopt a fresh parent, link, or leaf as the original. Byte readers validate the original opened object before and after work; requested preservation belongs to that same observation. Fail with a typed source-change error; retries, if offered, start a new bounded observation attempt rather than repairing old authority.
+
+Catalogue records and derived references have bounded lengths, exact membership/exhaustion, and authentication anchored in trusted run-owned state. Scratch corruption, replacement, truncation, and worker failure are terminal; recomputing a checksum over a changed scratch file does not restore authority. Bound traversal stacks, sort/index buffers, descriptors, and readers. Disk use may scale with names; resident memory and held descriptors must not. Do not retain one FD per source entry or build a whole-tree inode map.
+
+### SOURCE exclusion from destination effects
+
+Completed preflight admits the full destination effect set against original SOURCE observations, including omitted entries. This covers replacement/discard roots and descendants, ordinary deletes, backup publication/retirement, directory metadata, and inode-changing metadata—not just transferred matched files. Names protected by a pruned source directory cannot become discard work. Namespace/binding effects and shared-inode effects require their respective proofs; equal bytes are irrelevant to either.
+
+Use native evidence only within its qualified identity domain. A device/inode pair local to one host is not a cross-host disjointness certificate; a qualified filesystem UUID/file ID may establish object equivalence without establishing parent/name independence. Mount aliases and APFS logical/physical parent differences must not be hidden behind a path-prefix check. Where a potentially overlapping effect cannot be qualified safely, refuse that effect before mutation. Unknown evidence is neither permission nor a blanket refusal of unrelated SSH work already proved safe. Do not introduce a universal filesystem-provider or path-projection framework.
+
+### Root lifetime
+
+Local SOURCE and local PULL destination operations require original operator-address continuity. Remote roots are negotiated held directory authorities: relative operations may survive root relocation, but never adopt a replacement found at the configured spelling. A remote root's former absolute spelling does not automatically move with its FD. Following the operator-selected remote directory-link root is an explicit follow-once classification step; after capture, later operand-link changes cannot redirect the session.
+
 ## Reconciliation
 
 Source and destination entry streams are emitted in deterministic relative-path order and merge-joined in bounded memory.
@@ -179,9 +208,34 @@ Type transitions must be transactional rather than remove-then-create. Until a b
 
 For a nondirectory-to-directory transition, stage the replacement subtree completely, including child work and final metadata, before switching visibility. Child completion inside that private subtree is not destination publication: no child receipt authorizes source removal until the enclosing transaction commits and required finalization succeeds.
 
-The enclosing subtree owns publication through its original held staging-directory authority. After authenticated private preparation, individual source and creator file descriptors may close; do not retain one descriptor per descendant or hardlink group until parent publication. Record exact prepared membership and integrity/preservation evidence in bounded disk-backed manifests, then revalidate the original source observations and prepared namespace before atomic publication. This changes file-descriptor lifetime only for subtree-owned preparation, not ordinary standalone file/group transactions. A visible alias or a cached inode number is never a substitute for owned private staging. Cross-subtree hardlink groups retain one byte population and inode-level metadata policy, and cannot authorize source removal until every enclosing transaction and required group finalization completes.
+The enclosing subtree owns publication through its original held staging-directory authority. After authenticated private preparation, individual source and creator file descriptors may close; do not retain one descriptor per descendant or hardlink group until parent publication. Record exact prepared membership and integrity/preservation evidence in bounded disk-backed manifests, then revalidate the original source observations and prepared namespace before atomic publication. This changes file-descriptor lifetime only for subtree-owned preparation, not ordinary standalone file/group transactions. A visible alias or a cached inode number is never a substitute for owned private staging.
+
+Cross-subtree hardlink groups use one byte population, one inode-level metadata policy, bounded protected parking, and authenticated disk-backed membership/progress. The first selected member supplies ordinary metadata; explicit preservation overrides it. Creation, byte update, replacement, or topology repair uses SOURCE bytes, including quick-equal members; metadata-only/equal groups retain OLD bytes and isolate outside aliases when a write is needed. Every member validates its original source/destination authority, including effect-free members. No source removal is eligible until every member, enclosing subtree, and containing-parent finalization succeeds. Publishing one subtree does not imply whole-group rollback if another fails.
 
 For directory-to-nondirectory replacement, protect excluded descendants and include all discarded descendants in completed preflight's exact deletion accounting. The replacement entry itself is counted as a replacement, not a duplicate delete candidate. Discarding nonempty directory contents requires explicit deletion authorization (`--delete`); an empty entry-kind replacement does not. Apply the threshold before any destination mutation, and assign discarded descendants to the transition transaction so ordinary delete replay cannot remove/count them a second time. Recursive removal is not a shortcut around deletion safety.
+
+A discard catalogue is evidence, not authorization. The controller admits it only after both scans complete, protections and exact thresholds pass, and original SOURCE exclusion succeeds. Bind the exact OLD root and descendant inventory to the original planned transition. Revalidate before exchange, then retire only that authenticated inventory in reverse order through the held OLD authority. Enumeration may detect foreign children; it must never discover additional authorized deletes. Unknown children or displaced OLD bindings retain artifacts and produce an explicit cleanup failure.
+
+The transition states are:
+
+```text
+DIR -> leaf: observed OLD / sealed discard inventory
+             -> complete preflight admission
+             -> prepared and verified leaf
+             -> late SOURCE / OLD / inventory validation
+             -> native exchange
+             -> exact OLD retirement / required finalization
+             -> completion
+
+leaf -> DIR: observed OLD / owned private directory
+             -> bounded child and hardlink preparation
+             -> sealed membership / content / preservation evidence
+             -> private reverse finalization and late validation
+             -> native exchange
+             -> required finalization / completion
+```
+
+A post-exchange retirement/finalization error is a committed failure, not rollback. Child preparation or native inventory checks alone never enable a public transition.
 
 Prefer a backend atomic exchange/replacement primitive where supported. A fallback that renames the old destination to a tombstone and then installs staging has a missing-name window: it is **recoverable multi-step replacement**, not atomic visibility. Enabling that fallback requires an owned on-disk recovery record, identity-checked rollback, process-crash recovery, and safe tombstone cleanup. Recovery must preserve the last valid copy. Automatic destructive recovery requires ownership protected by backend primitives or an explicit exclusive-access assumption; if ownership cannot be established safely, retain recovery artifacts and stop for intervention rather than risk deleting an unrelated replacement. Identity checks alone do not establish atomic ownership under concurrent namespace mutation. Refuse transitions where the supported guarantee cannot be met.
 
@@ -189,9 +243,7 @@ State separately whether an operation provides namespace atomicity, recoverabili
 
 ### Source mutation / TOCTOU
 
-A scan describes a candidate snapshot, not a guarantee that the source remains unchanged. Regular-file transfer must carry the scanned identity into an opened source handle and validate it before reading and at completion using stable metadata available on the platform (for example device/inode/size/mtime/ctime). Requested preservation metadata must belong to that same validated observation. If the source changes, abort staging with a typed error; retries, if offered, must be bounded.
-
-Native copy, reflink, sparse, hashing and streaming paths must preserve this source binding. A path-based optimization that cannot do so must fall back to a safe bounded strategy. Identity checks detect supported races; they do not create snapshot isolation against arbitrary concurrent in-place writers.
+A completed scan is not a filesystem snapshot. Native copy, reflink, sparse, hashing and streaming all consume the original SOURCE observation contract above, including applicable binding transcripts. A path-based optimization that cannot preserve that authority must fall back to a safe bounded strategy. Checks are observational race detection, not snapshot isolation or immunity to arbitrary concurrent in-place writers. The absence of a portable atomic lookup/check/mutation syscall is not by itself a reason to reject an otherwise supported observational contract.
 
 Destination operations carry the expected state (absent or observed identity), revalidated before destructive commit/delete. Portable stat followed by rename/unlink is not atomic compare-and-swap. Use stronger backend preconditions where available and document residual concurrency limits rather than claiming separate syscalls close every race.
 
@@ -215,9 +267,11 @@ After both scans complete successfully:
 
 1. calculate the deletion threshold against the actual eligible destination scope;
 2. reject before mutations if the threshold is exceeded;
-3. perform non-delete work;
-4. replay the delete journal in reverse/depth-safe order;
-5. remove the journal.
+3. perform non-delete work and drain admitted workers;
+4. replay destination deletes in reverse/depth-safe order;
+5. complete required containing-directory finalization;
+6. seal terminal destination evidence, then run eligible deferred SOURCE removal;
+7. close/join journal work and release owned scratch resources.
 
 Excluded descendants protect their ancestors from recursive deletion. Any source scan error disables deletion.
 
@@ -249,19 +303,37 @@ validate source observation and expected destination
   -> verify staged contents and source identity
   -> revalidate expected destination
   -> commit using the declared backend guarantee
-  -> required post-commit finalization, if any
-  -> completion receipt / owned cleanup
+  -> required post-commit finalization and ownership-sensitive cleanup
+  -> qualified completion receipt
 ```
 
 Failure before commit leaves the previous destination intact under the backend's declared guarantee. Staging must be on the required filesystem and remain private even while applying permissive modes/ACLs; use a protected staging namespace or an equivalent proven mechanism.
 
-Xattrs, ACLs and other staging-compatible preservation belong before commit, not in a second visible-path RPC. Remote preservation for a replacement addresses a session-bound transaction/stream identity with bounded payloads and validated phase transitions. Validate effective mode/ACL interactions rather than assuming metadata application order is harmless.
+Xattrs, ACLs and other staging-compatible preservation belong before commit, not in a second visible-path RPC. Remote preservation addresses a session-bound private transaction/stream identity with bounded payloads and validated phase transitions. Assemble metadata as xattrs -> mode/time -> ACL -> explicit-mode proof -> flags. Preserve numeric identities and raw ACL order. Retire private inode anchors before flags; defer flags when they conflict with remaining namespace operations.
 
-Only metadata inherently incompatible with commit belongs afterward, such as selected immutable flags. Distinguish pre-commit abort, committed-but-required-finalization-failed, and cleanup-pending outcomes. A post-commit failure cannot be reported as a rollback. Source removal requires a published-destination receipt covering successful required preservation and verification plus source identity revalidation; deletion must not proceed after failed required main-work finalization. An unchanged file may instead receive a verified-existing-destination receipt with strong content/policy-selected preservation proof and revalidated identities. Quick-check equality alone never authorizes source removal. A private staged-subtree child receipt is neither kind of publication receipt.
+Fulfilled requested state avoids setters. The basic effect-free lane requires xattrs, ACLs and flags all unrequested; an explicitly empty extended request is still a request. Named FILE/parent observation may suffice for this lane but grants no byte, setter, publication, or source-removal authority. Mandatory SOURCE, OLD/default, backup, namespace, or verification reads remain errors when inaccessible: no temporary chmod, fake FD, path setter, or blanket permission-error waiver. Skip OLD metadata reads only for fields precisely superseded by captured SOURCE requests.
+
+Only metadata inherently incompatible with commit belongs afterward, such as selected immutable flags. Distinguish pre-commit abort, committed-but-required-finalization-failed, cleanup-pending, and uncertain completion. A post-commit failure cannot be reported as rollback. Receipts bind original source/destination observations and actual required verification/preservation outcomes; an inode number, item count, NoOp bookkeeping proof, or private-subtree preparation result is not a qualified completion receipt. Destination deletion waits for successful required main work; source removal has the stronger terminal gate below.
 
 Directory metadata finalization remains journal-owned after descendant work and deletion. Metadata-only changes on existing inodes have explicit backend semantics, not a fictitious atomic replacement. Hardlink group metadata has one inode-level owner; group bookkeeping must also be bounded.
 
-The endpoint serializes publication admission against disconnect/cancellation, after commit-time validation and before native publication. Cancellation winning admission aborts owned staging. Closing admission must not block a runtime worker behind filesystem I/O. Already-admitted native work may finish after cancellation; neither interruption nor rollback is guaranteed. Lost acknowledgement or cancellation during admitted work leaves completion uncertain: preserve the source and reconcile safely on retry. Strategies never admit or commit publication independently of the endpoint transaction owner.
+The endpoint serializes mutation admission against disconnect/cancellation after late validation and before the native effect. This includes file publication, directory/link work, backups, in-place metadata, destination deletes, and deferred SOURCE unlink—not just transferred files. Closing admission is nonblocking; do not make terminal actors wait behind filesystem I/O. Work not yet admitted aborts owned staging; admitted native work may finish and cannot be promised interruption or rollback.
+
+The controller/session retains worker and journal ownership until ordinary shutdown has called `close()` and joined all admitted work. Dropping or aborting a future cannot perform an async join. Report operation and drain/cleanup errors together when both occur. Uncertain destination completion or failed required finalization/cleanup prevents SOURCE removal from starting. During removal, cancellation stops new admission but an admitted unlink may finish: retain candidates not yet admitted, join admitted work, and report confirmed/uncertain partial removal without promising rollback. Strategies never admit or commit effects independently of their endpoint owner.
+
+### Deferred SOURCE removal
+
+`--remove-source-files` adds one final phase after required work, worker drain, destination deletion, and every containing-parent/group/subtree finalization. Ordinary local copy need not hash twice, but removal eligibility always requires strong byte parity and successful requested preservation, not quick equality. Qualify either a published destination or a strongly verified existing destination; a same-binding NoOp, unchanged symlink, lost receipt, or uncertain required completion retains SOURCE.
+
+Removal addresses the original selected nondirectory binding. With link following, remove the selected file-link itself only after its original link transcript and effective bytes qualify; do not implicitly unlink the followed referent. Retain directory links. Multiple logical selections reaching one native unlink binding are coalesced, and every associated destination completion must succeed before that one unlink. Different hardlink names remain distinct bindings.
+
+Use a sealed authenticated removal journal referencing the original SOURCE catalogue and exact destination completions. Before the first unlink, validate all eligible destination evidence and all original source bindings. Before each candidate, repeat the late destination check/assertion and source-binding validation, then acquire mutation admission and unlink. No gate is a snapshot: report confirmed removals and uncertain native effects accurately if a later candidate fails. Do not promise rollback of earlier unlinks.
+
+Only confirmed own SOURCE unlinks may advance narrowly defined native continuation state for remaining source aliases/parents. Authenticate that progress and preserve all unaffected identity/binding fields. SOURCE never adopts destination retirement lineage, fresh observations, or SOURCE markers. Cancellation and replay errors retain ownership until admitted work is joined.
+
+For PULL, the server owns original scan observations and its final removal journal. The client sends session-bound terminal destination completion assertions, not paths or freshly supplied identities that establish SOURCE authority. Assertions bind exact source observations, destination membership, strong digest/requested preservation, outcome, and all enclosing barriers. They attest client-side completion; the server cannot independently inspect or certify the client's filesystem. Missing, duplicate, incomplete, wrong-session, or uncertain assertions fail before removal.
+
+A complete sealed assertion set and explicit removal-phase request are required before any server unlink. The client must finish local work before requesting that phase and retain its destination owner through assertion revalidation and joined completion. For each candidate, the server requests a fresh, phase/candidate-bound assertion after the client revalidates that candidate's original destination proof; validating the stored assertion bytes again is not the late destination check. The server then revalidates original SOURCE bindings and exact dependencies before unlink admission. These separate checks remain observational, not cross-host atomicity. A lost final response may follow confirmed server unlinks; report uncertainty and re-observe on a later run, not automatic replay of an old session. Existing 3.12 fetch/group completion ACKs remain read-only and never acquire removal meaning.
 
 ## Local transfer strategies
 
@@ -280,6 +352,8 @@ For sufficiently large files with a low estimated change ratio:
 5. commit staging.
 
 This preserves unchanged extents without making a rolling network delta the default local strategy.
+
+The clone primitive must preserve regular staging ownership. Prefer an FD-to-FD clone into the genuine created stage. A syscall that creates a name but returns no creator FD does not automatically qualify a later pathname open as creator authority; a private directory's mode alone is not exclusivity against same-UID substitution. Without a separately qualified acquisition and failure-cleanup contract, do not advertise that native clone strategy—use whole copy. Unknown named clone results are not wildcard cleanup authority, and OLD clone metadata must not leak into SOURCE replacement semantics. Linux FD cloning is implemented; macOS currently uses native whole copy. Native COW support alone does not establish a usable backend capability.
 
 ### Non-COW changed file
 
@@ -353,8 +427,13 @@ negotiated semantics
 
 Do not guess remote capabilities from endpoint type.
 
-The exact wire contract is **3.12**, with no earlier-minor compatibility,
-including no 3.11 compatibility.
+The implemented exact wire contract is **3.12**, with no earlier-minor compatibility,
+including no 3.11 compatibility. The original SOURCE-reference, remote-follow,
+and terminal PULL-removal contracts below require a coherent new exact minor;
+this document does not assign new frame numbers or claim those features are
+implemented. Negotiate explicit source-follow/removal intent and capabilities;
+refuse unsupported requested semantics before scans or mutation. Do not reinterpret
+3.12 messages or add compatibility shims.
 Version refusal precedes operand classification or filesystem root opening.
 `SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
 
@@ -412,6 +491,10 @@ preflight; any RPC failure prevents all mutation. The query grants no source
 mutation/removal, directory-discard, or copy-links authority. It is mandatory
 in the exact 3.12 contract and requires no additional capability bit.
 
+### Original SOURCE references
+
+In the next exact contract, server-emitted scan entries carry cheap session-bound references into the server-owned observation catalogue. Validate requested paths/members against those records; peer-supplied stat identities or a second scan cannot replace original provenance. Bind fetch, signature/delta, metadata, hardlink, and removal requests to their original observations. Source group/footer completion validates exact membership and closes readers; it remains read-only until the separately admitted terminal removal phase. Bound declaration, assertion, and replay records before allocation and authenticate disk spills.
+
 ### Metadata phase
 
 Exchange cheap ordered metadata first. No block signatures are included in the initial tree walk.
@@ -449,6 +532,8 @@ source reader
 ```
 
 The receiver applies operations directly into staging. Copy operations reference the old destination; literal operations carry bounded data chunks.
+
+Use the same safety contract in both SSH directions. For delta PULL, the client owns the original OLD reader/staging and streams bounded basis signatures to the server; the server produces operations from the referenced original SOURCE observation. Uploading signatures grants no remote filesystem mutation authority. Validate SOURCE around generation and verify the client's reconstructed stage before commit. Whole-file PULL remains the implemented strategy until this caller/protocol path is qualified.
 
 ### Multiplexing
 
@@ -497,7 +582,17 @@ The remote agent must operate relative to a held root directory handle and use p
 - Linux: prefer `openat2` with `RESOLVE_BENEATH` and appropriate no-follow/no-magic-link flags.
 - macOS/other Unix: walk components using directory FDs/openat-style APIs with no-follow semantics.
 
-No remote mutation may follow a preexisting path component outside the negotiated root.
+No peer-selected DATA, METADATA, MUTATION, or policy-query ancestry may escape the held root. Trusted source-policy configuration remains the separate narrow read-only exception described in the handshake contract.
+
+### Confined SOURCE link following
+
+Follow only with explicit source-follow intent. An operator-selected directory symlink may be followed once during root classification; bind the actual directory FD before descendant work. Descendant resolution is SOURCE-only: destination symlinks never become traversal authority. Preserve original link identity/literal target and ancestor bindings in the SOURCE catalogue, validate around omission/read/completion, and enforce bounded path bytes, active depth, link hops, and cycle detection. Failure or unsupported qualification must propagate; do not silently skip a link.
+
+Relative targets resolve through the held-root component stack; `..` cannot pop above its root. Absolute targets keep native/literal meaning, not virtual-root rebasing. Reject escape-and-reentry paths even if lexical normalization would end inside the root. `RESOLVE_IN_ROOT` is not an implementation of these absolute semantics.
+
+Absolute following has one explicit read-only root-address qualification exception: inspect the operator-selected root address, or a native FD-derived candidate spelling, solely to establish that its bounded directory prefix still names the held root. A returned path, lexical prefix, or cached root identity alone is not proof. Native alias/binding qualification must establish that the literal target's prefix denotes this authority; ambiguous aliases or unqualified roots fail. Revalidate qualification on every absolute resolution step, and resolve the remaining suffix only through the held-root resolver.
+
+This exception permits no arbitrary outside-target stat, data/metadata read, or mutation. Do not open an outside referent and then accept it because its inode matches. A root may relocate while relative operations remain valid, but an absolute link using an obsolete root spelling fails unless that spelling still natively qualifies. Changing the configured path never redirects a held session. Supported qualification is backend evidence, not a universal path-projection API.
 
 ## One binary and remote bootstrap
 
@@ -579,13 +674,18 @@ Do not add these unless measurement demonstrates a need:
 - remote path confinement has dedicated escape/symlink tests;
 - interrupted transfers and injected preservation/commit failures prove old destinations survive pre-commit aborts, with explicit post-commit failure outcomes;
 - one endpoint conformance suite exercises local and SSH transaction/capability semantics;
-- source/destination race tests cover native whole copy, reflink, sparse and streaming paths;
+- source/destination race tests cover native whole copy, reflink, sparse and streaming paths, including foreign-parent substitution with the same inode and link retargeting between hardlinked targets;
+- original SOURCE exclusion covers omitted/pruned entries and all admitted destination effects, including backups and directory metadata; unqualified overlapping physical aliases refuse before mutation;
 - namespace preflight proves bounded RAM/descriptors on wide/deep trees and refuses collisions before mutation;
-- supported directory transitions have failure/process-crash recovery coverage;
+- supported directory transitions have failure/process-crash recovery coverage, exact discard ownership, and no cleanup of newly arrived foreign children;
+- private subtree/cross-subtree hardlink tests prove bounded descriptors, exact membership, one byte population, and all publication/finalization barriers;
+- local/PUSH/PULL removal tests prove complete gates, late checks, duplicate-binding dependency handling, own-unlink continuation, and safe lost-receipt/cancellation outcomes;
+- confined following tests cover operator directory links, relative/absolute targets, native root relocation, escape/reentry, cycles, non-UTF-8 names, and qualification failure;
+- scratch authentication and protocol tests reject tampered references, replay/phase errors, invalid lengths, and incomplete terminal assertion sets before effects;
 - Linux/macOS tests exercise supported optional features semantically, not only through compilation;
 - remote files are BLAKE3-verified before commit;
 - deletion tests prove incomplete scans cannot delete data;
 - Miri is run over relevant unsafe/path/reflink components where practical;
-- realistic benchmarks cover many-small-files, huge files, unchanged trees, low/high change ratios, local COW/non-COW, and representative SSH links;
+- realistic benchmarks cover many-small-files, huge files, unchanged trees, low/high change ratios, local COW/non-COW, and representative SSH links in both directions, including whole/delta policy and compression; pin artifacts/environment/cache ordering, verify correctness outside timing, and separate profiling from timed comparisons;
 - release CI builds and verifies static musl Linux binaries;
 - all replaced 0.4 architecture is actually removed rather than left as a second path.
