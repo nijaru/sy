@@ -153,11 +153,13 @@ impl Destination {
         self.validate_all(peer, !open.source_bytes)?;
         let modified = modified(&open.file)?;
         self.flags = open.file.bsd_flags();
+        #[cfg(unix)]
         let basic = MetadataPreservation {
             xattrs: preservation.xattrs.as_deref(),
             acl: preservation.acl.as_deref(),
             bsd_flags: self.flags,
         };
+        #[cfg(unix)]
         if !open.source_bytes && !open.verify_bytes && basic.basic_only() {
             let Some((WireEntryKind::File, identity)) = self.first_observation else {
                 return Err(GroupError::Phase("missing no-op destination observation"));
