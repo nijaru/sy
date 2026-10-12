@@ -8,9 +8,8 @@
 
 Fast file synchronization. Same mental model as rsync, built in Rust.
 
-This README documents the 0.5 rewrite (`v0.5-architecture` branch). The
-published `cargo install sy` crate is still 0.4.x; build from this branch to
-track 0.5.
+Development on `main` tracks the unfinished 0.5 rewrite. The published
+`cargo install sy` crate is still 0.4.x; build from source to track 0.5.
 
 ## Install
 
@@ -18,8 +17,8 @@ track 0.5.
 cargo install sy
 ```
 
-For this 0.5 branch, build from source. ACL preservation is behind the `acl`
-feature and needs the platform ACL libraries (for example `libacl` on Linux):
+For the 0.5 development version, build from source. ACL preservation is behind
+the `acl` feature and needs platform ACL libraries (for example `libacl` on Linux):
 
 ```bash
 cargo build --release --features acl
@@ -49,7 +48,8 @@ sy user@host:/remote /local
 
 - **Parallel** — bounded concurrent transfers, `-j N` to tune
 - **Delta sync** — only transfers changed blocks for large files
-- **COW support** — reflink copies on APFS/Btrfs/XFS
+- **COW updates** — descriptor-bound reflink patching on Linux Btrfs/XFS;
+  macOS currently uses native whole-file copying
 - **rsync-compatible flags** — `--delete`, `--exclude`, `--compress`, `-i`, etc.
 - **SSH sync** — custom v3 protocol over SSH stdin/stdout (`sy __serve`)
 - **Integrity** — BLAKE3-verified transfers; race-checked, staged atomic commits
@@ -139,10 +139,8 @@ sy /source /dest --delete --force-delete
 ### Verification
 
 ```bash
-
 # Verify staged content against the source before commit
 sy /source /dest --verify=after
-
 
 # Audit file integrity without modifying anything
 sy /source /dest --verify=only
@@ -287,7 +285,7 @@ exclude = [".git", "node_modules", "*.pyc"]
 | Feature | sy | rsync |
 |---------|-----|-------|
 | Delta sync | Yes (rolling + BLAKE3) | Yes |
-| COW reflinks | Yes | No |
+| COW reflink updates | Linux Btrfs/XFS | No |
 | SSH sync | Yes | Yes |
 | Wire protocol | Custom | rsync protocol |
 | Incremental | Yes | Yes |
