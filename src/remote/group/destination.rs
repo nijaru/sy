@@ -151,11 +151,48 @@ impl Destination {
         .validate()?;
         let overrides = preservation.request();
         self.validate_all(peer, !open.source_bytes)?;
+        let modified = modified(&open.file)?;
+        self.flags = open.file.bsd_flags();
+        let basic = MetadataPreservation {
+            xattrs: preservation.xattrs.as_deref(),
+            acl: preservation.acl.as_deref(),
+            bsd_flags: self.flags,
+        };
+        if !open.source_bytes && !open.verify_bytes && basic.basic_only() {
+            let Some((WireEntryKind::File, identity)) = self.first_observation else {
+                return Err(GroupError::Phase("missing no-op destination observation"));
+            };
+            let identity = EntryIdentity::from_bytes(identity);
+            if self.rooted.observed_file_preservation_matches_blocking(
+                &self.first,
+                identity,
+                open.file.unix_mode(),
+                modified,
+                &basic,
+            )? {
+                self.rooted.verify_retired_destination_blocking(
+                    &self.first,
+                    EntryKind::File,
+                    identity,
+                )?;
+                let size = self.rooted.file_metadata_blocking(&self.first)?.size;
+                self.rooted.verify_retired_destination_blocking(
+                    &self.first,
+                    EntryKind::File,
+                    identity,
+                )?;
+                return Ok(Preparation::Ready(WireGroupResult::DestinationReady {
+                    publish: false,
+                    size,
+                    digest: None,
+                    literal_bytes: 0,
+                    reused_bytes: 0,
+                }));
+            }
+        }
         if open.retain_metadata || !open.source_bytes {
             self.capture_old()?;
         }
-        let modified = modified(&open.file)?;
-        self.flags = open.file.bsd_flags();
         if !open.source_bytes {
             let old = self
                 .old
@@ -368,7 +405,8 @@ impl Destination {
             operation?;
             // OLD has been consumed and validated. Its first name is now NEW;
             // an unlinked single-link OLD has intentionally no alias lineage.
-            // Only NoOp retains OLD for the final all-binding proof.
+            // Only verified-byte/extended-field NoOp retains OLD; fulfilled
+            // basic metadata uses the original named declaration observations.
             self.old = None;
         }
         self.confirmed = self
@@ -407,13 +445,17 @@ impl Destination {
         } else {
             self.validate_all(peer, true)?;
             self.validate_old()?;
-            let old = self
-                .old
-                .as_ref()
-                .ok_or(GroupError::Phase("missing no-op OLD FD"))?;
+            let identity = if let Some(old) = &self.old {
+                old.identity
+            } else {
+                let Some((WireEntryKind::File, identity)) = self.first_observation else {
+                    return Err(GroupError::Phase("missing no-op destination observation"));
+                };
+                EntryIdentity::from_bytes(identity)
+            };
             Ok(self
                 .rooted
-                .retired_destination_identity_blocking(old.identity)?)
+                .retired_destination_identity_blocking(identity)?)
         }
     }
 

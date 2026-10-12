@@ -95,18 +95,22 @@ async fn close(
 }
 
 fn stamp(path: &Path, mode: u32) {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_600_000_000, 123)).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-fn observation(path: &Path) -> (u64, u32, i64, i64, u64) {
+fn observation(path: &Path) -> (u64, u64, u32, i64, i64, u64, u64, i64, i64) {
     let stat = std::fs::metadata(path).unwrap();
     (
+        stat.dev(),
         stat.ino(),
         stat.mode(),
         stat.ctime(),
         stat.ctime_nsec(),
         stat.nlink(),
+        stat.len(),
+        stat.mtime(),
+        stat.mtime_nsec(),
     )
 }
 
@@ -271,6 +275,40 @@ async fn retained_bytes_isolate_outside_alias_then_matching_group_is_effect_free
             assert_eq!(summary.files_skipped, 2);
         }
     }
+
+    // Default policy retains OLD mode/time. A readable SOURCE lease is still
+    // mandatory, but matching basic preservation must not open TARGET data.
+    stamp(&source.path().join("a"), 0o600);
+    stamp(&destination.path().join("a"), 0o000);
+    assert_eq!(
+        std::fs::File::open(destination.path().join("a"))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "fixture must expose the early OLD data open"
+    );
+    let paths = [
+        source.path().join("a"),
+        source.path().join("b"),
+        destination.path().join("a"),
+        destination.path().join("b"),
+        outside.path().join("alias"),
+    ];
+    let before = paths.each_ref().map(|path| observation(path));
+    let (executor, plan, client, server) =
+        setup(source.path(), destination.path(), Default::default(), false).await;
+    let result = SyncController::new(executor, NonZeroUsize::new(1).unwrap())
+        .execute(plan)
+        .await;
+    let summary = result.unwrap();
+    close(client, server).await;
+    assert_eq!(summary.main_operations, 0);
+    assert_eq!(summary.files_skipped, 2);
+    assert_eq!(summary.files_transferred, 0);
+    assert_eq!(summary.literal_bytes, 0);
+    assert_eq!(summary.reused_bytes, 0);
+    assert_eq!(paths.each_ref().map(|path| observation(path)), before);
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 2);
 }
 
 #[tokio::test]

@@ -56,6 +56,10 @@ impl MetadataPreservation<'_> {
         Ok(())
     }
 
+    pub(crate) const fn basic_only(&self) -> bool {
+        self.xattrs.is_none() && self.acl.is_none() && self.bsd_flags.is_none()
+    }
+
     /// Demand-read only requested fields. Unknown ACL read permission cannot
     /// establish an effect-free request, but does not forbid an exclusive SET.
     #[cfg(unix)]
@@ -66,14 +70,8 @@ impl MetadataPreservation<'_> {
         modified: Option<Timestamp>,
     ) -> Result<bool> {
         let current = stat_fd(file.as_raw_fd())?;
-        if unix_mode.is_some_and(|mode| current.st_mode & 0o7777 != (mode & 0o7777) as libc::mode_t)
-        {
+        if !basic_metadata_matches(&current, unix_mode, modified)? {
             return Ok(false);
-        }
-        if let Some(times) = modified.map(modified_timespecs).transpose()? {
-            if current.st_mtime != times[1].tv_sec || current.st_mtime_nsec != times[1].tv_nsec {
-                return Ok(false);
-            }
         }
         if let Some(xattrs) = self.xattrs {
             use xattr::FileExt;
@@ -187,7 +185,64 @@ pub(super) fn apply_acl_and_verify_mode(
     Ok(())
 }
 
+#[cfg(unix)]
+fn basic_metadata_matches(
+    current: &libc::stat,
+    unix_mode: Option<u32>,
+    modified: Option<Timestamp>,
+) -> Result<bool> {
+    if unix_mode.is_some_and(|mode| current.st_mode & 0o7777 != (mode & 0o7777) as libc::mode_t) {
+        return Ok(false);
+    }
+    if let Some(times) = modified.map(modified_timespecs).transpose()? {
+        if current.st_mtime != times[1].tv_sec || current.st_mtime_nsec != times[1].tv_nsec {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl RootedFs {
+    /// A mode/time-only NoOp needs no data descriptor. Its authority is the
+    /// original expected identity and one held no-follow parent, not a held
+    /// leaf, content parity, or an inode-bound permission to apply setters.
+    #[cfg(unix)]
+    fn observed_basic_metadata_matches_blocking(
+        &self,
+        relative: &RelativePath,
+        expected: EntryIdentity,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<bool> {
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        let observe = || {
+            stat_at_optional(parent.as_raw_fd(), &leaf)?
+                .filter(|current| {
+                    current.st_mode & libc::S_IFMT == libc::S_IFREG
+                        && identity_from_stat(current) == Some(expected)
+                })
+                .ok_or_else(|| RootedFsError::DestinationChanged(relative.as_path().to_path_buf()))
+        };
+        let before = observe()?;
+        if !basic_metadata_matches(&before, unix_mode, modified)? {
+            return Ok(false);
+        }
+        self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
+        let _permit = self.admit_mutation_blocking()?;
+        if !basic_metadata_matches(&observe()?, unix_mode, modified)? {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
+        if self.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        Ok(true)
+    }
+
     /// Compare without setters before deciding whether a shared group needs
     /// isolation. The original expected identity remains authoritative.
     pub(crate) fn observed_file_preservation_matches_blocking(
@@ -202,6 +257,20 @@ impl RootedFs {
         {
             preservation.validate()?;
             modified.map(modified_timespecs).transpose()?;
+            if preservation.basic_only() {
+                let mut lineage = self
+                    .retirement
+                    .lock()
+                    .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
+                let expected = if self.source_path_continuity {
+                    expected
+                } else {
+                    lineage.resolve(expected)?
+                };
+                return self.observed_basic_metadata_matches_blocking(
+                    relative, expected, unix_mode, modified,
+                );
+            }
             self.read_observed_metadata_blocking(relative, EntryKind::File, expected, |file| {
                 if !preservation.matches(file, unix_mode, modified)? {
                     return Ok(false);
@@ -293,6 +362,14 @@ impl RootedFs {
                     ));
                 }
                 return Ok(current);
+            }
+            if kind == EntryKind::File
+                && preservation.basic_only()
+                && self.observed_basic_metadata_matches_blocking(
+                    relative, expected, unix_mode, modified,
+                )?
+            {
+                return Ok(expected);
             }
             let file = self.open_xattr_entry_blocking(relative.as_path(), kind)?;
             if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected) {

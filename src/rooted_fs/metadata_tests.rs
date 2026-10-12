@@ -457,6 +457,188 @@ async fn acl_state_includes_directory_defaults_and_empty_request_removes_them() 
     );
 }
 
+#[tokio::test]
+async fn unreadable_basic_metadata_noop_does_not_claim_other_fields_or_setter_access() {
+    for shared in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("file");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let held = File::open(&path).unwrap();
+        assert_ne!(stat_fd(held.as_raw_fd()).unwrap().st_uid, 0);
+        if shared {
+            std::fs::hard_link(&path, fixture.path().join("outside")).unwrap();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            File::open(&path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+        let before = stat_fd(held.as_raw_fd()).unwrap();
+        let expected = rooted
+            .path_identity_blocking(&relative())
+            .unwrap()
+            .unwrap()
+            .1;
+        let modified =
+            Timestamp::new(before.st_mtime, before.st_mtime_nsec.try_into().unwrap()).unwrap();
+        for _ in 0..2 {
+            assert!(rooted
+                .observed_file_preservation_matches_blocking(
+                    &relative(),
+                    expected,
+                    Some(0),
+                    Some(modified),
+                    &MetadataPreservation::default()
+                )
+                .unwrap());
+            assert_eq!(
+                rooted
+                    .apply_observed_preservation_blocking(
+                        &relative(),
+                        EntryKind::File,
+                        expected,
+                        Some(0),
+                        Some(modified),
+                        &MetadataPreservation::default()
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+        // An explicit empty exact set still requires metadata READ authority;
+        // a mode mismatch still needs a genuine inode-bound setter descriptor.
+        for (mode, preservation) in [
+            (
+                0,
+                MetadataPreservation {
+                    xattrs: Some(&[]),
+                    ..Default::default()
+                },
+            ),
+            (0o600, MetadataPreservation::default()),
+        ] {
+            assert!(matches!(rooted.apply_observed_preservation_blocking(
+                &relative(), EntryKind::File, expected, Some(mode), Some(modified), &preservation
+            ), Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied));
+        }
+        assert!(staging::same_observation(
+            &before,
+            &stat_fd(held.as_raw_fd()).unwrap()
+        ));
+        let admission = Arc::new(PublicationAdmission::default());
+        let mut rooted = rooted;
+        rooted.bind_session_mutations(Arc::clone(&admission), false);
+        admission.close();
+        assert!(matches!(
+            rooted.observed_file_preservation_matches_blocking(
+                &relative(),
+                expected,
+                Some(0),
+                Some(modified),
+                &MetadataPreservation::default()
+            ),
+            Err(RootedFsError::CommitCancelled)
+        ));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn basic_noop_cannot_adopt_a_foreign_parent_with_the_same_original_inode() {
+    for compare in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        for name in ["parent", "foreign"] {
+            std::fs::create_dir(fixture.path().join(name)).unwrap();
+        }
+        let path = RelativePath::new("parent/file").unwrap();
+        std::fs::write(fixture.path().join(path.as_path()), b"original bytes").unwrap();
+        std::fs::hard_link(
+            fixture.path().join(path.as_path()),
+            fixture.path().join("foreign/file"),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            fixture.path().join(path.as_path()),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
+        let expected = rooted.path_identity_blocking(&path).unwrap().unwrap().1;
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        rooted.pause_mutation_at(
+            0,
+            PublicationPause {
+                point: PublicationPausePoint::AfterAdmission,
+                reached: reached_tx,
+                resume: resume_rx,
+            },
+        );
+        let operation_root = rooted.clone();
+        let operation_path = path.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            if compare {
+                operation_root
+                    .observed_file_preservation_matches_blocking(
+                        &operation_path,
+                        expected,
+                        Some(0),
+                        None,
+                        &MetadataPreservation::default(),
+                    )
+                    .map(|_| ())
+            } else {
+                operation_root
+                    .apply_observed_preservation_blocking(
+                        &operation_path,
+                        EntryKind::File,
+                        expected,
+                        Some(0),
+                        None,
+                        &MetadataPreservation::default(),
+                    )
+                    .map(|_| ())
+            }
+        });
+        let paused = tokio::time::timeout(Duration::from_secs(5), reached_rx).await;
+        std::fs::rename(
+            fixture.path().join("parent"),
+            fixture.path().join("held-parent"),
+        )
+        .unwrap();
+        std::fs::rename(
+            fixture.path().join("foreign"),
+            fixture.path().join("parent"),
+        )
+        .unwrap();
+        // Directory renames preserve the leaf's complete original identity.
+        assert_eq!(
+            rooted.path_identity_blocking(&path).unwrap(),
+            Some((EntryKind::File, expected))
+        );
+        let _ = resume_tx.send(());
+        assert!(matches!(paused, Ok(Ok(()))));
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(RootedFsError::DestinationChanged(_))
+        ));
+        assert_eq!(
+            rooted.path_identity_blocking(&path).unwrap(),
+            Some((EntryKind::File, expected))
+        );
+        std::fs::set_permissions(
+            fixture.path().join(path.as_path()),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(fixture.path().join("held-parent/file")).unwrap(),
+            b"original bytes"
+        );
+    }
+}
+
 fn relative() -> RelativePath {
     RelativePath::new("file").unwrap()
 }

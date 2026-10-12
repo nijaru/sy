@@ -426,6 +426,79 @@ async fn original_stage_survives_relocation_of_held_remote_root() {
 }
 
 #[tokio::test]
+async fn fulfilled_basic_noop_needs_no_old_reader_but_byte_verification_still_does() {
+    for verify_bytes in [false, true] {
+        let root = old_group();
+        std::fs::set_permissions(
+            root.path().join("first"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::File::open(root.path().join("first"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let before = std::fs::metadata(root.path().join("first")).unwrap();
+        let original =
+            crate::endpoint::local_identity::metadata_identity(&before, EntryKind::File).unwrap();
+        let mut request = open(false, true, 0);
+        request.verify_bytes = verify_bytes;
+        let mut session = Session::start(root, request, &["first", "second"], false).await;
+        if verify_bytes {
+            session.step(WireGroupStep::Prepare).await;
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(5), &mut session.server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                matches!(result, Err(GroupError::Rooted(RootedFsError::Io(ref error))) if error.kind() == std::io::ErrorKind::PermissionDenied),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(
+                session.prepare().await,
+                WireGroupResult::DestinationReady {
+                    publish: false,
+                    size: 3,
+                    digest: None,
+                    literal_bytes: 0,
+                    reused_bytes: 0,
+                }
+            );
+            session.publish(0).await;
+            session.publish(1).await;
+            // Negotiated held-root authority survives relocation; no configured
+            // pathname check may accidentally turn this into local authority.
+            let container = tempfile::tempdir().unwrap();
+            let moved = container.path().join("held");
+            std::fs::rename(session.root.path(), &moved).unwrap();
+            session.complete().await;
+            for name in ["first", "second", "outside"] {
+                assert_eq!(
+                    crate::endpoint::local_identity::metadata_identity(
+                        &std::fs::metadata(moved.join(name)).unwrap(),
+                        EntryKind::File
+                    ),
+                    Some(original)
+                );
+            }
+        }
+        if verify_bytes {
+            assert_eq!(
+                crate::endpoint::local_identity::metadata_identity(
+                    &std::fs::metadata(session.root.path().join("first")).unwrap(),
+                    EntryKind::File
+                ),
+                Some(original)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn captured_metadata_applies_at_file_end_and_rejects_late_duplicates() {
     for duplicate in [false, true] {
         let mut request = open(true, true, 0o600);

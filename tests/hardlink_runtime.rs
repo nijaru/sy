@@ -255,6 +255,26 @@ fn source_xattr_override_does_not_read_discarded_old_values() {
 }
 
 #[test]
+fn matching_unreadable_group_needs_no_byte_read_or_metadata_setter() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    let destination = fixture.path().join("destination");
+    for (root, bytes) in [(&source, b"NEW!"), (&destination, b"OLD!")] {
+        std::fs::create_dir(root).unwrap();
+        file(&root.join("a"), bytes, 0o600, 1_600_000_000);
+        std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+        std::fs::set_permissions(root.join("a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    let source_before = observe(&source.join("a"));
+    let destination_before = observe(&destination.join("a"));
+    run(&source, &destination, fixture.path(), &["-pt"]);
+    assert_eq!(observe(&source.join("a")), source_before);
+    assert_eq!(observe(&source.join("b")), source_before);
+    assert_eq!(observe(&destination.join("a")), destination_before);
+    assert_eq!(observe(&destination.join("b")), destination_before);
+}
+
+#[test]
 fn matching_coalesced_group_is_effect_free_even_with_unequal_quick_bytes() {
     let fixture = tempfile::tempdir().unwrap();
     let source = fixture.path().join("source");

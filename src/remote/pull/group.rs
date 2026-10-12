@@ -1,6 +1,6 @@
 //! Pull's source lease and original local creator own one sealed group.
 use super::*;
-use crate::endpoint::io::StagedWriter;
+use crate::endpoint::io::{Preservation, StagedWriter};
 use crate::endpoint::local::LocalStagedWriter;
 use crate::engine::hardlink_runtime::intent::{destination, GroupIntent};
 use crate::engine::hardlink_runtime::{GroupError, HardlinkGroupPlan};
@@ -150,24 +150,18 @@ impl RemotePullExecutor {
         }
         let (preservation, requested_flags) = lease.prepare().await?;
         let representative = destination(&first).cloned();
-        // Retained bytes/metadata must come from the original observed FD, not
-        // merely a pathname that was restored after a transient parent exchange.
-        let mut old = if intent.retain_metadata || !intent.canonical_source {
-            let old = representative
-                .clone()
-                .ok_or(GroupError::Invalid("missing retained destination"))?;
-            Some(Arc::new(
-                joined({
-                    let rooted = rooted.clone();
-                    move || {
-                        rooted.verify_root_path_blocking()?;
-                        let file = rooted.open_regular_blocking(&old.path)?;
-                        validate_old(&rooted, &file, &old)?;
-                        Ok(file)
-                    }
-                })
-                .await?,
-            ))
+        let basic_no_op = !intent.canonical_source
+            && crate::rooted_fs::MetadataPreservation {
+                xattrs: preservation.xattrs.as_deref(),
+                acl: preservation.acl.as_deref(),
+                bsd_flags: requested_flags,
+            }
+            .basic_only();
+        let needs_old = intent.retain_metadata || !intent.canonical_source;
+        // Extended comparisons retain the original data FD. Basic-only NoOp
+        // authority needs only the original observation and held parent.
+        let mut old = if needs_old && !basic_no_op {
+            Some(capture_old(rooted.clone(), representative.clone()).await?)
         } else {
             None
         };
@@ -176,36 +170,17 @@ impl RemotePullExecutor {
             let observed = representative
                 .as_ref()
                 .ok_or(GroupError::Invalid("missing no-op destination"))?;
-            let file = old
-                .as_ref()
-                .ok_or(GroupError::Invalid("missing no-op FD"))?;
-            let matches = joined({
-                let rooted = rooted.clone();
-                let observed = observed.clone();
-                let file = file.clone();
-                let preservation = preservation.clone();
-                move || {
-                    rooted.verify_root_path_blocking()?;
-                    validate_old(&rooted, &file, &observed)?;
-                    let matches = rooted.observed_file_preservation_matches_blocking(
-                        &observed.path,
-                        observed
-                            .identity
-                            .ok_or(GroupError::Invalid("missing no-op observation"))?,
-                        metadata.unix_mode,
-                        metadata.modified,
-                        &crate::rooted_fs::MetadataPreservation {
-                            xattrs: preservation.xattrs.as_deref(),
-                            acl: preservation.acl.as_deref(),
-                            bsd_flags: requested_flags,
-                        },
-                    )?;
-                    validate_old(&rooted, &file, &observed)?;
-                    Ok(matches)
-                }
-            })
-            .await?;
-            if matches {
+            let no_op_preservation = Arc::new(preservation.clone());
+            if let Some(matched) = no_op_proof(
+                rooted.clone(),
+                old.clone(),
+                observed.clone(),
+                metadata,
+                no_op_preservation.clone(),
+                requested_flags,
+            )
+            .await?
+            {
                 let mut members = group.members().await?;
                 let mut ordinal = 0;
                 while let Some(member) = members.next().await? {
@@ -213,35 +188,57 @@ impl RemotePullExecutor {
                     let observed = destination(&member)
                         .cloned()
                         .ok_or(GroupError::Invalid("missing no-op member"))?;
-                    let proof = joined({
-                        let rooted = rooted.clone();
-                        let file = file.clone();
-                        move || {
-                            rooted.verify_root_path_blocking()?;
-                            let native = validate_old(&rooted, &file, &observed)?;
-                            rooted.verify_root_path_blocking()?;
-                            Ok(PublishedFileProof {
-                                path: observed.path,
-                                identity: crate::endpoint::local_identity::metadata_identity(
-                                    &native,
-                                    EntryKind::File,
-                                )
-                                .ok_or(GroupError::Invalid("missing native no-op identity"))?,
-                            })
-                        }
-                    })
-                    .await?;
+                    let proof = no_op_proof(
+                        rooted.clone(),
+                        old.clone(),
+                        observed.clone(),
+                        metadata,
+                        no_op_preservation.clone(),
+                        requested_flags,
+                    )
+                    .await?
+                    .filter(|proof| proof.identity == matched.identity)
+                    .ok_or_else(|| {
+                        RootedFsError::DestinationChanged(observed.path.as_path().to_path_buf())
+                    })?;
                     group.confirm_member(&member, &proof).await?;
                     ordinal = next_ordinal(ordinal)?;
                 }
                 verify_root(rooted.clone(), false, first.path().clone()).await?;
                 lease.finish(group).await?;
-                // A successful remote ACK cannot waive local operator continuity.
+                // A successful remote ACK cannot waive exact local bindings or
+                // operator continuity. Replay remains bounded, with no data FD
+                // for basic-only preservation and no claim of byte parity.
+                let mut members = group.members().await?;
+                while let Some(member) = members.next().await? {
+                    let observed = destination(&member)
+                        .cloned()
+                        .ok_or(GroupError::Invalid("missing no-op member"))?;
+                    no_op_proof(
+                        rooted.clone(),
+                        old.clone(),
+                        observed.clone(),
+                        metadata,
+                        no_op_preservation.clone(),
+                        requested_flags,
+                    )
+                    .await?
+                    .filter(|proof| proof.identity == matched.identity)
+                    .ok_or_else(|| {
+                        RootedFsError::DestinationChanged(observed.path.as_path().to_path_buf())
+                    })?;
+                }
                 verify_root(rooted, false, first.path().clone()).await?;
                 return Ok(());
             }
         }
 
+        // An unfulfilled/unknown comparison grants no retained-byte authority.
+        // Capture genuine OLD before any private preparation, never fresh path
+        // defaults or a substituted descriptor after staging has begun.
+        if needs_old && old.is_none() {
+            old = Some(capture_old(rooted.clone(), representative.clone()).await?);
+        }
         let mut staged = LocalStagedWriter::new(
             rooted.clone(),
             first.path().clone(),
@@ -526,6 +523,69 @@ fn next_ordinal(ordinal: u64) -> Result<u64> {
     ordinal
         .checked_add(1)
         .ok_or_else(|| GroupError::Invalid("member ordinal overflow").into())
+}
+
+async fn capture_old(rooted: Arc<RootedFs>, observed: Option<Entry>) -> Result<Arc<File>> {
+    let observed = observed.ok_or(GroupError::Invalid("missing retained destination"))?;
+    joined(move || {
+        rooted.verify_root_path_blocking()?;
+        let file = rooted.open_regular_blocking(&observed.path)?;
+        validate_old(&rooted, &file, &observed)?;
+        Ok(Arc::new(file))
+    })
+    .await
+}
+
+/// Evidence of fulfilled preservation and exact native binding, not content
+/// verification, setter authority, or a source-removal receipt.
+async fn no_op_proof(
+    rooted: Arc<RootedFs>,
+    old: Option<Arc<File>>,
+    observed: Entry,
+    metadata: PullTransferMetadata,
+    preservation: Arc<Preservation>,
+    flags: Option<u32>,
+) -> Result<Option<PublishedFileProof>> {
+    joined(move || {
+        rooted.verify_root_path_blocking()?;
+        if let Some(file) = &old {
+            validate_old(&rooted, file, &observed)?;
+        }
+        let scanned = observed
+            .identity
+            .ok_or(GroupError::Invalid("missing no-op observation"))?;
+        let matches = rooted.observed_file_preservation_matches_blocking(
+            &observed.path,
+            scanned,
+            metadata.unix_mode,
+            metadata.modified,
+            &crate::rooted_fs::MetadataPreservation {
+                xattrs: preservation.xattrs.as_deref(),
+                acl: preservation.acl.as_deref(),
+                bsd_flags: flags,
+            },
+        )?;
+        if let Some(file) = &old {
+            validate_old(&rooted, file, &observed)?;
+        }
+        rooted.verify_root_path_blocking()?;
+        if !matches {
+            return Ok(None);
+        }
+        // Only real native retirement lineage may advance the scanned token.
+        let identity = rooted.retired_destination_identity_blocking(scanned)?;
+        if rooted.path_identity_blocking(&observed.path)? != Some((EntryKind::File, identity)) {
+            return Err(
+                RootedFsError::DestinationChanged(observed.path.as_path().to_path_buf()).into(),
+            );
+        }
+        rooted.verify_root_path_blocking()?;
+        Ok(Some(PublishedFileProof {
+            path: observed.path,
+            identity,
+        }))
+    })
+    .await
 }
 
 fn validate_old(rooted: &RootedFs, file: &File, observed: &Entry) -> Result<std::fs::Metadata> {
