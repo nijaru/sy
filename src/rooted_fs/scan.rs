@@ -3,10 +3,10 @@ use crate::endpoint::local_identity::{metadata_identity, stat_identity};
 use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Timestamp};
 use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::ScanRequest;
-use crate::engine::scan_sort::{read_name, NameSpool, SortBudget};
+use crate::engine::scan_sort::{NameSpool, SortBudget};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
@@ -228,75 +228,7 @@ fn scan_worker(
     }
 }
 
-// Fixed-size continuation records keep both ancestor identities and sorted-run
-// cursors on disk. No ancestor retains a name vector, run reader or directory FD.
-#[derive(Clone, Copy)]
-struct Continuation {
-    run: u64,
-    offset: u64,
-    device: u64,
-    inode: u64,
-}
-
-const CONTINUATION_BYTES: u64 = 32;
-
-struct Continuations(tempfile::NamedTempFile);
-
-impl Continuations {
-    #[cfg(test)]
-    fn new() -> io::Result<Self> {
-        Self::new_in(&tempfile::env::temp_dir())
-    }
-    fn new_in(parent: &Path) -> io::Result<Self> {
-        Ok(Self(
-            tempfile::Builder::new()
-                .prefix("sy-scan-stack-")
-                .tempfile_in(parent)?,
-        ))
-    }
-
-    fn write(&mut self, depth: usize, frame: Continuation) -> io::Result<()> {
-        self.0.seek(SeekFrom::Start(frame_offset(depth)?))?;
-        let mut record = [0; CONTINUATION_BYTES as usize];
-        for (field, value) in record.as_chunks_mut::<8>().0.iter_mut().zip([
-            frame.run,
-            frame.offset,
-            frame.device,
-            frame.inode,
-        ]) {
-            *field = value.to_le_bytes();
-        }
-        self.0.write_all(&record)?;
-        Ok(())
-    }
-
-    fn read(&mut self, depth: usize) -> io::Result<Continuation> {
-        self.0.seek(SeekFrom::Start(frame_offset(depth)?))?;
-        let mut record = [0; CONTINUATION_BYTES as usize];
-        self.0.read_exact(&mut record)?;
-        let mut values = [0; 4];
-        for (field, value) in record.as_chunks::<8>().0.iter().zip(&mut values) {
-            *value = u64::from_le_bytes(*field);
-        }
-        Ok(Continuation {
-            run: values[0],
-            offset: values[1],
-            device: values[2],
-            inode: values[3],
-        })
-    }
-
-    fn truncate(&mut self, frames: usize) -> io::Result<()> {
-        self.0.as_file_mut().set_len(frame_offset(frames)?)
-    }
-}
-
-fn frame_offset(depth: usize) -> io::Result<u64> {
-    u64::try_from(depth)
-        .ok()
-        .and_then(|depth| depth.checked_mul(CONTINUATION_BYTES))
-        .ok_or_else(|| io::Error::other("scan continuation offset overflow"))
-}
+use crate::engine::scan_sort::stack::{Frame as Continuation, Stack as Continuations};
 
 fn directory_identity(directory: &OwnedFd, path: &Path) -> Result<(u64, u64), RootedScanError> {
     let metadata =
@@ -345,12 +277,9 @@ fn reopen_directory(
     // EVERY ancestor, not just the leaf: a renamed directory must not resume
     // beneath a replacement parent even if its original inode was moved there.
     for (index, component) in path.components().enumerate() {
+        let frame = stack.read(index + 1).map_err(RootedScanError::Scratch)?;
         directory = open_dir_at(directory.as_raw_fd(), component.as_os_str(), path)?;
-        check_directory(
-            &directory,
-            path,
-            stack.read(index + 1).map_err(RootedScanError::Scratch)?,
-        )?;
+        check_directory(&directory, path, frame)?;
     }
     Ok(directory)
 }
@@ -379,12 +308,7 @@ fn prepare_directory(
     let run = spool
         .sort(names, || sender.is_closed())
         .map_err(RootedScanError::Scratch)?;
-    Ok(Continuation {
-        run,
-        offset: 0,
-        device,
-        inode,
-    })
+    Ok(Continuation { run, device, inode })
 }
 
 fn validate_path_bound(path: &Path) -> Result<(), RootedScanError> {
@@ -420,7 +344,7 @@ fn walk_tree(
         .map_err(RootedScanError::Scratch)?;
     drop(held_root);
     let mut spool = NameSpool::new_in(budget, &scratch_parent).map_err(RootedScanError::Scratch)?;
-    let mut stack = Continuations::new_in(&scratch_parent).map_err(RootedScanError::Scratch)?;
+    let mut stack = Continuations::new(spool.health()).map_err(RootedScanError::Scratch)?;
     let mut directory = rooted
         .root_fd
         .try_clone()
@@ -437,18 +361,15 @@ fn walk_tree(
     stack
         .write(depth, frame)
         .map_err(RootedScanError::Scratch)?;
-    let mut names = BufReader::new(
-        spool
-            .open(frame.run, frame.offset)
-            .map_err(RootedScanError::Scratch)?,
-    );
+    let mut names = spool.open(frame.run).map_err(RootedScanError::Scratch)?;
 
     while !sender.is_closed() {
-        let Some(name) = read_name(&mut names).map_err(RootedScanError::Scratch)? else {
+        let Some(name) = names.next().map_err(RootedScanError::Scratch)? else {
+            stack.check_top(depth).map_err(RootedScanError::Scratch)?;
             drop(names);
             spool.remove(frame.run).map_err(RootedScanError::Scratch)?;
             if depth == 0 {
-                stack.0.close().map_err(RootedScanError::Scratch)?;
+                drop(stack);
                 spool.close().map_err(RootedScanError::Scratch)?;
                 return Ok(());
             }
@@ -461,11 +382,7 @@ fn walk_tree(
             drop(directory);
             directory = reopen_directory(rooted, &path, &mut stack)?;
             frame = stack.read(depth).map_err(RootedScanError::Scratch)?;
-            names = BufReader::new(
-                spool
-                    .open(frame.run, frame.offset)
-                    .map_err(RootedScanError::Scratch)?,
-            );
+            names = spool.open(frame.run).map_err(RootedScanError::Scratch)?;
             continue;
         };
         let relative_path = path.join(&name);
@@ -498,7 +415,7 @@ fn walk_tree(
         }
         if request.max_depth.is_none_or(|limit| depth + 1 < limit) {
             if let Some(child) = inspected.directory {
-                frame.offset = names.stream_position().map_err(RootedScanError::Scratch)?;
+                frame.run = names.cursor();
                 stack
                     .write(depth, frame)
                     .map_err(RootedScanError::Scratch)?;
@@ -516,7 +433,7 @@ fn walk_tree(
                 stack
                     .write(depth, frame)
                     .map_err(RootedScanError::Scratch)?;
-                names = BufReader::new(spool.open(frame.run, 0).map_err(RootedScanError::Scratch)?);
+                names = spool.open(frame.run).map_err(RootedScanError::Scratch)?;
             }
         }
     }
@@ -1202,7 +1119,9 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(root.path().join("parent/child")).unwrap();
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
-        let mut stack = Continuations::new().unwrap();
+        let mut spool = NameSpool::new(SortBudget::default()).unwrap();
+        let run = spool.sort(std::iter::empty(), || false).unwrap();
+        let mut stack = Continuations::new(spool.health()).unwrap();
         let mut directory = rooted.root_fd.try_clone().unwrap();
         for (depth, name) in [None, Some("parent"), Some("child")]
             .into_iter()
@@ -1214,15 +1133,7 @@ mod tests {
             }
             let (device, inode) = directory_identity(&directory, Path::new("")).unwrap();
             stack
-                .write(
-                    depth,
-                    Continuation {
-                        run: 0,
-                        offset: 0,
-                        device,
-                        inode,
-                    },
-                )
+                .write(depth, Continuation { run, device, inode })
                 .unwrap();
         }
         drop(directory);
@@ -1241,6 +1152,32 @@ mod tests {
         std::fs::remove_dir_all(root.path().join("parent")).unwrap();
         std::os::unix::fs::symlink(root.path().join("old"), root.path().join("parent")).unwrap();
         assert!(reopen_directory(&rooted, Path::new("parent/child"), &mut stack).is_err());
+    }
+
+    #[test]
+    fn truncated_sorted_source_run_never_completes_or_emits_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("original"), b"source").unwrap();
+        let rooted = RootedFs::open_blocking(root.path().into()).unwrap();
+        rooted.begin_source_observations_blocking().unwrap();
+        let mut scope = crate::engine::ignore_scope::SourceIgnoreScope::new(root.path(), false);
+        scope.prepare_source().unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        crate::engine::scan_sort::truncate_next_sorted_run();
+        let error = walk_tree(
+            &rooted,
+            ScanRequest::default(),
+            &sender,
+            SortBudget::default(),
+            Some(&mut scope),
+        )
+        .unwrap_err();
+        assert!(matches!(error, RootedScanError::Scratch(_)));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("original")).unwrap(),
+            b"source"
+        );
     }
 
     #[tokio::test]

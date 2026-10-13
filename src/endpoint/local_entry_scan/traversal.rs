@@ -6,10 +6,10 @@ use crate::engine::domain::Entry;
 use crate::engine::ignore_scope::SourceIgnoreScope;
 use crate::engine::reconcile::BoxError;
 use crate::engine::scan::ScanRequest;
-use crate::engine::scan_sort::{read_name, NameSpool, SortBudget};
+use crate::engine::scan_sort::{NameSpool, SortBudget};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(unix)]
@@ -86,68 +86,7 @@ fn windows_identity(file: &File) -> io::Result<Identity> {
     ))
 }
 
-#[derive(Clone, Copy)]
-struct Frame {
-    run: u64,
-    offset: u64,
-    identity: Identity,
-}
-
-const FRAME_BYTES: u64 = 32;
-struct Stack(tempfile::NamedTempFile);
-impl Stack {
-    #[cfg(test)]
-    fn new() -> io::Result<Self> {
-        Self::new_in(&tempfile::env::temp_dir())
-    }
-    fn new_in(parent: &Path) -> io::Result<Self> {
-        Ok(Self(
-            tempfile::Builder::new()
-                .prefix("sy-local-stack-")
-                .tempfile_in(parent)?,
-        ))
-    }
-    fn position(depth: usize) -> io::Result<u64> {
-        u64::try_from(depth)
-            .ok()
-            .and_then(|depth| depth.checked_mul(FRAME_BYTES))
-            .ok_or_else(|| io::Error::other("local scan continuation overflow"))
-    }
-    fn write(&mut self, depth: usize, frame: Frame) -> io::Result<()> {
-        self.0.seek(SeekFrom::Start(Self::position(depth)?))?;
-        for value in [frame.run, frame.offset, frame.identity.0, frame.identity.1] {
-            self.0.write_all(&value.to_le_bytes())?;
-        }
-        Ok(())
-    }
-    fn read(&mut self, depth: usize) -> io::Result<Frame> {
-        self.0.seek(SeekFrom::Start(Self::position(depth)?))?;
-        let mut values = [0; 4];
-        for value in &mut values {
-            let mut bytes = [0; 8];
-            self.0.read_exact(&mut bytes)?;
-            *value = u64::from_le_bytes(bytes);
-        }
-        Ok(Frame {
-            run: values[0],
-            offset: values[1],
-            identity: Identity(values[2], values[3]),
-        })
-    }
-    fn truncate(&mut self, frames: usize) -> io::Result<()> {
-        self.0.as_file_mut().set_len(Self::position(frames)?)
-    }
-    fn contains(&mut self, depth: usize, candidate: Identity) -> io::Result<bool> {
-        // Exact loop detection needs only this on-disk ancestor list, never a
-        // per-tree visited set (which would also incorrectly reject aliases).
-        for index in 0..=depth {
-            if self.read(index)?.identity == candidate {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
+use crate::engine::scan_sort::stack::{Frame, Stack};
 
 struct Directory {
     file: File,
@@ -281,15 +220,17 @@ fn reopen(
     follow: bool,
     stack: &mut Stack,
 ) -> Result<Directory, LocalScanError> {
+    let frame = stack.read(0)?;
     let mut directory = Directory::root(root)?;
-    if directory.identity()? != stack.read(0)?.identity {
+    if directory.identity()? != Identity(frame.device, frame.inode) {
         return Err(LocalScanError::DirectoryChanged(root.to_path_buf()));
     }
     for (index, component) in relative.components().enumerate() {
+        let frame = stack.read(index + 1)?;
         directory = directory.child(component.as_os_str(), follow)?;
         // Check EVERY ancestor: moving the original leaf under a substituted
         // parent must not allow resuming an old continuation in a new tree.
-        if directory.identity()? != stack.read(index + 1)?.identity {
+        if directory.identity()? != Identity(frame.device, frame.inode) {
             return Err(LocalScanError::DirectoryChanged(root.join(relative)));
         }
     }
@@ -322,8 +263,8 @@ fn prepare(
     let run = spool.sort(names, || sender.is_closed())?;
     Ok(Frame {
         run,
-        offset: 0,
-        identity,
+        device: identity.0,
+        inode: identity.1,
     })
 }
 
@@ -518,11 +459,8 @@ fn walk_tree_with_root(
     }
     let scratch_parent = directory.scratch_parent()?;
     let mut spool = NameSpool::new_in(budget, &scratch_parent)?;
-    let mut stack = Stack::new_in(&scratch_parent)?;
-    let scratch = [
-        Scratch::new(spool.scratch_path())?,
-        Scratch::new(stack.0.path())?,
-    ];
+    let mut stack = Stack::new(spool.health())?;
+    let scratch = Scratch::new(spool.scratch_path())?;
     let mut path = PathBuf::new();
     let mut depth = 0;
     let mut frame = prepare(
@@ -534,14 +472,15 @@ fn walk_tree_with_root(
         request.follow_symlinks,
     )?;
     stack.write(0, frame)?;
-    let mut names = BufReader::new(spool.open(frame.run, 0)?);
+    let mut names = spool.open(frame.run)?;
     let result = (|| {
         while !sender.is_closed() {
             // Entry conversion uses lexical paths (including copy-links).
             // Revalidate every ancestor before resolving those paths, and on
             // EOF so an empty/replaced root is not a successful source scan.
             drop(reopen(root, &path, request.follow_symlinks, &mut stack)?);
-            let Some(name) = read_name(&mut names)? else {
+            let Some(name) = names.next()? else {
+                stack.check_top(depth)?;
                 drop(names);
                 spool.remove(frame.run)?;
                 if depth == 0 {
@@ -553,7 +492,7 @@ fn walk_tree_with_root(
                 drop(directory);
                 directory = reopen(root, &path, request.follow_symlinks, &mut stack)?;
                 frame = stack.read(depth)?;
-                names = BufReader::new(spool.open(frame.run, frame.offset)?);
+                names = spool.open(frame.run)?;
                 continue;
             };
             let relative = path.join(&name);
@@ -571,18 +510,16 @@ fn walk_tree_with_root(
                     .map_err(io::Error::other)?;
             }
             let metadata = entry_metadata(&absolute, request)?;
-            if scratch[0].matches(&absolute, &metadata, request.follow_symlinks)?
-                || scratch[1].matches(&absolute, &metadata, request.follow_symlinks)?
-            {
+            if scratch.matches(&absolute, &metadata, request.follow_symlinks)? {
                 continue;
             }
             // WalkBuilder detects followed loops before ignore filtering and
             // even at max-depth. Ignoring a loop cannot turn a failed source
             // observation into a successful scan that authorizes deletion.
-            if request.follow_symlinks
-                && metadata.is_dir()
-                && stack.contains(depth, path_identity(&absolute, &metadata, true)?)?
-            {
+            if request.follow_symlinks && metadata.is_dir() && {
+                let id = path_identity(&absolute, &metadata, true)?;
+                stack.contains(depth, (id.0, id.1))?
+            } {
                 return Err(LocalScanError::SymlinkLoop(absolute));
             }
             if !request.include_git_dir && name == ".git" {
@@ -610,7 +547,7 @@ fn walk_tree_with_root(
                 return Ok(());
             }
             if let Some(child) = child {
-                frame.offset = names.stream_position()?;
+                frame.run = names.cursor();
                 stack.write(depth, frame)?;
                 drop(names);
                 directory = child;
@@ -625,20 +562,16 @@ fn walk_tree_with_root(
                     request.follow_symlinks,
                 )?;
                 stack.write(depth, frame)?;
-                names = BufReader::new(spool.open(frame.run, 0)?);
+                names = spool.open(frame.run)?;
             }
         }
         Ok(())
     })();
     // Cleanup is explicit and fallible on successful completion AND errors /
     // cancellation. RAII remains the last resort if the process panics.
-    let stack_cleanup = stack.0.close();
+    drop(stack);
     let spool_cleanup = spool.close();
-    let cleanup = match (stack_cleanup, spool_cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(stack), Err(spool)) => Err(io::Error::other(format!("stack: {stack}; runs: {spool}"))),
-    };
+    let cleanup = spool_cleanup;
     if let Err(source) = cleanup {
         return Err(LocalScanError::Cleanup {
             operation: result.err().map(Box::new),

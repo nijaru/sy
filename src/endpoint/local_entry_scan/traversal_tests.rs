@@ -1,5 +1,33 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn truncated_sorted_source_run_is_an_error_before_any_entry_is_emitted() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("original"), b"source").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let rooted = runtime
+        .block_on(crate::rooted_fs::RootedFs::open(root.path().into()))
+        .unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    crate::engine::scan_sort::truncate_next_sorted_run();
+    assert!(walk_tree_rooted(
+        &rooted,
+        ScanRequest::default(),
+        &sender,
+        SortBudget::default()
+    )
+    .is_err());
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("original")).unwrap(),
+        b"source"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_link_identity_respects_follow_policy_and_detects_cycles() {
@@ -62,7 +90,9 @@ fn windows_link_identity_respects_follow_policy_and_detects_cycles() {
 fn reopening_validates_every_ancestor_even_when_leaf_inode_is_unchanged() {
     let root = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(root.path().join("parent/child")).unwrap();
-    let mut stack = Stack::new().unwrap();
+    let mut spool = NameSpool::new(SortBudget::default()).unwrap();
+    let run = spool.sort(std::iter::empty(), || false).unwrap();
+    let mut stack = Stack::new(spool.health()).unwrap();
     let mut directory = Directory::root(root.path()).unwrap();
     for (depth, name) in [None, Some("parent"), Some("child")]
         .into_iter()
@@ -75,9 +105,9 @@ fn reopening_validates_every_ancestor_even_when_leaf_inode_is_unchanged() {
             .write(
                 depth,
                 Frame {
-                    run: 0,
-                    offset: 0,
-                    identity: directory.identity().unwrap(),
+                    run,
+                    device: directory.identity().unwrap().0,
+                    inode: directory.identity().unwrap().1,
                 },
             )
             .unwrap();
