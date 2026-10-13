@@ -155,7 +155,7 @@ fn rooted_expected_destination(expected: ExpectedDestination) -> sy::endpoint::E
     }
 }
 
-fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
+pub(crate) fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
     match error {
         sy::rooted_fs::RootedFsError::Io(error) => SyncError::Io(error),
         sy::rooted_fs::RootedFsError::SourceBindingChanged(path) => {

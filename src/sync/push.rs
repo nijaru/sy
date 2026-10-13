@@ -122,7 +122,7 @@ pub(super) async fn run(
 }
 
 #[cfg(test)]
-async fn execute_with_handle(
+pub(super) async fn execute_with_handle(
     source_root: &Path,
     destination_root: &Path,
     remote: ClientRemoteHandle,
@@ -151,6 +151,8 @@ async fn execute_bound(
     scan_options: ScanOptions,
     scope: sy::engine::domain::SyncScope,
 ) -> Result<SyncStats> {
+    use sy::endpoint::Endpoint;
+    admit_remote_preservation(&remote, source_authority.endpoint().capabilities(), config)?;
     let source_root = source_authority.path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,

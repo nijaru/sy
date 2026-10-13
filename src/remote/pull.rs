@@ -661,7 +661,6 @@ impl RemotePullExecutor {
                     xattrs: self.xattrs,
                     acls: self.acls,
                 },
-                protocol_version: self.remote.protocol_version(),
                 capabilities: self.remote.capabilities(),
             },
         )
@@ -721,21 +720,13 @@ impl RemotePullExecutor {
 
     fn validate_file_fetch_options(&self) -> Result<()> {
         let capabilities = self.remote.capabilities();
-        for (requested, supported, feature) in [
-            (self.xattrs, capabilities.preserve_xattrs, "xattrs"),
-            (self.acls, capabilities.preserve_acls, "ACLs"),
-        ] {
-            if requested
-                && (!supported || self.remote.protocol_version() < crate::protocol::PROTOCOL_V3_2)
-            {
-                return Err(
-                    crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
-                        feature,
-                    }
-                    .into(),
-                );
-            }
+        super::preservation::PreservationRequest {
+            xattrs: self.xattrs,
+            acls: self.acls,
+            flags: self.bsd_flags,
+            ..Default::default()
         }
+        .validate(capabilities)?;
         if self.compression.is_some() && !capabilities.zstd {
             return Err(RemotePullError::Remote(RemoteSessionError::PeerLacksZstd));
         }

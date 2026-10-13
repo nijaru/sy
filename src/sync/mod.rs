@@ -6,6 +6,8 @@ mod json_path;
 mod local;
 pub mod output;
 pub mod policy;
+#[cfg(all(test, unix, feature = "ssh"))]
+mod preflight_tests;
 #[cfg(feature = "ssh")]
 mod pull;
 mod push;

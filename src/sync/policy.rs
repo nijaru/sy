@@ -22,6 +22,25 @@ use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
 
+#[cfg(feature = "ssh")]
+pub(super) fn admit_remote_preservation(
+    remote: &sy::remote::runtime::ClientRemoteHandle,
+    local: &sy::endpoint::Capabilities,
+    config: &SyncConfig,
+) -> Result<()> {
+    remote
+        .admit_preservation(
+            local,
+            sy::remote::preservation::PreservationRequest {
+                xattrs: config.preserve.xattrs,
+                acls: config.preserve.acls,
+                hardlinks: config.preserve.hardlinks,
+                flags: config.preserve.flags,
+            },
+        )
+        .map_err(map_io)
+}
+
 pub(crate) fn finish_report(
     reporter: &sy::sync::output::SyncReporter,
     stats: &SyncStats,

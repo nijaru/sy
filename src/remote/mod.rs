@@ -7,6 +7,7 @@ pub mod hash;
 pub mod local_executor;
 pub mod operand;
 pub mod path;
+pub mod preservation;
 pub mod pull;
 pub mod pull_lower;
 pub mod push;

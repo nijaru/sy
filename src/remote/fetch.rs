@@ -15,9 +15,8 @@ use crate::endpoint::{io::Preservation, Capabilities};
 use crate::engine::compression::CompressionPolicy;
 use crate::engine::work::TransferSummary;
 use crate::protocol::{
-    Frame, FrameFlags, FrameKind, PlatformOs, ProtocolVersion, StreamId, WireAcl, WireAclResult,
+    Frame, FrameFlags, FrameKind, PlatformOs, StreamId, WireAcl, WireAclResult,
     WireFetchCompression, WireFileEnd, WireFileFetchRequest, WireXattr, WireXattrResult,
-    PROTOCOL_V3_2,
 };
 use crate::remote::data::DataChunk;
 use crate::remote::path::{decode_relative_path, ensure_compatible_path_encoding};
@@ -53,7 +52,6 @@ pub struct FetchPolicy<'a> {
     pub compression: Option<CompressionPolicy>,
     pub rate_limiter: Option<&'a Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
     pub preservation: FetchPreservationRequest,
-    pub protocol_version: ProtocolVersion,
     pub capabilities: &'a Capabilities,
 }
 
@@ -72,22 +70,12 @@ pub async fn fetch_file(
     policy: FetchPolicy<'_>,
 ) -> std::result::Result<FetchResult, RemoteTransferError> {
     ensure_compatible_path_encoding(peer)?;
-    for (requested, supported, feature) in [
-        (
-            policy.preservation.xattrs,
-            policy.capabilities.preserve_xattrs,
-            "xattrs",
-        ),
-        (
-            policy.preservation.acls,
-            policy.capabilities.preserve_acls,
-            "ACLs",
-        ),
-    ] {
-        if requested && (!supported || policy.protocol_version < PROTOCOL_V3_2) {
-            return Err(RemoteTransferError::PreservationUnavailable { feature });
-        }
+    super::preservation::PreservationRequest {
+        xattrs: policy.preservation.xattrs,
+        acls: policy.preservation.acls,
+        ..Default::default()
     }
+    .validate(policy.capabilities)?;
     if !source.is_file() {
         return Err(RemoteTransferError::InvalidSource);
     }
@@ -555,7 +543,6 @@ mod tests {
     use crate::engine::domain::Entry;
     use crate::protocol::{
         read_frame, write_frame, Platform, MAX_FRAME_PAYLOAD, MAX_TRANSFER_DATA_SIZE,
-        SUPPORTED_VERSIONS,
     };
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
     use futures::TryStreamExt;
@@ -631,7 +618,6 @@ mod tests {
                 compression: None,
                 rate_limiter: None,
                 preservation: FetchPreservationRequest::default(),
-                protocol_version: SUPPORTED_VERSIONS.max,
                 capabilities: endpoint.capabilities(),
             },
         )
@@ -714,7 +700,6 @@ mod tests {
                     compression,
                     rate_limiter: None,
                     preservation: FetchPreservationRequest::default(),
-                    protocol_version: SUPPORTED_VERSIONS.max,
                     capabilities: endpoint.capabilities(),
                 },
             )
@@ -783,7 +768,6 @@ mod tests {
                     compression: None,
                     rate_limiter: None,
                     preservation: FetchPreservationRequest::default(),
-                    protocol_version: SUPPORTED_VERSIONS.max,
                     capabilities: endpoint.capabilities(),
                 },
             )

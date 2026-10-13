@@ -39,23 +39,29 @@ pub(super) async fn run(
     let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
         .await
         .map_err(map_io)?;
-    // Pin an existing destination before any producer is admitted. Only an
-    // initially missing root may be acquired later: selected parents must wait
-    // for completed effect protection, and previews never create roots.
+    // Capture either the root or its original held ancestor before scanning.
+    // Tree and selected work both defer missing parents until a completed
+    // preflight selects a Create; absence never permits a fresh pathname open.
+    let binding = sy::rooted_fs::operand::BoundDestination::open(
+        destination_root.to_path_buf(),
+        sy::rooted_fs::operand::SourceShape::Directory { basename: None },
+    )
+    .await
+    .map_err(sy::endpoint::local::map_rooted_fs_error)?;
     let destination_endpoint =
         sy::endpoint::local::LocalEndpoint::new(destination_root.to_path_buf());
-    match destination_endpoint.rooted_fs(false).await {
-        Ok(_) => {}
-        Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            if scope == SyncScope::Tree && !config.dry_run {
-                destination_endpoint.rooted_fs(true).await?;
-            }
+    let (destination_endpoint, pending) = match binding.root {
+        sy::rooted_fs::operand::DestinationRoot::Present(rooted) => {
+            (destination_endpoint.with_rooted_authority(rooted), None)
         }
-        Err(error) => return Err(error),
+        pending @ sy::rooted_fs::operand::DestinationRoot::Pending(_) => {
+            (destination_endpoint, Some(pending))
+        }
     };
     run_with_authorities(
         source_authority,
         destination_endpoint,
+        pending,
         config,
         scan_options,
         scope,
@@ -65,11 +71,12 @@ pub(super) async fn run(
 
 /// Discovery, comparison and execution all consume the initially acquired
 /// destination. An uninitialized endpoint records initial absence, not permission
-/// to reopen an existing observation; only completed selected preflight may admit
+/// to reopen an existing observation; only completed preflight may admit
 /// later creation.
 async fn run_with_authorities(
     source_authority: sy::endpoint::source_root::SourceRoot,
-    destination_endpoint: sy::endpoint::local::LocalEndpoint,
+    mut destination_endpoint: sy::endpoint::local::LocalEndpoint,
+    pending: Option<sy::rooted_fs::operand::DestinationRoot>,
     config: &SyncConfig,
     scan_options: ScanOptions,
     scope: SyncScope,
@@ -243,7 +250,17 @@ async fn run_with_authorities(
         .await
         .map_err(map_controller_error)?;
         if requires_root {
-            destination_endpoint.rooted_fs(true).await?;
+            let pending = pending.ok_or_else(|| {
+                SyncError::Config("missing destination has no held ancestor authority".into())
+            })?;
+            let rooted = pending
+                .acquire_local()
+                .await
+                .map_err(sy::endpoint::local::map_rooted_fs_error)?;
+            // Preflight used conservative unknown semantics. Qualify the actual
+            // acquired root, never the ancestor's filesystem or the pathname.
+            rooted.namespace_semantics().await.map_err(map_io)?;
+            destination_endpoint = destination_endpoint.with_rooted_authority(rooted);
         }
     }
 
@@ -502,6 +519,7 @@ mod tests {
             assert!(run_with_authorities(
                 source,
                 destination,
+                None,
                 &config,
                 ScanOptions::default(),
                 scope
@@ -516,6 +534,54 @@ mod tests {
             assert_eq!(std::fs::read_dir(&held).unwrap().count(), 2);
             for name in ["file", "retained"] {
                 assert_eq!(std::fs::read(source_path.join(name)).unwrap(), b"new");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_local_acquisition_never_adopts_a_foreign_root_or_ancestor() {
+        use sy::rooted_fs::operand::{BoundDestination, SourceShape};
+        for swap_ancestor in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source_path = fixture.path().join("source");
+            let ancestor = fixture.path().join("ancestor");
+            let held = fixture.path().join("held");
+            let destination = ancestor.join("missing/parents");
+            std::fs::create_dir(&source_path).unwrap();
+            std::fs::create_dir(&ancestor).unwrap();
+            std::fs::write(source_path.join("file"), b"SOURCE").unwrap();
+            let source = sy::endpoint::source_root::SourceRoot::open(source_path)
+                .await
+                .unwrap();
+            let binding = BoundDestination::open(
+                destination.clone(),
+                SourceShape::Directory { basename: None },
+            )
+            .await
+            .unwrap();
+            if swap_ancestor {
+                std::fs::rename(&ancestor, &held).unwrap();
+                std::fs::create_dir(&ancestor).unwrap();
+            } else {
+                std::fs::create_dir_all(&destination).unwrap();
+                std::fs::write(destination.join("foreign"), b"KEEP").unwrap();
+            }
+            let result = run_with_authorities(
+                source,
+                sy::endpoint::local::LocalEndpoint::new(destination.clone()),
+                Some(binding.root),
+                &SyncConfig::test_default(),
+                ScanOptions::default(),
+                SyncScope::Tree,
+            )
+            .await;
+            assert!(result.is_err());
+            if swap_ancestor {
+                assert!(!ancestor.join("missing").exists());
+                assert!(!held.join("missing").exists());
+            } else {
+                assert_eq!(std::fs::read(destination.join("foreign")).unwrap(), b"KEEP");
+                assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
             }
         }
     }

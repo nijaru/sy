@@ -206,6 +206,22 @@ impl ClientRemoteHandle {
         &self.capabilities
     }
 
+    /// Admit mandatory preservation against actual source and destination
+    /// capabilities immediately after negotiation, before scanning or effects.
+    pub fn admit_preservation(
+        &self,
+        local: &EndpointCapabilities,
+        request: crate::remote::preservation::PreservationRequest,
+    ) -> Result<()> {
+        let (source, destination) = match self.operation {
+            Operation::Push | Operation::PreviewPush => (local, &self.capabilities),
+            Operation::Pull => (&self.capabilities, local),
+        };
+        request.validate(source)?;
+        request.validate(destination)?;
+        Ok(())
+    }
+
     /// Actual held-root semantics; pending roots remain unqualified.
     pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
         self.binding().namespace_semantics.into()
@@ -387,35 +403,13 @@ impl ClientRemoteHandle {
         stream_policy: TransferStreamPolicy,
     ) -> Result<(TransferSummary, crate::rooted_fs::PublishedFileProof)> {
         self.require_push(FrameKind::FileBegin)?;
-        for (requested, supported, feature) in [
-            (
-                stream_policy.preservation.xattrs,
-                self.capabilities.preserve_xattrs,
-                "xattrs",
-            ),
-            (
-                stream_policy.preservation.acls,
-                self.capabilities.preserve_acls,
-                "ACLs",
-            ),
-        ] {
-            if requested && (self.protocol_version < crate::protocol::PROTOCOL_V3_2 || !supported) {
-                return Err(
-                    crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
-                        feature,
-                    }
-                    .into(),
-                );
-            }
+        crate::remote::preservation::PreservationRequest {
+            xattrs: stream_policy.preservation.xattrs,
+            acls: stream_policy.preservation.acls,
+            flags: stream_policy.final_flags.is_some(),
+            ..Default::default()
         }
-        if stream_policy.final_flags.is_some() && !self.capabilities.preserve_flags {
-            return Err(
-                crate::remote::transfer::RemoteTransferError::PreservationUnavailable {
-                    feature: "BSD flags",
-                }
-                .into(),
-            );
-        }
+        .validate(&self.capabilities)?;
         if stream_policy.compression.is_some() && !self.capabilities.zstd {
             return Err(RemoteSessionError::PeerLacksZstd);
         }

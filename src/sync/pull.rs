@@ -87,6 +87,9 @@ pub(super) async fn run(
     display_source.push(source_root);
     let display_source = std::path::PathBuf::from(display_source);
     let result = async {
+        use sy::endpoint::Endpoint;
+        let local = sy::endpoint::local::LocalEndpoint::new(destination_root.to_path_buf());
+        admit_remote_preservation(&remote, local.capabilities(), config)?;
         let shape = remote
             .binding()
             .source_shape
@@ -142,7 +145,7 @@ pub(super) async fn run(
 }
 
 #[cfg(test)]
-async fn execute_with_handle(
+pub(super) async fn execute_with_handle(
     source_root: &Path,
     destination_root: &Path,
     remote: ClientRemoteHandle,
@@ -177,7 +180,10 @@ async fn execute_bound(
     config: &SyncConfig,
     scan_options: ScanOptions,
 ) -> Result<SyncStats> {
+    use sy::endpoint::Endpoint;
     let destination_root = destination.root.path().to_path_buf();
+    let local = sy::endpoint::local::LocalEndpoint::new(destination_root.clone());
+    admit_remote_preservation(&remote, local.capabilities(), config)?;
     let destination_root = destination_root.as_path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
         config.itemize_changes,
