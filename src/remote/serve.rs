@@ -410,6 +410,7 @@ mod tests {
         );
         let client = client.unwrap();
         let mut server = server.unwrap();
+        crate::rooted_fs::test_source::scan(&server.scan_handler_rooted().unwrap()).await;
         let handlers = RequestHandlers::new(&server).unwrap();
         let previous = handlers
             .native()
@@ -562,6 +563,50 @@ mod tests {
             crate::remote::client_handshake(&mut reader, &mut writer, Operation::Pull, root.path())
                 .await
                 .unwrap();
+            // The actual session, not a separate local observer, owns originals.
+            let scan_id = StreamId::new(3);
+            write_frame(
+                &mut writer,
+                &Frame::new(
+                    FrameKind::ScanRequest,
+                    FrameFlags::empty(),
+                    scan_id,
+                    crate::protocol::WireScanRequest {
+                        scope: crate::protocol::WireScanScope::Tree,
+                        respect_gitignore: false,
+                        include_git_dir: false,
+                        follow_symlinks: false,
+                        max_depth: None,
+                        unix_mode: false,
+                        symlink_target: true,
+                        identity: true,
+                        hardlink_group: false,
+                    }
+                    .encode(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            loop {
+                let frame = read_frame(&mut reader).await.unwrap();
+                if frame.kind() == FrameKind::EntryEnd {
+                    break;
+                }
+                assert_eq!(frame.kind(), FrameKind::Entry);
+            }
+            write_frame(
+                &mut writer,
+                &Frame::new(
+                    FrameKind::Ack,
+                    FrameFlags::empty(),
+                    scan_id,
+                    bytes::Bytes::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
             let id = StreamId::new(1);
             let request = WireFileFetchRequest::new(
                 crate::remote::path::encode_relative_path(source.path.as_path()).unwrap(),

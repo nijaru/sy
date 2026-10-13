@@ -457,6 +457,9 @@ pub async fn request_file_transfer_with_stream_policy(
             compression,
         )?;
         producer_root.validate_blocking()?;
+        producer_root
+            .rooted()
+            .validate_source_observation_blocking(&producer_path)?;
         if producer_root
             .rooted()
             .path_identity_blocking(&producer_path)?
@@ -508,6 +511,9 @@ pub async fn request_file_transfer_with_stream_policy(
     let final_path = source.path;
     tokio::task::spawn_blocking(move || {
         final_root.validate_blocking()?;
+        final_root
+            .rooted()
+            .validate_source_reader_blocking(&final_path, &final_source_file)?;
         validate_source(&final_source_file, expected_identity, expected_size)?;
         if final_root.rooted().path_identity_blocking(&final_path)?
             != Some((crate::engine::domain::EntryKind::File, expected_identity))

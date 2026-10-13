@@ -180,6 +180,7 @@ pub async fn serve_incoming_metadata_rooted(
         let identity = EntryIdentity::from_bytes(request.identity);
         drop(first);
         tokio::task::spawn_blocking(move || -> Result<()> {
+            rooted.validate_source_observation_blocking(&relative)?;
             if rooted.path_identity_blocking(&relative)? != Some((kind, identity)) {
                 return Err(RemoteMetadataError::ObservationChanged(relative));
             }

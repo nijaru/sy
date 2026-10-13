@@ -45,6 +45,13 @@ async fn metadata_completion_rechecks_source_after_admitted_native_work() {
     )
     .await
     .unwrap();
+    client
+        .scan(request)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
     let executor = RemotePullExecutor::new(
         destination_root.path().into(),
         client.request_handle(),
@@ -176,6 +183,13 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
             )
             .await
             .unwrap();
+            client
+                .scan(request)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
             let sender = client.sender();
             let mut executor = RemotePullExecutor::new(
                 destination_root.path().to_path_buf(),

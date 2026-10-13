@@ -1,8 +1,9 @@
 //! Selected plans execute over the real v3 router with independent physical
-//! addresses. Fixture observations are local: selected remote scan RPCs and CLI
-//! operand resolution are deliberately not part of this contract.
+//! addresses. Original observations come from the actual SOURCE producers;
+//! CLI operand resolution is deliberately outside this contract.
 #![cfg(unix)]
 
+use futures::TryStreamExt;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -67,11 +68,15 @@ fn seed(path: &Path, bytes: &[u8], mode: u32) {
     filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_600_000_000, 123)).unwrap();
 }
 
-async fn selected_plan(source: &Path, destination: &Path, case: Case) -> SyncPlan {
+async fn selected_plan(
+    source: &sy::endpoint::source_root::SourceRoot,
+    destination: &Path,
+    case: Case,
+) -> SyncPlan {
     let mut request = ScanRequest::default();
     request.metadata.unix_mode = true;
     let reconciler = OrderedReconciler::with_scope(
-        selected_leaf_stream(source.into(), relative("original"), request, false),
+        source.selected_entries(relative("original"), request, false),
         selected_leaf_stream(destination.into(), relative("renamed"), request, true),
         SyncScope::SelectedLeaf {
             source: relative("original"),
@@ -211,7 +216,10 @@ async fn selected_address_matrix(push: bool) {
             xattr::set(&source_path, "user.sy-selected", b"preserved").unwrap();
             xattr::set(&dest_path, "user.sy-stale", b"remove").unwrap();
         }
-        let plan = selected_plan(source.path(), destination.path(), case).await;
+        let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
+            .await
+            .unwrap();
+        let plan = selected_plan(&authority, destination.path(), case).await;
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(server_io);
         let server = tokio::spawn(sy::remote::serve::serve_transport(
@@ -239,9 +247,6 @@ async fn selected_address_matrix(push: bool) {
         .unwrap();
         let scheduler = Scheduler::new(Default::default()).unwrap();
         let summary = if push {
-            let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
-                .await
-                .unwrap();
             let executor = RemotePushExecutor::new(
                 authority,
                 client.request_handle(),
@@ -259,6 +264,14 @@ async fn selected_address_matrix(push: bool) {
                 .execute(plan)
                 .await
         } else {
+            client
+                .request_handle()
+                .scan_entry(ScanRequest::default(), relative("original"))
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
             let executor = RemotePullExecutor::new(
                 destination.path().into(),
                 client.request_handle(),
@@ -382,8 +395,11 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
         let mut request = ScanRequest::default();
         request.metadata.unix_mode = true;
         request.metadata.hardlink_group = true;
+        let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
+            .await
+            .unwrap();
         let reconciler = OrderedReconciler::with_scope(
-            selected_leaf_stream(source.path().into(), relative("a"), request, false),
+            authority.selected_entries(relative("a"), request, false),
             selected_leaf_stream(
                 destination.path().into(),
                 relative("renamed-a"),
@@ -442,9 +458,6 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
         let scheduler = Scheduler::new(Default::default()).unwrap();
         let execution = async {
             if push {
-                let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
-                    .await
-                    .unwrap();
                 SyncController::new(
                     RemotePushExecutor::new(
                         authority,
@@ -460,6 +473,14 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
                 .await
                 .unwrap()
             } else {
+                client
+                    .request_handle()
+                    .scan_entry(request, relative("a"))
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
                 SyncController::new(
                     RemotePullExecutor::new(
                         destination.path().into(),

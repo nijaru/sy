@@ -84,7 +84,10 @@ impl RootedFs {
     pub(crate) fn source_entry_stream(&self, request: ScanRequest) -> EntryStream {
         let rooted = self.clone();
         EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
-            scan_worker(rooted, request, sender, true)
+            let attempt = rooted.start_source_scan_blocking()?;
+            let result = scan_worker(rooted, request, sender.clone(), true);
+            attempt.finish(result.is_ok() && !sender.is_closed());
+            result
         })
     }
 
@@ -114,52 +117,72 @@ impl RootedFs {
     ) -> EntryStream {
         let rooted = self.clone();
         EntryStream::spawn_blocking(1, move |sender| {
-            if request.respect_gitignore && !source {
-                return Err(Box::new(RootedScanError::GitignoreUnsupported) as BoxError);
-            }
-            let mut scope = source.then(|| {
-                crate::engine::ignore_scope::SourceIgnoreScope::with_remote_authority(
-                    rooted.clone(),
-                    request.respect_gitignore,
-                )
-            });
-            if let Some(scope) = &mut scope {
-                scope.prepare_source()?;
-            }
-            let name = path
-                .as_path()
-                .file_name()
-                .filter(|_| path.as_path().components().count() == 1)
-                .ok_or_else(|| {
-                    Box::new(RootedScanError::InvalidRelativePath(
-                        path.as_path().to_path_buf(),
-                    )) as BoxError
-                })?;
-            validate_path_bound(path.as_path())?;
-            // Only a missing initial name is an empty observation. An error
-            // after lstat (including disappearance during inspection) is a scan race.
-            let stat = match lstat_at(rooted.root_fd.as_raw_fd(), name, path.as_path()) {
-                Err(RootedScanError::Metadata { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
-                {
-                    return Ok(())
+            let attempt = source
+                .then(|| rooted.start_source_scan_blocking())
+                .transpose()?;
+            let result = (|| {
+                if request.respect_gitignore && !source {
+                    return Err(Box::new(RootedScanError::GitignoreUnsupported) as BoxError);
                 }
-                Err(error) => return Err(Box::new(error)),
-                Ok(stat) => stat,
-            };
-            if let Some(scope) = &mut scope {
-                if (!request.include_git_dir && name == OsStr::new(".git"))
-                    || scope.source_match(
+                if source {
+                    rooted.begin_source_observations_blocking()?;
+                }
+                let mut scope = source.then(|| {
+                    crate::engine::ignore_scope::SourceIgnoreScope::with_remote_authority(
+                        rooted.clone(),
+                        request.respect_gitignore,
+                    )
+                });
+                if let Some(scope) = &mut scope {
+                    scope.prepare_source()?;
+                }
+                let name = path
+                    .as_path()
+                    .file_name()
+                    .filter(|_| path.as_path().components().count() == 1)
+                    .ok_or_else(|| {
+                        Box::new(RootedScanError::InvalidRelativePath(
+                            path.as_path().to_path_buf(),
+                        )) as BoxError
+                    })?;
+                validate_path_bound(path.as_path())?;
+                // Only a missing initial name is an empty observation. An error
+                // after lstat (including disappearance during inspection) is a scan race.
+                let stat = match lstat_at(rooted.root_fd.as_raw_fd(), name, path.as_path()) {
+                    Err(RootedScanError::Metadata { source, .. })
+                        if source.kind() == io::ErrorKind::NotFound =>
+                    {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(Box::new(error)),
+                    Ok(stat) => stat,
+                };
+                if source {
+                    rooted.record_source_name_blocking(
+                        rooted.root_fd.as_raw_fd(),
                         path.as_path(),
-                        stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
-                    )?
-                {
-                    return Ok(());
+                        false,
+                    )?;
                 }
+                if let Some(scope) = &mut scope {
+                    if (!request.include_git_dir && name == OsStr::new(".git"))
+                        || scope.source_match(
+                            path.as_path(),
+                            stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                        )?
+                    {
+                        return Ok(());
+                    }
+                }
+                let inspected =
+                    inspect_entry(rooted.root_fd.as_raw_fd(), name, &path, request, stat)?;
+                let _ = sender.blocking_send(Ok(inspected.entry));
+                Ok(())
+            })();
+            if let Some(attempt) = attempt {
+                attempt.finish(result.is_ok() && !sender.is_closed());
             }
-            let inspected = inspect_entry(rooted.root_fd.as_raw_fd(), name, &path, request, stat)?;
-            let _ = sender.blocking_send(Ok(inspected.entry));
-            Ok(())
+            result
         })
     }
 }
@@ -172,6 +195,9 @@ fn scan_worker(
 ) -> Result<(), BoxError> {
     if request.respect_gitignore && !source {
         return Err(Box::new(RootedScanError::GitignoreUnsupported));
+    }
+    if source {
+        rooted.begin_source_observations_blocking()?;
     }
     let mut scope = source.then(|| {
         crate::engine::ignore_scope::SourceIgnoreScope::with_remote_authority(
@@ -334,9 +360,20 @@ fn prepare_directory(
     path: &Path,
     spool: &mut NameSpool,
     sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
+    source: Option<&RootedFs>,
 ) -> Result<Continuation, RootedScanError> {
     let (device, inode) = directory_identity(directory, path)?;
-    let names = DirectoryStream::open(directory.as_raw_fd())?;
+    let names = DirectoryStream::open(directory.as_raw_fd())?.map(|name| {
+        let name = name?;
+        if let Some(source) = source {
+            let relative = path.join(&name);
+            validate_path_bound(&relative).map_err(io::Error::other)?;
+            source
+                .record_source_name_blocking(directory.as_raw_fd(), &relative, false)
+                .map_err(io::Error::other)?;
+        }
+        Ok(name)
+    });
     let run = spool
         .sort(names, || sender.is_closed())
         .map_err(RootedScanError::Scratch)?;
@@ -388,7 +425,13 @@ fn walk_tree(
         .map_err(RootedScanError::ReadDirectory)?;
     let mut path = PathBuf::new();
     let mut depth = 0;
-    let mut frame = prepare_directory(&directory, &path, &mut spool, sender)?;
+    let mut frame = prepare_directory(
+        &directory,
+        &path,
+        &mut spool,
+        sender,
+        scope.as_ref().map(|_| rooted),
+    )?;
     stack
         .write(depth, frame)
         .map_err(RootedScanError::Scratch)?;
@@ -423,14 +466,19 @@ fn walk_tree(
             );
             continue;
         };
-        if !request.include_git_dir && name.as_bytes() == b".git" {
-            continue;
-        }
         let relative_path = path.join(&name);
         validate_path_bound(&relative_path)?;
         let relative = RelativePath::new(relative_path.clone())
             .map_err(|_| RootedScanError::InvalidRelativePath(relative_path))?;
         let stat = lstat_at(directory.as_raw_fd(), &name, relative.as_path())?;
+        if scope.is_some() {
+            rooted
+                .validate_source_observation_blocking(&relative)
+                .map_err(|error| RootedScanError::SourceIgnore(io::Error::other(error)))?;
+        }
+        if !request.include_git_dir && name.as_bytes() == b".git" {
+            continue;
+        }
         if let Some(scope) = &mut scope {
             if scope
                 .source_match(
@@ -456,7 +504,13 @@ fn walk_tree(
                 directory = child;
                 path = relative.into_path_buf();
                 depth += 1;
-                frame = prepare_directory(&directory, &path, &mut spool, sender)?;
+                frame = prepare_directory(
+                    &directory,
+                    &path,
+                    &mut spool,
+                    sender,
+                    scope.as_ref().map(|_| rooted),
+                )?;
                 stack
                     .write(depth, frame)
                     .map_err(RootedScanError::Scratch)?;

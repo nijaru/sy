@@ -11,8 +11,12 @@ mod group_metadata;
 mod group_tests;
 pub mod operand;
 mod publication;
+#[cfg(unix)]
+mod source_observations;
 mod source_policy;
 mod staging;
+#[cfg(all(test, unix))]
+pub(crate) mod test_source;
 pub use publication::{PublishedEntryProof, PublishedFileProof, RootedPublishedFile};
 #[cfg(unix)]
 use staging::OwnedStagingEntry;
@@ -113,6 +117,15 @@ pub enum RootedFsError {
 
     #[error("root directory identity changed after it was opened: {0}")]
     RootChanged(PathBuf),
+
+    #[error("original source binding changed: {0}")]
+    SourceBindingChanged(PathBuf),
+
+    #[error("source name has no original scanner observation: {0}")]
+    SourceUnobserved(PathBuf),
+
+    #[error("source observation catalogue is terminal")]
+    SourceCatalogueTerminal,
 
     #[error("destination was committed at {path}, but its parent no longer matches the rooted path: {reason}")]
     CommittedParentChanged { path: PathBuf, reason: String },
@@ -229,6 +242,8 @@ pub struct RootedFs {
     // Local source runs reject a divergent configured name as well as retaining
     // the FD. Negotiated remote roots instead intentionally survive relocation.
     source_path_continuity: bool,
+    #[cfg(unix)]
+    source_observations: Arc<std::sync::Mutex<source_observations::CatalogueState>>,
     #[cfg(all(test, unix))]
     mutation_pause: Arc<std::sync::Mutex<Option<(usize, PublicationPause)>>>,
     #[cfg(all(test, unix))]
@@ -1352,6 +1367,20 @@ impl RootedFs {
         self.source_path_continuity
     }
 
+    #[cfg(not(unix))]
+    pub(crate) fn validate_source_observation_blocking(&self, _path: &RelativePath) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_source_reader_blocking(
+        &self,
+        _path: &RelativePath,
+        _file: &std::fs::File,
+    ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
     pub(crate) fn verify_source_root_path_blocking(&self) -> Result<()> {
         if self.source_path_continuity {
             self.verify_root_path_blocking()?;
@@ -1504,7 +1533,8 @@ impl RootedFs {
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
         // Source observations are always exact. Destination retirement is not
         // permission to adopt a new source version, even on an aliasing inode.
-        let expected = if self.source_path_continuity {
+        self.validate_source_observation_blocking(relative)?;
+        let expected = if self.is_source_authority() {
             scanned
         } else {
             lineage.resolve(scanned)?
@@ -1579,8 +1609,10 @@ impl RootedFs {
         &self,
         relative: &RelativePath,
     ) -> Result<crate::endpoint::FileMetadata> {
+        self.validate_source_observation_blocking(relative)?;
         let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
         let stat = stat_at_no_follow(parent.as_raw_fd(), &leaf)?;
+        self.validate_source_observation_blocking(relative)?;
         let seconds = stat.st_mtime as i64;
         let nanoseconds = u32::try_from(stat.st_mtime_nsec).map_err(std::io::Error::other)?;
         let duration = std::time::Duration::new(seconds.unsigned_abs(), nanoseconds);
@@ -2187,7 +2219,8 @@ impl RootedFs {
             .retirement
             .lock()
             .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-        let expected = if self.source_path_continuity {
+        self.validate_source_observation_blocking(relative)?;
+        let expected = if self.is_source_authority() {
             expected
         } else {
             lineage.resolve(expected)?
@@ -2237,7 +2270,12 @@ impl RootedFs {
                 relative.as_path().to_path_buf(),
             ));
         }
-        read_xattrs_from_file(file)
+        #[cfg(unix)]
+        self.validate_source_reader_blocking(relative, file)?;
+        let value = read_xattrs_from_file(file)?;
+        #[cfg(unix)]
+        self.validate_source_reader_blocking(relative, file)?;
+        Ok(value)
     }
 
     /// Mirror an extended-attribute set onto a regular file beneath the
@@ -2279,7 +2317,12 @@ impl RootedFs {
                 relative.as_path().to_path_buf(),
             ));
         }
-        self.read_acl_from_file(file)
+        #[cfg(unix)]
+        self.validate_source_reader_blocking(relative, file)?;
+        let value = self.read_acl_from_file(file)?;
+        #[cfg(unix)]
+        self.validate_source_reader_blocking(relative, file)?;
+        Ok(value)
     }
 
     /// Mirror an access-control list, as exacl unified-entries text, onto one
@@ -2438,6 +2481,7 @@ impl RootedFs {
         Self {
             mutation_admission: RootedMutationAdmission::Unrestricted,
             source_path_continuity: false,
+            source_observations: Arc::new(std::sync::Mutex::new(Default::default())),
             #[cfg(test)]
             mutation_pause: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(all(test, unix))]
@@ -2455,11 +2499,15 @@ impl RootedFs {
 
     #[cfg(unix)]
     fn open_regular_path_blocking(&self, relative: &Path) -> Result<File> {
+        self.validate_source_binding_blocking(relative, true)?;
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let file = open_file_at(parent.as_raw_fd(), &leaf)?;
         if !file.metadata()?.file_type().is_file() {
             return Err(RootedFsError::NotRegularFile(relative.to_path_buf()));
         }
+        let path = RelativePath::new(relative.to_path_buf())
+            .map_err(|_| RootedFsError::InvalidRelativePath)?;
+        self.validate_source_reader_blocking(&path, &file)?;
         Ok(file)
     }
 
@@ -2717,6 +2765,17 @@ impl RootedFs {
         relative: &RelativePath,
         scanned: EntryIdentity,
     ) -> Result<RootedSourceFile> {
+        if matches!(
+            *self
+                .source_observations
+                .lock()
+                .map_err(|_| RootedFsError::SourceCatalogueTerminal)?,
+            source_observations::CatalogueState::Unstarted
+        ) {
+            return Err(RootedFsError::SourceUnobserved(
+                relative.as_path().to_path_buf(),
+            ));
+        }
         let (source, _) = self.open_source_member_blocking(relative.as_path(), scanned, None)?;
         self.validate_source_file_parent_blocking(relative, &source)?;
         Ok(source)
@@ -2737,6 +2796,7 @@ impl RootedFs {
         relative: &RelativePath,
         source: &RootedSourceFile,
     ) -> Result<()> {
+        self.validate_source_observation_blocking(relative)?;
         self.verify_parent_binding_blocking(relative.as_path(), &source.parent)
     }
 
@@ -2756,6 +2816,7 @@ impl RootedFs {
         scanned: EntryIdentity,
         expected: Option<&HardlinkSourceState>,
     ) -> Result<(RootedSourceFile, HardlinkSourceState)> {
+        self.validate_source_binding_blocking(relative, expected.is_none())?;
         let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let file = open_file_at(parent.as_raw_fd(), &leaf)?;

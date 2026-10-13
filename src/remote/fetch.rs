@@ -677,6 +677,7 @@ mod tests {
             let rooted = RootedFs::open(source_root.path().to_path_buf())
                 .await
                 .unwrap();
+            crate::rooted_fs::test_source::scan(&rooted).await;
             let (client_io, server_io) = tokio::io::duplex(4096);
             let (cr, cw) = tokio::io::split(client_io);
             let (sr, sw) = tokio::io::split(server_io);
@@ -753,6 +754,7 @@ mod tests {
             let rooted = RootedFs::open(source_root.path().to_path_buf())
                 .await
                 .unwrap();
+            crate::rooted_fs::test_source::scan(&rooted).await;
             let peer = Platform::current().os;
             let (client_io, server_io) = tokio::io::duplex(4096);
             let (cr, cw) = tokio::io::split(client_io);
@@ -841,6 +843,7 @@ mod tests {
         std::fs::write(root.path().join("dir/file"), &data).unwrap();
         let source = scanned_file(root.path()).await;
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        crate::rooted_fs::test_source::scan(&rooted).await;
         let peer = Platform::current().os;
         let (mut client_io, server_io) = tokio::io::duplex(4096);
         let (sr, sw) = tokio::io::split(server_io);
@@ -943,6 +946,7 @@ mod tests {
             WireFetchCompression::Always,
         ] {
             let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            crate::rooted_fs::test_source::scan(&rooted).await;
             let (mut client_io, server_io) = tokio::io::duplex(4096);
             let (sr, sw) = tokio::io::split(server_io);
             let server = tokio::spawn(async move {

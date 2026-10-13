@@ -168,6 +168,7 @@ fn validate_file(
 
 pub(crate) fn validate_path(rooted: &RootedFs, entry: &Entry) -> Result<()> {
     rooted.verify_source_root_path_blocking()?;
+    rooted.validate_source_observation_blocking(&entry.path)?;
     if entry.identity.is_none()
         || rooted.path_identity_blocking(&entry.path)? != entry.identity.map(|id| (entry.kind, id))
     {
@@ -509,6 +510,7 @@ mod tests {
             let source_rooted = RootedFs::open(source_directory.path().to_path_buf())
                 .await
                 .unwrap();
+            crate::rooted_fs::test_source::scan(&source_rooted).await;
             let source_fingerprint = fingerprint(
                 source_rooted.clone(),
                 source.clone(),
@@ -555,6 +557,7 @@ mod tests {
             let source = observe_file(root.path(), "input");
             let destination = observe_file(root.path(), "renamed");
             let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            crate::rooted_fs::test_source::scan(&rooted).await;
             let options = FingerprintOptions::default();
             let proof = receipt(
                 &source,

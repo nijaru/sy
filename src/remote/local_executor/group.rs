@@ -552,6 +552,8 @@ pub(super) fn validate_source(
     follow: bool,
 ) -> crate::rooted_fs::Result<()> {
     root.validate_blocking()?;
+    root.rooted()
+        .validate_source_observation_blocking(&source.path)?;
     let named = if follow {
         crate::endpoint::local_identity::metadata_identity(
             &std::fs::metadata(root.path().join(source.path.as_path()))?,
@@ -592,10 +594,10 @@ async fn source_preservation_lease_rejects_wrong_fd_even_after_name_restoration(
         .unwrap();
     let source = authority
         .entries(Default::default())
-        .try_next()
+        .try_collect::<Vec<_>>()
         .await
         .unwrap()
-        .unwrap();
+        .remove(0);
     let wrong = File::open(foreign.path().join("file")).unwrap();
     // The operator name is correct again, but the transiently opened descriptor
     // must not supply a different inode's preservation to a no-op receipt.

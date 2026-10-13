@@ -115,12 +115,16 @@ pub(crate) fn source_entry_stream(
     request: ScanRequest,
 ) -> EntryStream {
     EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
+        #[cfg(unix)]
+        let attempt = root.rooted().start_source_scan_blocking()?;
         root.validate_blocking()?;
         let result = scan_result(
             traversal::walk_tree_rooted(&root.rooted(), request, &sender, Default::default()),
             &sender,
         );
         root.validate_blocking()?;
+        #[cfg(unix)]
+        attempt.finish(result.is_ok() && !sender.is_closed());
         result
     })
 }
@@ -132,6 +136,8 @@ pub(crate) fn selected_source_stream(
     missing_allowed: bool,
 ) -> EntryStream {
     EntryStream::spawn_blocking(1, move |sender| {
+        #[cfg(unix)]
+        let attempt = root.rooted().start_source_scan_blocking()?;
         root.validate_blocking()?;
         let result = traversal::selected_leaf_rooted(
             &root.rooted(),
@@ -142,6 +148,8 @@ pub(crate) fn selected_source_stream(
         )
         .map_err(|error| Box::new(error) as BoxError);
         root.validate_blocking()?;
+        #[cfg(unix)]
+        attempt.finish(result.is_ok() && !sender.is_closed());
         result
     })
 }

@@ -8,6 +8,7 @@ fn rel(path: &str) -> RelativePath {
 
 fn observed(root: &SourceRoot, name: &str) -> Entry {
     let path = rel(name);
+    crate::rooted_fs::test_source::selected_blocking(&root.rooted(), path.clone());
     let (kind, identity) = root
         .rooted()
         .path_identity_blocking(&path)
@@ -332,7 +333,7 @@ async fn late_original_source_race_fails_the_complete_source_gate() {
     assert_eq!(error.removed, 0);
     assert!(matches!(
         error.cause,
-        RemovalCause::Rooted(RootedFsError::DestinationChanged(_))
+        RemovalCause::Rooted(RootedFsError::SourceBindingChanged(_))
     ));
     for name in ["a", "b"] {
         assert!(source.path().join(name).exists());
@@ -696,6 +697,7 @@ fn non_h_aliases_replay_under_low_fd_limit_with_one_continuation_per_identity() 
                 .unwrap();
             }
             let root = SourceRoot::open(source.path().into()).await.unwrap();
+            crate::rooted_fs::test_source::scan(&root.rooted()).await;
             let original = observed(&root, "member-0");
             let mut native = NativeState::new(root).unwrap();
             for n in 0..ALIASES {

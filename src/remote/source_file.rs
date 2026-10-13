@@ -54,9 +54,11 @@ impl SourceFile {
         let member = rooted
             .capture_source_file_blocking(&relative, identity)
             .map_err(|error| match error {
-                RootedFsError::DestinationChanged(_) => SourceFileError::Changed {
-                    path: relative.as_path().to_path_buf(),
-                },
+                RootedFsError::DestinationChanged(_) | RootedFsError::SourceBindingChanged(_) => {
+                    SourceFileError::Changed {
+                        path: relative.as_path().to_path_buf(),
+                    }
+                }
                 error => error.into(),
             })?;
         let source = Self {
@@ -111,9 +113,11 @@ impl SourceFile {
         self.rooted
             .validate_source_file_parent_blocking(&self.relative, &self.member)
             .map_err(|error| match error {
-                RootedFsError::DestinationChanged(_) => SourceFileError::Changed {
-                    path: self.relative.as_path().to_path_buf(),
-                },
+                RootedFsError::DestinationChanged(_) | RootedFsError::SourceBindingChanged(_) => {
+                    SourceFileError::Changed {
+                        path: self.relative.as_path().to_path_buf(),
+                    }
+                }
                 error => error.into(),
             })
     }
@@ -123,6 +127,14 @@ impl SourceFile {
         relative: &RelativePath,
         expected: EntryIdentity,
     ) -> Result<()> {
+        self.rooted
+            .validate_source_observation_blocking(relative)
+            .map_err(|error| match error {
+                RootedFsError::SourceBindingChanged(_) => SourceFileError::Changed {
+                    path: relative.as_path().to_path_buf(),
+                },
+                error => error.into(),
+            })?;
         if self.rooted.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
             return Err(SourceFileError::Changed {
                 path: relative.as_path().to_path_buf(),
@@ -189,6 +201,7 @@ mod tests {
 
     fn capture(root: &Path, name: &str) -> SourceFile {
         let rooted = RootedFs::open_blocking_for_worker(root.to_path_buf()).unwrap();
+        crate::rooted_fs::test_source::scan_blocking(&rooted);
         let path = relative(name);
         let (_, identity) = rooted.path_identity_blocking(&path).unwrap().unwrap();
         let size = std::fs::metadata(root.join(name)).unwrap().len();
@@ -332,7 +345,9 @@ mod tests {
         ));
         assert!(matches!(
             nested.read_metadata_blocking(SourceMetadataRequest::default()),
-            Err(SourceFileError::Changed { .. })
+            Err(SourceFileError::Rooted(
+                RootedFsError::SourceCatalogueTerminal
+            ))
         ));
     }
 

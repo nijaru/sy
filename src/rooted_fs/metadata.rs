@@ -262,7 +262,7 @@ impl RootedFs {
                     .retirement
                     .lock()
                     .map_err(|_| std::io::Error::other("retirement authority lock poisoned"))?;
-                let expected = if self.source_path_continuity {
+                let expected = if self.is_source_authority() {
                     expected
                 } else {
                     lineage.resolve(expected)?

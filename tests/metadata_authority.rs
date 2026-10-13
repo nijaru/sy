@@ -239,6 +239,16 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
                     )
                     .await
                     .unwrap();
+                    if matches!(direction, Direction::Pull) {
+                        client
+                            .request_handle()
+                            .scan(request)
+                            .await
+                            .unwrap()
+                            .try_collect::<Vec<_>>()
+                            .await
+                            .unwrap();
+                    }
                     let result = match direction {
                         Direction::Push => {
                             let executor = RemotePushExecutor::new(

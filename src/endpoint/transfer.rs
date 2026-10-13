@@ -381,18 +381,25 @@ impl CommitChecks {
             }
         }
         if let Some(rooted) = &self.source_rooted {
-            rooted.verify_root_path_blocking().map_err(|error| {
-                if matches!(error, crate::rooted_fs::RootedFsError::RootChanged(_)) {
-                    SyncError::SourceChanged {
-                        path: self.source.as_ref().map_or_else(
-                            || rooted.root_path().join(self.source_relative.as_path()),
-                            |source| source.path.clone(),
-                        ),
+            rooted
+                .verify_root_path_blocking()
+                .and_then(|()| rooted.validate_source_observation_blocking(&self.source_relative))
+                .map_err(|error| {
+                    if matches!(
+                        error,
+                        crate::rooted_fs::RootedFsError::RootChanged(_)
+                            | crate::rooted_fs::RootedFsError::SourceBindingChanged(_)
+                    ) {
+                        SyncError::SourceChanged {
+                            path: self.source.as_ref().map_or_else(
+                                || rooted.root_path().join(self.source_relative.as_path()),
+                                |source| source.path.clone(),
+                            ),
+                        }
+                    } else {
+                        SyncError::Io(std::io::Error::other(error))
                     }
-                } else {
-                    SyncError::Io(std::io::Error::other(error))
-                }
-            })?;
+                })?;
         }
         if let Some(expected) = &self.source {
             let matches = if let Some(rooted) = self
@@ -1519,6 +1526,71 @@ mod tests {
 
     fn hook(mutate: impl Fn() + Send + Sync + 'static) -> RaceHook {
         Arc::new(mutate)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn original_source_binding_is_required_at_commit_even_when_bytes_and_inode_match() {
+        use futures::TryStreamExt;
+
+        for follow in [false, true] {
+            let fixture = Fixture::new();
+            let root = fixture.source_root.path();
+            std::fs::create_dir(root.join("original")).unwrap();
+            std::fs::create_dir(root.join("foreign")).unwrap();
+            std::fs::write(root.join("original/file"), b"NEW!").unwrap();
+            std::fs::hard_link(root.join("original/file"), root.join("foreign/file")).unwrap();
+            std::os::unix::fs::symlink("original/file", root.join("link")).unwrap();
+            std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
+            let authority = crate::endpoint::source_root::SourceRoot::open(root.to_path_buf())
+                .await
+                .unwrap();
+            let request = crate::engine::scan::ScanRequest {
+                follow_symlinks: follow,
+                ..Default::default()
+            };
+            let path = if follow { "link" } else { "original/file" };
+            let source_entry = authority
+                .entries(request)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|entry| entry.path.as_path() == Path::new(path))
+                .unwrap();
+            let source_identity = source_entry.identity.unwrap();
+            let mut transfer_options = options(
+                TransferIdentity {
+                    source: SourceExpectation::Scanned(source_identity),
+                    destination: ExpectedDestination::Unchanged(identity_of(&fixture.dest_file())),
+                },
+                true,
+            );
+            transfer_options.follow_symlinks = follow;
+            let root = root.to_path_buf();
+            let mutation = hook(move || {
+                if follow {
+                    std::fs::remove_file(root.join("link")).unwrap();
+                    std::os::unix::fs::symlink("foreign/file", root.join("link")).unwrap();
+                } else {
+                    std::fs::rename(root.join("original"), root.join("held")).unwrap();
+                    std::fs::rename(root.join("foreign"), root.join("original")).unwrap();
+                }
+            });
+            let error = transfer_file_with_hook(
+                &authority.endpoint(),
+                Path::new(path),
+                &fixture.dest_endpoint(),
+                Path::new(NAME),
+                transfer_options,
+                mutation,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, SyncError::SourceChanged { .. }), "{error}");
+            assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
+            assert_eq!(fixture.dest_entries(), 1, "abort cleans only its own stage");
+        }
     }
 
     #[cfg(unix)]

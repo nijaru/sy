@@ -48,9 +48,12 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
         let authority = sy::endpoint::source_root::SourceRoot::open(source.path().into())
             .await
             .unwrap();
-        let mut source_entries = authority.entries(request);
-        let source_entry = source_entries.try_next().await.unwrap().unwrap();
-        source_entries.close().await.unwrap();
+        let source_entry = authority
+            .entries(request)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
         let mut destination_entries =
             sy::endpoint::local_entry_scan::local_entry_stream(destination.path().into(), request);
         let destination_entry = destination_entries.try_next().await.unwrap().unwrap();
@@ -89,6 +92,9 @@ async fn quick_unchanged_local_and_pull_preservation_keeps_destination_payload_a
             )
             .await
             .unwrap();
+            let mut remote_entries = client.request_handle().scan(request).await.unwrap();
+            while remote_entries.try_next().await.unwrap().is_some() {}
+            remote_entries.close().await.unwrap();
             let executor = RemotePullExecutor::new(
                 destination.path().into(),
                 client.request_handle(),

@@ -158,6 +158,9 @@ fn rooted_expected_destination(expected: ExpectedDestination) -> sy::endpoint::E
 fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
     match error {
         sy::rooted_fs::RootedFsError::Io(error) => SyncError::Io(error),
+        sy::rooted_fs::RootedFsError::SourceBindingChanged(path) => {
+            SyncError::SourceChanged { path }
+        }
         sy::rooted_fs::RootedFsError::DestinationChanged(path)
         | sy::rooted_fs::RootedFsError::StagingEntryChanged(path) => {
             SyncError::DestinationChanged { path }
@@ -1122,12 +1125,19 @@ impl Endpoint for LocalEndpoint {
         // Following is an explicit local --copy-links contract. Retain the
         // original root around the external target observation as well.
         let rooted = self.rooted_fs(false).await?;
+        let relative = self.relative_path(path)?;
         let path = self.resolve(path);
         tokio::task::spawn_blocking(move || {
+            rooted
+                .validate_source_observation_blocking(&relative)
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
             rooted
                 .verify_root_path_blocking()
                 .map_err(|error| map_rooted_read_error(&rooted, error))?;
             let metadata = fs::metadata(path)?;
+            rooted
+                .validate_source_observation_blocking(&relative)
+                .map_err(|error| map_rooted_read_error(&rooted, error))?;
             rooted
                 .verify_root_path_blocking()
                 .map_err(|error| map_rooted_read_error(&rooted, error))?;
@@ -1335,6 +1345,9 @@ impl Endpoint for LocalEndpoint {
                 rooted
                     .verify_root_path_blocking()
                     .map_err(|error| map_rooted_read_error(&rooted, error))?;
+                rooted
+                    .validate_source_observation_blocking(&relative)
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 // --copy-links explicitly follows the leaf (and intermediate)
                 // symlinks. O_NONBLOCK prevents a raced FIFO replacement from
                 // pinning this worker before descriptor-type validation.
@@ -1349,6 +1362,9 @@ impl Endpoint for LocalEndpoint {
                     ));
                 }
                 use std::os::fd::AsRawFd;
+                rooted
+                    .validate_source_reader_blocking(&relative, &file)
+                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
                 let fd = file.as_raw_fd();
                 // SAFETY: `fd` is a live open descriptor.
                 let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };

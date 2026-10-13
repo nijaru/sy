@@ -296,9 +296,30 @@ fn reopen(
     Ok(directory)
 }
 
-fn prepare(directory: &Directory, spool: &mut NameSpool, sender: &Sender) -> io::Result<Frame> {
+fn prepare(
+    directory: &Directory,
+    spool: &mut NameSpool,
+    sender: &Sender,
+    rooted: Option<&crate::rooted_fs::RootedFs>,
+    path: &Path,
+    follow: bool,
+) -> io::Result<Frame> {
     let identity = directory.identity()?;
-    let run = spool.sort(directory.names()?, || sender.is_closed())?;
+    // Native enumeration establishes originals; scratch names may only refer
+    // back to these records, never establish a new binding after spilling.
+    let names = directory.names()?.map(|name| {
+        let name = name?;
+        #[cfg(unix)]
+        if let Some(rooted) = rooted {
+            rooted
+                .record_source_name_blocking(directory.file.as_raw_fd(), &path.join(&name), follow)
+                .map_err(io::Error::other)?;
+        }
+        #[cfg(not(unix))]
+        let _ = (rooted, path, follow);
+        Ok(name)
+    });
+    let run = spool.sort(names, || sender.is_closed())?;
     Ok(Frame {
         run,
         offset: 0,
@@ -345,7 +366,7 @@ pub(super) fn selected_leaf(
         missing_allowed,
         sender,
         SourceIgnoreScope::new(root, request.respect_gitignore),
-        || Directory::root(root),
+        None,
     )
 }
 
@@ -363,7 +384,7 @@ pub(super) fn selected_leaf_rooted(
         missing_allowed,
         sender,
         SourceIgnoreScope::with_rooted_authority(rooted.clone(), request.respect_gitignore),
-        || Directory::held(rooted),
+        Some(rooted),
     )
 }
 
@@ -374,20 +395,36 @@ fn selected_leaf_with_root(
     missing_allowed: bool,
     sender: &Sender,
     mut scope: SourceIgnoreScope,
-    open_root: impl FnOnce() -> io::Result<Directory>,
+    rooted: Option<&crate::rooted_fs::RootedFs>,
 ) -> Result<(), LocalScanError> {
     if relative.as_path().components().count() != 1 {
         return Err(LocalScanError::OutsideRoot {
             path: relative.as_path().to_path_buf(),
         });
     }
-    let directory = match open_root() {
+    #[cfg(unix)]
+    if let Some(rooted) = rooted {
+        rooted
+            .begin_source_observations_blocking()
+            .map_err(io::Error::other)?;
+    }
+    let directory = match rooted.map_or_else(|| Directory::root(root), Directory::held) {
         Ok(directory) => directory,
         Err(error) if missing_allowed && error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
     };
     let expected = directory.identity()?;
     let absolute = root.join(relative.as_path());
+    #[cfg(unix)]
+    if let Some(rooted) = rooted {
+        rooted
+            .record_source_name_blocking(
+                directory.file.as_raw_fd(),
+                relative.as_path(),
+                request.follow_symlinks,
+            )
+            .map_err(io::Error::other)?;
+    }
     let metadata = match entry_metadata(&absolute, request) {
         Ok(metadata) => Some(metadata),
         Err(LocalScanError::Metadata { source, .. })
@@ -439,6 +476,7 @@ pub(super) fn walk_tree(
         budget,
         Directory::root(root)?,
         SourceIgnoreScope::new(root, request.respect_gitignore),
+        None,
     )
 }
 
@@ -455,6 +493,7 @@ pub(super) fn walk_tree_rooted(
         budget,
         Directory::held(rooted)?,
         SourceIgnoreScope::with_rooted_authority(rooted.clone(), request.respect_gitignore),
+        Some(rooted),
     )
 }
 
@@ -465,7 +504,14 @@ fn walk_tree_with_root(
     budget: SortBudget,
     mut directory: Directory,
     mut scope: SourceIgnoreScope,
+    rooted: Option<&crate::rooted_fs::RootedFs>,
 ) -> Result<(), LocalScanError> {
+    #[cfg(unix)]
+    if let Some(rooted) = rooted {
+        rooted
+            .begin_source_observations_blocking()
+            .map_err(io::Error::other)?;
+    }
     scope.prepare_source()?;
     if request.max_depth == Some(0) {
         return Ok(());
@@ -479,7 +525,14 @@ fn walk_tree_with_root(
     ];
     let mut path = PathBuf::new();
     let mut depth = 0;
-    let mut frame = prepare(&directory, &mut spool, sender)?;
+    let mut frame = prepare(
+        &directory,
+        &mut spool,
+        sender,
+        rooted,
+        &path,
+        request.follow_symlinks,
+    )?;
     stack.write(0, frame)?;
     let mut names = BufReader::new(spool.open(frame.run, 0)?);
     let result = (|| {
@@ -505,6 +558,18 @@ fn walk_tree_with_root(
             };
             let relative = path.join(&name);
             let absolute = root.join(&relative);
+            #[cfg(unix)]
+            if let Some(rooted) = rooted {
+                let selected = crate::engine::domain::RelativePath::new(relative.clone()).map_err(
+                    |source| LocalScanError::RelativePath {
+                        path: relative.clone(),
+                        source,
+                    },
+                )?;
+                rooted
+                    .validate_source_observation_blocking(&selected)
+                    .map_err(io::Error::other)?;
+            }
             let metadata = entry_metadata(&absolute, request)?;
             if scratch[0].matches(&absolute, &metadata, request.follow_symlinks)?
                 || scratch[1].matches(&absolute, &metadata, request.follow_symlinks)?
@@ -551,7 +616,14 @@ fn walk_tree_with_root(
                 directory = child;
                 path = relative;
                 depth += 1;
-                frame = prepare(&directory, &mut spool, sender)?;
+                frame = prepare(
+                    &directory,
+                    &mut spool,
+                    sender,
+                    rooted,
+                    &path,
+                    request.follow_symlinks,
+                )?;
                 stack.write(depth, frame)?;
                 names = BufReader::new(spool.open(frame.run, 0)?);
             }

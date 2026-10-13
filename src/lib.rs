@@ -8,6 +8,7 @@ pub mod sync;
 pub mod temp_file;
 
 // Internal modules — public for binary/test access, not part of stable API
+mod authenticated_index;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]

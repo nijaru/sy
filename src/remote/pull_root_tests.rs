@@ -60,6 +60,13 @@ async fn pull_metadata_refuses_replaced_local_root_and_reports_admitted_effects(
         )
         .await
         .unwrap();
+        client
+            .scan(request)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
         let executor = Arc::new(RemotePullExecutor::new(
             root.clone(),
             client.request_handle(),

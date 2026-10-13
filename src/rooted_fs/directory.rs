@@ -18,6 +18,7 @@ pub struct DirectoryPreservationRequest {
 impl RootedFs {
     #[cfg(unix)]
     fn observed_directory(&self, path: &RelativePath, expected: EntryIdentity) -> Result<File> {
+        self.validate_source_observation_blocking(path)?;
         let file = self.open_xattr_entry_blocking(path.as_path(), EntryKind::Directory)?;
         if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected)
             || self.path_identity_blocking(path)? != Some((EntryKind::Directory, expected))
@@ -26,6 +27,7 @@ impl RootedFs {
                 path.as_path().to_path_buf(),
             ));
         }
+        self.validate_source_reader_blocking(path, &file)?;
         Ok(file)
     }
 
@@ -92,6 +94,7 @@ impl RootedFs {
     ) -> Result<()> {
         #[cfg(unix)]
         {
+            self.require_writable()?;
             let preservation = MetadataPreservation {
                 xattrs: preservation.xattrs.as_deref(),
                 acl: preservation.acl.as_deref(),

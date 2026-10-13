@@ -551,6 +551,7 @@ mod tests {
                 .unwrap();
             }
             let source_root = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
+            crate::rooted_fs::test_source::scan(&source_root.rooted()).await;
             let rooted = source_root.rooted();
             let journal = HardlinkRemovalJournal::default();
             let destination = tempfile::tempdir().unwrap();
@@ -713,6 +714,7 @@ mod tests {
         std::fs::write(root.path().join("a"), b"same").unwrap();
         std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
         let source_root = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
+        crate::rooted_fs::test_source::scan(&source_root.rooted()).await;
         let rooted = source_root.rooted();
         let (_, a_identity) = rooted.path_identity_blocking(&rel("a")).unwrap().unwrap();
         let (_, b_identity) = rooted.path_identity_blocking(&rel("b")).unwrap().unwrap();

@@ -294,6 +294,18 @@ async fn run_case(
                 ClientRemoteSession::connect(cr, cw, operation, root, RouterConfig::default())
                     .await
                     .unwrap();
+            if matches!(direction, Direction::Pull) {
+                // PULL originals belong to the serving session, not the local
+                // fixture scan used to build the direction-neutral plan.
+                client
+                    .request_handle()
+                    .scan(request)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+            }
             let result = if matches!(direction, Direction::Push) {
                 let executor = RemotePushExecutor::new(
                     authority,

@@ -335,6 +335,7 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     let alias = destination.path().join("alias");
     std::fs::write(source.path().join("file"), b"only copy").unwrap();
     std::os::unix::fs::symlink(source.path(), &alias).unwrap();
+    std::fs::hard_link(source.path().join("file"), destination.path().join("file")).unwrap();
     let authority = sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
         .await
         .unwrap();
@@ -355,7 +356,6 @@ async fn root_aliases_are_refused_but_distinct_hardlink_names_are_allowed() {
     .is_err());
     assert!(source.path().join("file").exists());
 
-    std::fs::hard_link(source.path().join("file"), destination.path().join("file")).unwrap();
     let source_entry = observed(authority.entries(ScanRequest::default())).await;
     let mut dest_scan =
         local_entry_stream(destination.path().to_path_buf(), ScanRequest::default());

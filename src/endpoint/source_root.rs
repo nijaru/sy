@@ -94,12 +94,12 @@ mod tests {
         std::fs::hard_link(original.join("file"), replacement.join("file")).unwrap();
         let root = SourceRoot::open(original.clone()).await.unwrap();
         let endpoint = root.endpoint();
-        assert_eq!(endpoint.metadata(Path::new("file")).await.unwrap().size, 4);
         let entries: Vec<_> = root
             .entries(Default::default())
             .map(|entry| entry.unwrap())
             .collect()
             .await;
+        assert_eq!(endpoint.metadata(Path::new("file")).await.unwrap().size, 4);
         let source = entries[0].clone();
         std::fs::rename(&original, &held).unwrap();
         std::fs::rename(&replacement, &original).unwrap();

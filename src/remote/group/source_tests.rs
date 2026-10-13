@@ -47,6 +47,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             .unwrap();
         }
         let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        crate::rooted_fs::test_source::scan(&rooted).await;
         let rooted_for_worker = rooted.clone();
         let identity = tokio::task::spawn_blocking(move || {
             rooted_for_worker
