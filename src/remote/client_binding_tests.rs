@@ -36,6 +36,12 @@ async fn acquisition_is_one_shared_acknowledged_epoch_for_all_handles() {
         let second = first.clone();
         let independently_obtained = client.request_handle();
         assert!(first.binding().pending);
+        let namespace = first.begin_namespace_qualification().await.unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
         let (a, b) = tokio::join!(
             first.acquire_root_for_create(&selected),
             second.acquire_root_for_create(&selected),
@@ -43,14 +49,8 @@ async fn acquisition_is_one_shared_acknowledged_epoch_for_all_handles() {
         a.unwrap();
         b.unwrap();
         let newly_obtained = client.request_handle();
-        let actual = crate::rooted_fs::RootedFs::open(root.clone())
-            .await
-            .unwrap();
-        let namespace = actual.namespace_semantics().await.unwrap();
-        assert_eq!(client.namespace_semantics(), namespace);
         for handle in [&first, &second, &independently_obtained, &newly_obtained] {
             assert!(!handle.binding().pending);
-            assert_eq!(handle.namespace_semantics(), namespace);
             handle.acquire_root_for_create(&selected).await.unwrap();
         }
         newly_obtained

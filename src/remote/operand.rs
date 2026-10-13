@@ -71,7 +71,6 @@ pub(super) fn native_shape(shape: &SourceShape) -> Result<WireShape> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::engine::namespace::NamespaceSemantics;
     use crate::protocol::Operation;
     use crate::remote::router::RouterConfig;
     use crate::remote::runtime::ClientRemoteSession;
@@ -108,10 +107,6 @@ mod tests {
             .unwrap();
             let remote = client.request_handle();
             assert!(remote.binding().pending);
-            assert_eq!(
-                remote.namespace_semantics(),
-                NamespaceSemantics::UNSPECIFIED
-            );
             assert_eq!(remote.binding().modtime_precision_ns, 0);
             let scan = remote
                 .scan_entry(Default::default(), selected.clone())
@@ -119,6 +114,12 @@ mod tests {
                 .unwrap();
             assert!(scan.try_collect::<Vec<_>>().await.unwrap().is_empty());
             assert!(!root.parent().unwrap().exists());
+            let namespace = remote.begin_namespace_qualification().await.unwrap();
+            namespace
+                .qualify(crate::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace.seal().await.unwrap();
             if wrong_target {
                 assert!(remote.acquire_root_for_create(&name).await.is_err());
                 assert!(server.await.unwrap().is_err());
@@ -127,13 +128,6 @@ mod tests {
             } else {
                 remote.acquire_root_for_create(&selected).await.unwrap();
                 assert!(!remote.binding().pending);
-                let actual = crate::rooted_fs::RootedFs::open(root.clone())
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    remote.namespace_semantics(),
-                    actual.namespace_semantics().await.unwrap()
-                );
                 let held = fixture.path().join("held");
                 std::fs::rename(&root, &held).unwrap();
                 let foreign = fixture.path().join("foreign");

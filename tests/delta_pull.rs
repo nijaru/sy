@@ -68,7 +68,7 @@ async fn routed_delta_pull_reuses_old_blocks_and_preserves_native_metadata() {
         .await
         .unwrap();
         assert!(client.capabilities().delta_pull);
-        let executor = RemotePullExecutor::new(
+        let mut executor = RemotePullExecutor::new(
             destination.path().to_path_buf(),
             client.request_handle(),
             client.sender(),
@@ -90,19 +90,19 @@ async fn routed_delta_pull_reuses_old_blocks_and_preserves_native_metadata() {
             respect_gitignore: false,
             ..Default::default()
         };
-        let (namespace_semantics, dest) = executor.destination_entries(request).await.unwrap();
+        let (namespace, dest) = executor.destination_entries(request).await.unwrap();
         let remote = client.scan(request).await.unwrap();
         let plan = preflight_sync(
             remote,
             dest,
             ComparisonPolicy {
-                namespace_semantics,
                 mode: ComparisonMode::SizeOnly,
                 preserve_permissions: preserve,
                 preserve_times: preserve,
                 ..Default::default()
             },
             None,
+            sy::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
             |_| false,
         )
         .await
@@ -211,7 +211,7 @@ async fn four_concurrent_delta_pulls_progress_with_server_byte_admission() {
     )
     .await
     .unwrap();
-    let executor = RemotePullExecutor::new(
+    let mut executor = RemotePullExecutor::new(
         destination.path().to_path_buf(),
         client.request_handle(),
         client.sender(),
@@ -226,17 +226,17 @@ async fn four_concurrent_delta_pulls_progress_with_server_byte_admission() {
         respect_gitignore: false,
         ..Default::default()
     };
-    let (namespace_semantics, dest) = executor.destination_entries(request).await.unwrap();
+    let (namespace, dest) = executor.destination_entries(request).await.unwrap();
     let remote = client.scan(request).await.unwrap();
     let plan = preflight_sync(
         remote,
         dest,
         ComparisonPolicy {
-            namespace_semantics,
             mode: ComparisonMode::SizeOnly,
             ..Default::default()
         },
         None,
+        sy::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
         |_| false,
     )
     .await

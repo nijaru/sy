@@ -1,3 +1,6 @@
+#[cfg(all(test, unix))]
+#[path = "backup_delete_tests.rs"]
+mod backup_delete_tests;
 #[path = "client.rs"]
 mod client;
 #[path = "directory.rs"]
@@ -89,6 +92,9 @@ pub enum RemoteSessionError {
 
     #[error(transparent)]
     SourceIgnore(#[from] crate::remote::source_ignore::SourceIgnoreError),
+
+    #[error(transparent)]
+    Namespace(#[from] crate::remote::namespace::NamespaceRpcError),
 
     #[error(transparent)]
     Signature(#[from] RemoteSignatureError),
@@ -217,10 +223,6 @@ impl ClientRemoteSession {
 
     pub const fn capabilities(&self) -> &EndpointCapabilities {
         &self.capabilities
-    }
-
-    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
-        self.binding.ready().namespace_semantics.into()
     }
 
     pub fn sender(&self) -> RouterSender {
@@ -452,6 +454,8 @@ impl ClientRemoteSession {
 
 pub enum IncomingRequest {
     AcquireRoot(IncomingStream),
+    NamespaceBegin(IncomingStream),
+    Namespace(IncomingStream),
     Scan(IncomingStream),
     SourceIgnore(IncomingStream),
     Hash(IncomingStream),
@@ -612,6 +616,7 @@ impl ServerBsdFlagsHandler {
 pub struct ServerRemoteSession {
     opened: OpenedServerSession,
     router: FrameRouter,
+    namespace: Option<std::sync::Arc<dyn crate::engine::namespace::NamespaceQualification>>,
 }
 
 impl ServerRemoteSession {
@@ -621,6 +626,25 @@ impl ServerRemoteSession {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let mut opened = server_handshake(&mut reader, &mut writer).await?;
+        if opened.operation != Operation::Pull {
+            let mut destination = match opened.rooted {
+                SessionRoot::Present(rooted) => {
+                    crate::rooted_fs::operand::DestinationRoot::Present(rooted)
+                }
+                SessionRoot::Pending(pending) => {
+                    crate::rooted_fs::operand::DestinationRoot::Pending(pending)
+                }
+            };
+            destination.require_namespace_qualification();
+            opened.rooted = match destination {
+                crate::rooted_fs::operand::DestinationRoot::Present(rooted) => {
+                    SessionRoot::Present(rooted)
+                }
+                crate::rooted_fs::operand::DestinationRoot::Pending(pending) => {
+                    SessionRoot::Pending(pending)
+                }
+            };
+        }
         let router = FrameRouter::start(reader, writer, RouterRole::Server, config)?;
         match &mut opened.rooted {
             SessionRoot::Present(rooted) => rooted.bind_session_mutations(
@@ -632,7 +656,11 @@ impl ServerRemoteSession {
                 opened.operation != Operation::Push,
             ),
         }
-        Ok(Self { opened, router })
+        Ok(Self {
+            opened,
+            router,
+            namespace: None,
+        })
     }
 
     pub fn client(&self) -> &ClientHello {
@@ -684,6 +712,53 @@ impl ServerRemoteSession {
             self.router.sender(),
             self.opened.client.platform.os,
         ))
+    }
+
+    pub(super) fn namespace_handler(&self) -> Option<crate::remote::namespace::NamespaceHandler> {
+        self.namespace
+            .as_ref()
+            .map(|authority| crate::remote::namespace::NamespaceHandler {
+                authority: std::sync::Arc::clone(authority),
+                sender: self.sender(),
+                peer: self.client().platform.os,
+                resolved: self.ready().resolved.clone(),
+            })
+    }
+
+    /// The serve owner has drained earlier requests before replacing a run's
+    /// catalogue. Pending acquisition transfers it rather than reconstructing it.
+    pub(super) async fn begin_namespace(
+        &mut self,
+        inbox: crate::remote::router::StreamInbox,
+    ) -> Result<()> {
+        let root = match &self.opened.rooted {
+            SessionRoot::Present(rooted) => {
+                crate::rooted_fs::operand::DestinationRoot::Present(rooted.clone())
+            }
+            SessionRoot::Pending(pending) => {
+                crate::rooted_fs::operand::DestinationRoot::Pending(pending.clone())
+            }
+        };
+        let (bound, authority) = root
+            .with_namespace_qualification()
+            .await
+            .map_err(crate::remote::namespace::NamespaceRpcError::from)?;
+        self.opened.rooted = match bound {
+            crate::rooted_fs::operand::DestinationRoot::Present(rooted) => {
+                SessionRoot::Present(rooted)
+            }
+            crate::rooted_fs::operand::DestinationRoot::Pending(pending) => {
+                SessionRoot::Pending(pending)
+            }
+        };
+        self.namespace = Some(std::sync::Arc::new(authority));
+        crate::remote::namespace::reply_and_ack(
+            &self.sender(),
+            inbox,
+            crate::protocol::WireNamespaceResult::Begun,
+        )
+        .await?;
+        Ok(())
     }
 
     pub fn hash_handler(&self) -> Result<ServerHashHandler> {
@@ -795,13 +870,8 @@ impl ServerRemoteSession {
             .acquire()
             .await
             .map_err(crate::remote::RemoteError::from)?;
-        let namespace = rooted
-            .namespace_semantics()
-            .await
-            .map_err(crate::remote::RemoteError::from)?;
         self.opened.rooted = SessionRoot::Present(rooted);
         self.opened.ready.pending = false;
-        self.opened.ready.namespace_semantics = namespace.into();
         let ack = crate::protocol::Frame::new(
             FrameKind::Ack,
             crate::protocol::FrameFlags::empty(),
@@ -822,7 +892,12 @@ impl ServerRemoteSession {
         };
 
         let kind = incoming.first.frame().kind();
-        if !self.has_root() && kind != FrameKind::ScanRequest && kind != FrameKind::AcquireRoot {
+        if !self.has_root()
+            && !matches!(
+                kind,
+                FrameKind::ScanRequest | FrameKind::AcquireRoot | FrameKind::NamespaceRequest
+            )
+        {
             return Err(RemoteSessionError::OperationMismatch {
                 operation: self.operation(),
                 kind,
@@ -832,6 +907,20 @@ impl ServerRemoteSession {
             FrameKind::AcquireRoot if self.operation() == Operation::Push && !self.has_root() => {
                 Ok(Some(IncomingRequest::AcquireRoot(incoming)))
             }
+            FrameKind::NamespaceRequest if self.operation() != Operation::Pull => {
+                let request =
+                    crate::protocol::WireNamespaceRequest::decode(incoming.first.frame().payload())
+                        .map_err(crate::remote::RemoteError::from)?;
+                if request == crate::protocol::WireNamespaceRequest::Begin {
+                    Ok(Some(IncomingRequest::NamespaceBegin(incoming)))
+                } else {
+                    Ok(Some(IncomingRequest::Namespace(incoming)))
+                }
+            }
+            FrameKind::NamespaceRequest => Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation(),
+                kind,
+            }),
             FrameKind::ScanRequest => Ok(Some(IncomingRequest::Scan(incoming))),
             FrameKind::SourceIgnoreRequest if self.operation() == Operation::Pull => {
                 Ok(Some(IncomingRequest::SourceIgnore(incoming)))
@@ -973,7 +1062,9 @@ impl ServerRemoteSession {
                 | IncomingRequest::Mutation(incoming)
                 | IncomingRequest::Xattr(incoming)
                 | IncomingRequest::Acl(incoming)
-                | IncomingRequest::BsdFlags(incoming) => incoming,
+                | IncomingRequest::BsdFlags(incoming)
+                | IncomingRequest::NamespaceBegin(incoming)
+                | IncomingRequest::Namespace(incoming) => incoming,
             };
             scope::authorize(
                 &self.opened.ready.resolved,
@@ -1072,6 +1163,44 @@ async fn preview_requests_have_only_the_observed_read_authority() {
             assert_eq!(root.exists(), present);
             if present {
                 assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl ServerRemoteSession {
+    /// Manual fault/counter fixtures use the real serial namespace phase, then
+    /// construct their effect handlers from the newly bound session owner.
+    pub(crate) async fn next_fixture_request(
+        &mut self,
+        tasks: &mut tokio::task::JoinSet<std::result::Result<(), String>>,
+    ) -> Option<IncomingRequest> {
+        loop {
+            let Some(request) = self.next_request().await.unwrap() else {
+                while let Some(joined) = tasks.join_next().await {
+                    joined.unwrap().unwrap();
+                }
+                return None;
+            };
+            match request {
+                IncomingRequest::NamespaceBegin(incoming) => {
+                    let (request, inbox) =
+                        crate::remote::namespace::decode_request(incoming).unwrap();
+                    assert_eq!(request, crate::protocol::WireNamespaceRequest::Begin);
+                    while let Some(joined) = tasks.join_next().await {
+                        joined.unwrap().unwrap();
+                    }
+                    self.begin_namespace(inbox).await.unwrap();
+                }
+                IncomingRequest::Namespace(incoming) => {
+                    self.namespace_handler()
+                        .unwrap()
+                        .serve(incoming)
+                        .await
+                        .unwrap();
+                }
+                request => return Some(request),
             }
         }
     }
@@ -1244,7 +1373,9 @@ mod tests {
                     | IncomingRequest::Xattr(_)
                     | IncomingRequest::Acl(_)
                     | IncomingRequest::BsdFlags(_)
-                    | IncomingRequest::AcquireRoot(_) => {
+                    | IncomingRequest::AcquireRoot(_)
+                    | IncomingRequest::NamespaceBegin(_)
+                    | IncomingRequest::Namespace(_) => {
                         panic!("unexpected mutation request")
                     }
                 }
@@ -1330,12 +1461,17 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.file_handler().unwrap();
-            let request = session.next_request().await.unwrap().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            let request = session.next_fixture_request(&mut tasks).await.unwrap();
             let IncomingRequest::File(incoming) = request else {
                 panic!("expected file request");
             };
-            handler.serve(incoming).await.unwrap()
+            session
+                .file_handler()
+                .unwrap()
+                .serve(incoming)
+                .await
+                .unwrap()
         });
 
         let session = ClientRemoteSession::connect(
@@ -1347,6 +1483,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let namespace = session
+            .request_handle()
+            .begin_namespace_qualification()
+            .await
+            .unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        drop(namespace);
         let sent = session
             .transfer_file(
                 authority,
@@ -1383,12 +1530,17 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.metadata_handler().unwrap();
-            let request = session.next_request().await.unwrap().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            let request = session.next_fixture_request(&mut tasks).await.unwrap();
             let IncomingRequest::Metadata(incoming) = request else {
                 panic!("expected metadata request");
             };
-            handler.serve(incoming).await.unwrap();
+            session
+                .metadata_handler()
+                .unwrap()
+                .serve(incoming)
+                .await
+                .unwrap();
         });
 
         let session = ClientRemoteSession::connect(
@@ -1400,6 +1552,17 @@ mod tests {
         )
         .await
         .unwrap();
+        let namespace = session
+            .request_handle()
+            .begin_namespace_qualification()
+            .await
+            .unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        drop(namespace);
         let modified = Timestamp::new(1_600_000_020, 0).unwrap();
         session
             .apply_metadata(
@@ -1435,20 +1598,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let handler = session.mutation_handler().unwrap();
-            for _ in 0..4 {
-                let request = session.next_request().await.unwrap().unwrap();
-                let IncomingRequest::Mutation(incoming) = request else {
-                    panic!("expected mutation request");
-                };
-                handler.serve(incoming).await.unwrap();
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1459,7 +1613,23 @@ mod tests {
         )
         .await
         .unwrap();
+        let namespace = session
+            .request_handle()
+            .begin_namespace_qualification()
+            .await
+            .unwrap();
         let dir = RelativePath::new("dir").unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                dir.clone(),
+            ))
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
         session.create_directory(&dir).await.unwrap();
         let link = RelativePath::new("link").unwrap();
         session
@@ -1471,7 +1641,13 @@ mod tests {
             .await
             .unwrap();
         session.remove(&dir, true, None).await.unwrap();
-        server.await.unwrap();
+        drop(namespace);
+        drop(session);
+        let result = server.await.unwrap();
+        if let Err(error) = result {
+            assert!(matches!(error, crate::remote::serve::ServeError::Session(
+                RemoteSessionError::Router(error)) if matches!(error.as_ref(), crate::remote::router::RouterError::TransportEof)));
+        }
 
         assert!(!destination_root.path().join("old").exists());
         assert!(!destination_root.path().join("dir").exists());
@@ -1521,13 +1697,18 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let handler = session.file_handler().unwrap();
             ready_tx.send(()).unwrap();
-            let request = session.next_request().await.unwrap().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            let request = session.next_fixture_request(&mut tasks).await.unwrap();
             let IncomingRequest::File(incoming) = request else {
                 panic!("expected file request");
             };
-            handler.serve(incoming).await.unwrap();
+            session
+                .file_handler()
+                .unwrap()
+                .serve(incoming)
+                .await
+                .unwrap();
         });
 
         let session = ClientRemoteSession::connect(
@@ -1540,6 +1721,17 @@ mod tests {
         .await
         .unwrap();
         ready_rx.await.unwrap();
+        let namespace = session
+            .request_handle()
+            .begin_namespace_qualification()
+            .await
+            .unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        drop(namespace);
         std::fs::rename(&root_path, &moved_path).unwrap();
         symlink(outside.path(), &root_path).unwrap();
 

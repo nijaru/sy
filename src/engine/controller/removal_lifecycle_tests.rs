@@ -132,6 +132,7 @@ async fn routed_push_source_failure_cuts_off_waiting_worker_before_owned_drain()
         remote.scan(request).await.unwrap(),
         ComparisonPolicy::default(),
         None,
+        crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
         |_| true,
     )
     .await
@@ -250,15 +251,18 @@ async fn routed_push_inline_failure_closes_session_but_success_keeps_it_reusable
             },
             ..Default::default()
         };
+        let namespace = remote.begin_namespace_qualification().await.unwrap();
         let plan = preflight_sync(
             source.entries(request),
             remote.scan(request).await.unwrap(),
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
             |_| true,
         )
         .await
         .unwrap();
+        drop(namespace);
         if fail {
             std::fs::remove_dir(source_dir.path().join("parent")).unwrap();
             std::fs::write(source_dir.path().join("parent"), b"changed kind").unwrap();
@@ -389,16 +393,19 @@ async fn local_and_push_source_cutoff_joins_and_reports_confirmed_unlinks() {
                 .await
                 .unwrap();
                 let remote = client.request_handle();
+                let namespace = remote.begin_namespace_qualification().await.unwrap();
                 let destination = remote.scan(request).await.unwrap();
                 let mut plan = preflight_sync(
                     source.entries(request),
                     destination,
                     ComparisonPolicy::default(),
                     None,
+                    crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
                     |_| true,
                 )
                 .await
                 .unwrap();
+                drop(namespace);
                 if grouped {
                     plan.seal_hardlink_membership().await.unwrap();
                 }
@@ -435,6 +442,7 @@ async fn local_and_push_source_cutoff_joins_and_reports_confirmed_unlinks() {
                         .entry_stream(request),
                     ComparisonPolicy::default(),
                     None,
+                    crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
                     |_| true,
                 )
                 .await
@@ -532,15 +540,18 @@ async fn local_and_push_late_destination_races_preserve_candidates_and_run_count
                 .await
                 .unwrap();
                 let remote = client.request_handle();
+                let namespace = remote.begin_namespace_qualification().await.unwrap();
                 let mut plan = preflight_sync(
                     source.entries(request),
                     remote.scan(request).await.unwrap(),
                     ComparisonPolicy::default(),
                     None,
+                    crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
                     |_| true,
                 )
                 .await
                 .unwrap();
+                drop(namespace);
                 plan.seal_hardlink_membership().await.unwrap();
                 let executor = crate::remote::push::RemotePushExecutor::new(
                     source.clone(),
@@ -587,6 +598,7 @@ async fn local_and_push_late_destination_races_preserve_candidates_and_run_count
                         .entry_stream(request),
                     ComparisonPolicy::default(),
                     None,
+                    crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
                     |_| true,
                 )
                 .await
@@ -747,6 +759,7 @@ async fn completed_worker_and_ready_interrupt_preserve_confirmed_removal_count()
                 .entry_stream(request),
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await

@@ -102,11 +102,32 @@ async fn run_with_authorities(
 
     // Complete fallible discovery before either scan producer is admitted.
     // Query only the stored observation, never retry the root pathname here.
+    let (destination_endpoint, namespace) =
+        destination_endpoint.with_namespace_qualification().await?;
     let destination_authority = destination_endpoint.acquired_rooted_fs();
-    let namespace_semantics = match destination_authority {
-        Some(rooted) => rooted.namespace_semantics().await.map_err(map_io)?,
-        None => sy::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+    let backup_directory = backup_dir(config, destination_root);
+    let backup_namespace = if config.backup.is_some() {
+        Some(
+            sy::engine::backup::BackupPolicy::capture_local(
+                destination_root,
+                backup_directory.as_deref(),
+                config.suffix.clone(),
+            )
+            .await
+            .map_err(map_io)?,
+        )
+    } else {
+        None
     };
+    let mut preflight = sy::engine::namespace::NamespacePreflight::new(namespace.as_ref());
+    if let Some((policy, root)) = &backup_namespace {
+        preflight = preflight.with_backup(sy::engine::namespace::BackupNamespace {
+            policy,
+            qualification: namespace.as_ref(),
+            external: root.as_ref(),
+            potential_hardlinks: config.preserve.hardlinks,
+        });
+    }
 
     // Both scans are local. The source walk honors the ignore rules where
     // the files live; the destination scan stays COMPLETE (gitignore never
@@ -163,8 +184,9 @@ async fn run_with_authorities(
         let destination_endpoint = destination_endpoint.clone();
         preflight_sync_scoped_with_content(
             OrderedReconciler::with_scope(source, destination, scope.clone()),
-            comparison_policy(config, namespace_semantics),
+            comparison_policy(config),
             delete_policy(&config.delete),
+            preflight,
             move |entry| {
                 entry_in_size_scope(entry, min_size, max_size)
                     && entry_selected_by_symlink_mode(entry, skip_symlinks)
@@ -267,6 +289,7 @@ async fn run_with_authorities(
             backup_dir(config, destination_root),
             config.suffix.clone(),
         )
+        .with_backup_root(backup_namespace.and_then(|(_, root)| root))
         .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
         .with_rate_limiter(rate_limiter)
         .with_remove_source_files(config.remove_source_files)

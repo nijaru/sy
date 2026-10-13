@@ -249,7 +249,11 @@ Destination operations carry the expected state (absent or observed identity), r
 
 ### Namespace preflight
 
-Detect destination case/normalization aliases across planned source paths, existing destination paths, and ancestor prefixes before mutation. Comparison semantics belong to the destination root. Where exact semantics are unavailable, use a documented conservative check or reject ambiguous operations; generic Unicode normalization is not proof of filesystem equivalence.
+Detect destination case/normalization aliases across planned source paths, existing destination paths, and ancestor prefixes before mutation. Each child name is governed by its containing destination directory, not a uniform root profile: descendant casefold flags and submounts can change the rules. Qualify existing parents through their original held-root ancestry; predict missing parents only from qualified native creation inheritance or a documented conservative model. Validate acquired children before admitting descendants. Where exact semantics are unavailable, reject ambiguous operations; generic Unicode normalization is not proof of filesystem equivalence.
+
+Retain authenticated, disk-backed original parent qualifications through native effects. Revalidate the actual held parent before mutation admission, including directory metadata/finalization targets. Only the run's confirmed directory creations may advance predicted absence into observed directory authority. Starting another run creates another owner; old prepared work never adopts the new run's proof. These checks are observational, not immutable namespace snapshots.
+
+Include actual and potentially publishing hardlink-member backup destinations in the same preflight. In-root backups share the destination collision set; an operator-selected external backup root has its own original held authority and bounded collision set. Retain early external acquisition failures without retrying the path, but require that authority only when the completed plan can produce a backup. Exact deletion replay must remain unchanged after backup declaration. No permanent backup parents may be created before all collision proofs and native seals succeed.
 
 Collision detection must remain bounded even for one extremely wide directory. Use disk-backed records and bounded external sorting/merge (or an equivalently bounded exact algorithm), not a whole-tree or unbounded per-directory map. Bound record sizes, run buffers, merge fan-in and descriptors; propagate scratch I/O failures before mutation. Identical path spellings may deduplicate; distinct names must never silently overwrite one another.
 
@@ -445,8 +449,8 @@ Version refusal precedes operand classification or filesystem root opening.
   2=Leaf plus physical source name. Names are `byte_len:u32, native_bytes`.
 
 `SessionReady` is `capabilities:u64, modtime_precision_ns:u64,
-namespace_semantics:u8, resolved_operand, source_shape_presence:u8,
-[source_shape], pending:u8`. Resolved operand is 0=Tree or 1=Entry plus name.
+resolved_operand, source_shape_presence:u8, [source_shape], pending:u8`.
+It supplies no uniform destination namespace profile. Resolved operand is 0=Tree or 1=Entry plus name.
 Presence and pending are 0/1. Pull returns source shape and cannot be pending;
 push returns no source shape. Every path/name length is bounded by
 `MAX_WIRE_PATH_BYTES` before allocation, and all tags are validated.
@@ -458,17 +462,45 @@ one-name scans and the shared selected-leaf reconciler. An operator-selected
 destination directory symlink may be followed initially, then remains FD-bound.
 
 Missing destination parents are pending, not created by handshake or scanning.
-Pending namespace semantics are unqualified. After complete preflight selects a
+Pending parents require qualified or conservative creation predictions. After complete preflight selects a
 Create, `AcquireRoot` (frame kind 33) carries its destination `RelativeWirePath`,
 not a new root. An Entry-bound session requires that exact selected name. The
 server drains active handlers before acquisition and rebuilds every handler from
-the captured root FD. Its Ack carries the updated `SessionReady`, including the
-actual held-root namespace profile. Acquisition creates permanent parents from
+the captured root FD. Its Ack carries the updated `SessionReady`. Acquisition retains the sealed
+original parent catalogue and checks actual acquired-directory rules before work. Acquisition creates permanent parents from
 the original held ancestor, refuses foreign existing names, and does not claim
 private creator ownership, cleanup authority, or whole-run rollback. Local
 acquisition also requires original operator-path continuity; remote authority
 permits relocation of the held ancestor/root. Neither adopts a replacement after
 capturing its original root FD.
+
+`NamespaceRequest` (43, `FINAL` only) is a read-only Push/PreviewPush RPC.
+Its action is `0=Begin`, `1=Qualify` plus `parent_tag:u8`, `2=Seal`,
+`3=QualifyBackup` plus the same parent encoding, or `4=ValidateBackupAddress`
+plus `path_len:u32, relative_wire_path`. A parent is `0=Root` or
+`1=Directory` plus `path_len:u32, relative_wire_path`; lengths are bounded before
+allocation. Entry-bound ordinary queries permit only Root. Explicit backup
+parent queries may observe root-confined destination directories, matching the
+existing COPY backup destination scope; they grant no sibling SOURCE data,
+metadata-setter or removal authority. Backup address validation checks literal
+native spelling beneath the original held root, including containing-directory
+components. Native lookup reaching an entry with no exact directory-entry
+spelling is an alias, not permission to overwrite an unselected kept name. This
+read-only proof runs before sealing and is repeated at native backup admission
+and publication; an explicitly spelled existing backup slot retains its normal
+overwrite policy.
+Begin releases its opener's frame permits and drains previous handlers before
+binding a new run owner. Qualify and Seal use that owner even while the root is
+pending; acquisition does not replace it. Seal follows completed collision proof
+and successful scan drain, not merely exhaustion of a declaration stream.
+
+`NamespaceResult` (44, `FINAL|ACK_REQUIRED`) is `0=Begun`, `1=Qualified` plus
+`namespace_semantics:u8`, `2=Sealed`, or `3=BackupAddressValidated`, then an empty
+unflagged Ack on the same stream. The profile encodes case and normalization axes separately; wrong-phase,
+truncated, trailing, reserved-axis and noncanonical values fail. Returned profile
+bytes are collision-preflight inputs, never substitute native original authority
+or SOURCE byte/removal evidence. PULL qualifies its local destination through
+the same native owner without a namespace RPC to its remote SOURCE.
 
 `SourceIgnoreRequest` (frame kind 39, `FINAL` only) is a read-only Pull RPC
 for local destination deletion protection. Its payload is

@@ -67,15 +67,21 @@ async fn pull_metadata_refuses_replaced_local_root_and_reports_admitted_effects(
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
-        let executor = Arc::new(RemotePullExecutor::new(
+        let mut executor = RemotePullExecutor::new(
             root.clone(),
             client.request_handle(),
             client.sender(),
             Scheduler::new(Default::default()).unwrap(),
-        ));
-        let (_, mut destinations) = executor.destination_entries(request).await.unwrap();
+        );
+        let (namespace, mut destinations) = executor.destination_entries(request).await.unwrap();
         let destination = destinations.try_next().await.unwrap().unwrap();
         destinations.close().await.unwrap();
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        let executor = Arc::new(executor);
         let rooted = executor.metadata_authority().await.unwrap().clone();
         let action = RemotePullAction::ApplyMetadata {
             source,

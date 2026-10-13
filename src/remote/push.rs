@@ -394,15 +394,21 @@ impl RemoteBackupPlan {
     pub(crate) fn destination(
         &self,
         path: &crate::engine::domain::RelativePath,
-    ) -> Option<crate::engine::domain::RelativePath> {
-        let mut backup = match &self.dir {
-            Some(dir) => dir.as_path().join(path.as_path()),
-            None => path.as_path().to_path_buf(),
-        };
-        let mut name = path.as_path().file_name()?.to_os_string();
-        name.push(&self.suffix);
-        backup.set_file_name(name);
-        crate::engine::domain::RelativePath::new(backup).ok()
+    ) -> Result<crate::engine::domain::RelativePath> {
+        match self
+            .policy()
+            .destination(path)
+            .map_err(|_| RemotePushError::InvalidBackupPath(path.as_path().to_path_buf()))?
+        {
+            crate::engine::backup::BackupAddress::Main(path) => Ok(path),
+            crate::engine::backup::BackupAddress::FixedRoot(_) => Err(
+                RemotePushError::InvalidBackupPath(path.as_path().to_path_buf()),
+            ),
+        }
+    }
+
+    pub fn policy(&self) -> crate::engine::backup::BackupPolicy {
+        crate::engine::backup::BackupPolicy::in_root(self.dir.clone(), self.suffix.clone())
     }
 }
 
@@ -731,11 +737,7 @@ impl RemotePushExecutor {
                 // so the user's copy cannot be silently skipped.
                 if let (Some(plan), Some(existing)) = (&self.backup, &destination) {
                     if existing.is_file() {
-                        let backup_path = plan.destination(&existing.path).ok_or_else(|| {
-                            RemotePushError::InvalidBackupPath(
-                                existing.path.as_path().to_path_buf(),
-                            )
-                        })?;
+                        let backup_path = plan.destination(&existing.path)?;
                         self.copy_backup(&existing.path, &backup_path, existing.identity)
                             .await?;
                     }
@@ -795,6 +797,14 @@ impl RemotePushExecutor {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     RemotePushError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
+                if let (Some(plan), Some(existing)) = (
+                    &self.backup,
+                    destination.as_ref().filter(|entry| entry.is_file()),
+                ) {
+                    let backup_path = plan.destination(&existing.path)?;
+                    self.copy_backup(&existing.path, &backup_path, existing.identity)
+                        .await?;
+                }
                 let expected_identity = destination
                     .map(|destination| {
                         destination.identity.ok_or_else(|| {
@@ -946,9 +956,7 @@ impl RemotePushExecutor {
         // dangling or escaped target is never resolved.
         if let Some(plan) = &self.backup {
             if action.kind == EntryKind::File {
-                let backup_path = plan.destination(&action.path).ok_or_else(|| {
-                    RemotePushError::InvalidBackupPath(action.path.as_path().to_path_buf())
-                })?;
+                let backup_path = plan.destination(&action.path)?;
                 self.copy_backup(&action.path, &backup_path, action.identity)
                     .await?;
             }

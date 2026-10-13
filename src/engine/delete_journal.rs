@@ -100,6 +100,8 @@ impl DeleteJournal {
         Ok(DeleteJournalReader {
             file: self.file,
             cursor,
+            sealed_end: cursor,
+            sealed_records: self.records,
             remaining: self.records,
         })
     }
@@ -108,10 +110,21 @@ impl DeleteJournal {
 pub struct DeleteJournalReader {
     file: tokio::fs::File,
     cursor: u64,
+    sealed_end: u64,
+    sealed_records: usize,
     remaining: usize,
 }
 
 impl DeleteJournalReader {
+    pub async fn rewind(&mut self) -> Result<()> {
+        if self.file.metadata().await?.len() != self.sealed_end {
+            return Err(invalid_data("delete journal length changed after seal"));
+        }
+        self.cursor = self.sealed_end;
+        self.remaining = self.sealed_records;
+        Ok(())
+    }
+
     pub async fn next(&mut self) -> Result<Option<DeleteRecord>> {
         if self.cursor == 0 {
             if self.remaining != 0 {

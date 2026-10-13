@@ -335,9 +335,7 @@ impl RemotePushExecutor {
                         &self.backup,
                         destination(&member).filter(|entry| entry.is_file()),
                     ) {
-                        let backup = plan.destination(&old.path).ok_or_else(|| {
-                            RemotePushError::InvalidBackupPath(old.path.as_path().to_path_buf())
-                        })?;
+                        let backup = plan.destination(&old.path)?;
                         self.copy_backup(&old.path, &backup, old.identity).await?;
                     }
                 }

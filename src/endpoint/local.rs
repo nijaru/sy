@@ -171,10 +171,7 @@ impl LocalEndpoint {
         self.rooted.get().map(std::convert::AsRef::as_ref)
     }
 
-    pub(crate) async fn rooted_fs(
-        &self,
-        create_root: bool,
-    ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
+    async fn destination_authority(&self) -> Result<&sy::rooted_fs::operand::DestinationRoot> {
         // Cache initial absence through its held ancestor too. A later Create
         // must acquire that original pending authority, never classify a fresh
         // replacement of an ancestor after preflight.
@@ -195,6 +192,35 @@ impl LocalEndpoint {
                 Ok::<_, SyncError>(authority)
             })
             .await?;
+        Ok(binding)
+    }
+
+    pub(crate) async fn with_namespace_qualification(
+        self,
+    ) -> Result<(
+        Self,
+        std::sync::Arc<dyn sy::engine::namespace::NamespaceQualification>,
+    )> {
+        let (bound, authority) = self
+            .destination_authority()
+            .await?
+            .clone()
+            .with_namespace_qualification()
+            .await
+            .map_err(map_rooted_fs_error)?;
+        // Replace caches with the returned held owner, never a fresh pathname
+        // lookup. Already prepared native clones retain their original run proof.
+        Ok((
+            self.with_destination_authority(bound),
+            std::sync::Arc::new(authority),
+        ))
+    }
+
+    pub(crate) async fn rooted_fs(
+        &self,
+        create_root: bool,
+    ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
+        let binding = self.destination_authority().await?;
         let rooted = self
             .rooted
             .get_or_try_init(|| async {

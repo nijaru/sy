@@ -239,6 +239,24 @@ async fn metadata_only_mutations_require_both_scanned_observations_in_all_direct
                     )
                     .await
                     .unwrap();
+                    if matches!(direction, Direction::Push) {
+                        let namespace = client
+                            .request_handle()
+                            .begin_namespace_qualification()
+                            .await
+                            .unwrap();
+                        namespace
+                            .qualify(sy::engine::namespace::NamespaceParent::Root)
+                            .await
+                            .unwrap();
+                        namespace
+                            .qualify(sy::engine::namespace::NamespaceParent::Directory(
+                                sy::engine::domain::RelativePath::new("dir").unwrap(),
+                            ))
+                            .await
+                            .unwrap();
+                        namespace.seal().await.unwrap();
+                    }
                     if matches!(direction, Direction::Pull) {
                         client
                             .request_handle()

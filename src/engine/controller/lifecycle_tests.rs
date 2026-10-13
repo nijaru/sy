@@ -27,6 +27,7 @@ async fn local_plan(source: &SourceRoot, destination: &LocalEndpoint) -> SyncPla
             ..Default::default()
         },
         None,
+        crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
         |_| true,
     )
     .await
@@ -200,7 +201,7 @@ async fn routed_pull_interrupt_retains_native_publication_until_joined() {
         )
         .await
         .unwrap();
-        let executor = crate::remote::pull::RemotePullExecutor::new(
+        let mut executor = crate::remote::pull::RemotePullExecutor::new(
             destination.path().to_path_buf(),
             client.request_handle(),
             client.sender(),
@@ -214,12 +215,13 @@ async fn routed_pull_interrupt_retains_native_publication_until_joined() {
             },
             ..Default::default()
         };
-        let (_, dest) = executor.destination_entries(request).await.unwrap();
+        let (namespace, dest) = executor.destination_entries(request).await.unwrap();
         let plan = preflight_sync(
             client.request_handle().scan(request).await.unwrap(),
             dest,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
             |_| true,
         )
         .await

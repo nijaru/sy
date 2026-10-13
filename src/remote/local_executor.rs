@@ -126,6 +126,7 @@ pub struct LocalSyncExecutor {
     backup: bool,
     backup_dir: Option<PathBuf>,
     backup_suffix: String,
+    backup_root: Option<crate::rooted_fs::backup::BackupRoot>,
     /// --copy-links: transfers stat through source symlinks so the target's
     /// bytes and size flow through the native fast paths.
     follow_symlinks: bool,
@@ -174,6 +175,7 @@ impl LocalSyncExecutor {
             backup: false,
             backup_dir: None,
             backup_suffix: String::new(),
+            backup_root: None,
             follow_symlinks: false,
             rate_limiter: None,
             remove_source_files: false,
@@ -191,6 +193,11 @@ impl LocalSyncExecutor {
         self.backup = enabled;
         self.backup_dir = dir;
         self.backup_suffix = suffix;
+        self
+    }
+
+    pub fn with_backup_root(mut self, root: Option<crate::rooted_fs::backup::BackupRoot>) -> Self {
+        self.backup_root = root;
         self
     }
 
@@ -380,10 +387,21 @@ impl LocalSyncExecutor {
         let backup = self.backup_destination_for(relative)?;
         let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
+        let backup_root = self.backup_root.clone();
         tokio::task::spawn_blocking(move || {
             rooted.verify_root_path_blocking()?;
-            rooted.backup_file_blocking(&relative, &backup, expected)?;
-            rooted.verify_root_path_blocking()
+            rooted.backup_file_with_root_blocking(
+                &relative,
+                &backup,
+                expected,
+                backup_root.as_ref(),
+            )?;
+            rooted.verify_root_path_blocking().map_err(|error| {
+                crate::rooted_fs::RootedFsError::CommittedFinalizationFailed {
+                    path: backup,
+                    reason: error.to_string(),
+                }
+            })
         })
         .await
         .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
@@ -401,10 +419,21 @@ impl LocalSyncExecutor {
         let backup = self.backup_destination_for(relative)?;
         let rooted = self.metadata_authority().await?;
         let relative = relative.clone();
+        let backup_root = self.backup_root.clone();
         tokio::task::spawn_blocking(move || {
             rooted.verify_root_path_blocking()?;
-            rooted.backup_file_blocking(&relative, &backup, expected)?;
-            rooted.verify_root_path_blocking()?;
+            rooted.backup_file_with_root_blocking(
+                &relative,
+                &backup,
+                expected,
+                backup_root.as_ref(),
+            )?;
+            rooted.verify_root_path_blocking().map_err(|error| {
+                crate::rooted_fs::RootedFsError::CommittedFinalizationFailed {
+                    path: backup,
+                    reason: error.to_string(),
+                }
+            })?;
             rooted
                 .remove_destination_blocking(&relative, false, Some(expected))?
                 .verify_local_root(&rooted, &relative)
@@ -1029,10 +1058,9 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
     }
 
     async fn prepare_destination_for_create(&self, _create: &RelativePath) -> Result<()> {
-        let rooted = self.destination_endpoint.rooted_fs(true).await?;
-        // Missing-root preflight used unknown semantics. Qualification uses the
-        // acquired directory, never its held ancestor or an operator pathname.
-        rooted.namespace_semantics().await?;
+        // Acquisition validates the sealed original parent predictions and
+        // the acquired child's actual rules before admitting descendants.
+        self.destination_endpoint.rooted_fs(true).await?;
         Ok(())
     }
 
@@ -1109,23 +1137,17 @@ pub fn backup_destination_path(
     dir: Option<&Path>,
     suffix: &str,
 ) -> Result<PathBuf> {
-    let mut backup_name = relative
-        .as_path()
-        .file_name()
-        .ok_or_else(|| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
-        .to_os_string();
-    backup_name.push(suffix);
-    match dir {
-        Some(dir) => {
-            let mut backup = dir.join(relative.as_path());
-            backup.set_file_name(backup_name);
-            Ok(backup)
-        }
-        None => {
-            let mut backup = destination_root.join(relative.as_path());
-            backup.set_file_name(backup_name);
-            Ok(backup)
-        }
+    use crate::engine::backup::{BackupAddress, BackupPolicy};
+    let policy = BackupPolicy::local(destination_root, dir, suffix.to_owned())
+        .map_err(|_| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?;
+    match policy
+        .destination(relative)
+        .map_err(|_| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
+    {
+        BackupAddress::Main(path) => Ok(destination_root.join(path.as_path())),
+        BackupAddress::FixedRoot(path) => Ok(dir
+            .ok_or_else(|| LocalSyncError::InvalidBackupPath(relative.as_path().to_path_buf()))?
+            .join(path.as_path())),
     }
 }
 

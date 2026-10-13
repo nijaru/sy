@@ -44,6 +44,11 @@ impl SourceRootSwap {
             ),
             Default::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(
+                &crate::engine::namespace::FixedNamespaceQualification(
+                    crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+                ),
+            ),
             |_| false,
         )
         .await

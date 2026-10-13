@@ -3,8 +3,8 @@ use super::*;
 use std::io::Write;
 use xattr::FileExt;
 
-#[test]
-fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits() {
+#[tokio::test]
+async fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits() {
     for foreign_edit in [false, true] {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a"), b"old bytes").unwrap();
@@ -12,6 +12,10 @@ fn prepared_alias_follows_own_retirements_but_refuses_foreign_held_inode_edits()
             std::fs::hard_link(root.path().join("a"), root.path().join(name)).unwrap();
         }
         let rooted = RootedFs::open_blocking_for_worker(root.path().to_path_buf()).unwrap();
+        let (rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
+        crate::engine::namespace::NamespaceQualification::seal(&namespace)
+            .await
+            .unwrap();
         let path = |name| RelativePath::new(name).unwrap();
         let held_old = rooted.open_regular_blocking(&path("c")).unwrap();
         let scanned = identity_from_stat(&stat_fd(held_old.as_raw_fd()).unwrap()).unwrap();

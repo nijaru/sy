@@ -269,6 +269,28 @@ impl DeletePlan {
         self.delete_candidates
     }
 
+    /// Replay the exact protected action set without consuming execution.
+    pub async fn validate_actions<F, Fut, E>(
+        &mut self,
+        mut validate: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(DeleteAction) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(), E>>,
+        E: From<DeletePlanError>,
+    {
+        while let Some(action) = self.replay.next_action().await? {
+            validate(action).await?;
+        }
+        self.replay
+            .journal
+            .rewind()
+            .await
+            .map_err(DeletePlanError::from)?;
+        self.replay.protected_directories.clear();
+        Ok(())
+    }
+
     pub fn into_replay(self) -> DeleteReplay {
         self.replay
     }
@@ -353,6 +375,41 @@ mod tests {
             limit: DeleteLimit::Percentage(100),
             force: false,
         }
+    }
+
+    #[tokio::test]
+    async fn validation_rewinds_exact_protected_actions() {
+        let mut tracker = DeleteTracker::new(policy()).await.unwrap();
+        tracker
+            .observe_destination_only(&directory("parent"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_destination_only(&file("parent/deleted"), true)
+            .await
+            .unwrap();
+        tracker
+            .observe_destination_only(&file("parent/kept"), false)
+            .await
+            .unwrap();
+        let mut plan = tracker.finish().await.unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected = seen.clone();
+        plan.validate_actions::<_, _, DeletePlanError>(move |action| {
+            collected.lock().unwrap().push(action);
+            futures::future::ready(Ok(()))
+        })
+        .await
+        .unwrap();
+        let expected = seen.lock().unwrap().clone();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].path, path("parent/deleted"));
+        let mut replay = plan.into_replay();
+        assert_eq!(
+            replay.next_action().await.unwrap(),
+            Some(expected[0].clone())
+        );
+        assert_eq!(replay.next_action().await.unwrap(), None);
     }
 
     #[tokio::test]

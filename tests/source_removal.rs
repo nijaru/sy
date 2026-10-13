@@ -31,6 +31,7 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
         .unwrap();
     let source_rooted = authority.rooted();
     let dest_rooted = RootedFs::open(dest.path().to_path_buf()).await.unwrap();
+    let (dest_rooted, namespace) = dest_rooted.with_namespace_qualification().await.unwrap();
     let plan = preflight_sync_scoped_with_content(
         sy::engine::reconcile::OrderedReconciler::new(
             authority.entries(ScanRequest::default()),
@@ -41,6 +42,7 @@ async fn replacing_destination_after_checksum_preflight_retains_source() {
             ..ComparisonPolicy::default()
         },
         None,
+        sy::engine::namespace::NamespacePreflight::new(&namespace),
         |_| true,
         |_| futures::future::ready(Ok(true)),
         move |source, dest| {
@@ -264,6 +266,10 @@ async fn standalone_existing_aliases_continue_after_own_source_unlink() {
     let destination_rooted = RootedFs::open(destination.path().to_path_buf())
         .await
         .unwrap();
+    let (destination_rooted, namespace) = destination_rooted
+        .with_namespace_qualification()
+        .await
+        .unwrap();
     let plan = preflight_sync_scoped_with_content(
         sy::engine::reconcile::OrderedReconciler::new(
             authority.entries(ScanRequest::default()),
@@ -274,6 +280,7 @@ async fn standalone_existing_aliases_continue_after_own_source_unlink() {
             ..ComparisonPolicy::default()
         },
         None,
+        sy::engine::namespace::NamespacePreflight::new(&namespace),
         |_| true,
         |_| futures::future::ready(Ok(true)),
         move |source, destination| {

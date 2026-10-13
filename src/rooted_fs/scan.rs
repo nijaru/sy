@@ -363,17 +363,19 @@ fn prepare_directory(
     source: Option<&RootedFs>,
 ) -> Result<Continuation, RootedScanError> {
     let (device, inode) = directory_identity(directory, path)?;
-    let names = DirectoryStream::open(directory.as_raw_fd())?.map(|name| {
-        let name = name?;
-        if let Some(source) = source {
-            let relative = path.join(&name);
-            validate_path_bound(&relative).map_err(io::Error::other)?;
-            source
-                .record_source_name_blocking(directory.as_raw_fd(), &relative, false)
-                .map_err(io::Error::other)?;
-        }
-        Ok(name)
-    });
+    let names = DirectoryStream::open(directory.as_raw_fd())
+        .map_err(RootedScanError::ReadDirectory)?
+        .map(|name| {
+            let name = name?;
+            if let Some(source) = source {
+                let relative = path.join(&name);
+                validate_path_bound(&relative).map_err(io::Error::other)?;
+                source
+                    .record_source_name_blocking(directory.as_raw_fd(), &relative, false)
+                    .map_err(io::Error::other)?;
+            }
+            Ok(name)
+        });
     let run = spool
         .sort(names, || sender.is_closed())
         .map_err(RootedScanError::Scratch)?;
@@ -724,17 +726,20 @@ fn stat_times(_stat: &libc::stat) -> Result<(i64, u32, i64, u32), RootedScanErro
 
 /// Stop at the first non-dot entry; never collect a directory's children.
 pub(super) fn directory_is_empty(fd: RawFd) -> Result<bool, RootedScanError> {
-    match DirectoryStream::open(fd)?.next() {
+    match DirectoryStream::open(fd)
+        .map_err(RootedScanError::ReadDirectory)?
+        .next()
+    {
         None => Ok(true),
         Some(Ok(_)) => Ok(false),
         Some(Err(error)) => Err(RootedScanError::ReadDirectory(error)),
     }
 }
 
-struct DirectoryStream(*mut libc::DIR);
+pub(super) struct DirectoryStream(*mut libc::DIR);
 
 impl DirectoryStream {
-    fn open(fd: RawFd) -> Result<Self, RootedScanError> {
+    pub(super) fn open(fd: RawFd) -> io::Result<Self> {
         let scan_fd = unsafe {
             // SAFETY: `fd` is a live directory descriptor and `.` is a fixed native
             // component. Reopening it creates a distinct open file description, so
@@ -747,7 +752,7 @@ impl DirectoryStream {
             )
         };
         if scan_fd < 0 {
-            return Err(RootedScanError::ReadDirectory(io::Error::last_os_error()));
+            return Err(io::Error::last_os_error());
         }
         let dir = unsafe {
             // SAFETY: `scan_fd` is a fresh directory descriptor. fdopendir takes
@@ -760,7 +765,7 @@ impl DirectoryStream {
                 // SAFETY: fdopendir failed, so ownership remained with us.
                 libc::close(scan_fd);
             }
-            return Err(RootedScanError::ReadDirectory(error));
+            return Err(error);
         }
         Ok(Self(dir))
     }

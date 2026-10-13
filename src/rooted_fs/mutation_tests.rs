@@ -278,7 +278,34 @@ async fn session_cutoff_fences_rooted_mutations_and_cleans_owned_staging() {
             let root = tempfile::tempdir().unwrap();
             prepare(root.path(), mutation);
             let (client, mut server) = session(root.path(), Operation::Push).await;
-            let rooted = server.scan_handler_rooted().unwrap();
+            let (rooted, namespace) = server
+                .scan_handler_rooted()
+                .unwrap()
+                .with_namespace_qualification()
+                .await
+                .unwrap();
+            use crate::engine::namespace::{NamespaceParent, NamespaceQualification};
+            namespace.qualify(NamespaceParent::Root).await.unwrap();
+            if matches!(
+                mutation,
+                Mutation::Directory
+                    | Mutation::Ancestors
+                    | Mutation::RemoveDirectory
+                    | Mutation::SymlinkExchange
+                    | Mutation::DirectoryMetadata
+                    | Mutation::DirectoryFinalize
+            ) {
+                let target = if matches!(mutation, Mutation::Ancestors) {
+                    relative("target/child")
+                } else {
+                    relative("target")
+                };
+                namespace
+                    .qualify(NamespaceParent::Directory(target))
+                    .await
+                    .unwrap();
+            }
+            namespace.seal().await.unwrap();
             let before = observe(&rooted).unwrap();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();

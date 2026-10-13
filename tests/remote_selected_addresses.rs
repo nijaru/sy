@@ -83,6 +83,10 @@ async fn selected_plan(
             destination: relative("renamed"),
         },
     );
+    let rooted = sy::rooted_fs::RootedFs::open(destination.into())
+        .await
+        .unwrap();
+    let (_rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
     let mut plan = preflight_sync_scoped_with_content(
         reconciler,
         ComparisonPolicy {
@@ -98,6 +102,7 @@ async fn selected_plan(
             limit: DeleteLimit::Unlimited,
             force: false,
         }),
+        sy::engine::namespace::NamespacePreflight::new(&namespace),
         |_| true,
         |_| futures::future::ready(Ok(true)),
         |_, _| async { panic!("size-only/always plans do not request content comparison") },
@@ -247,6 +252,16 @@ async fn selected_address_matrix(push: bool) {
         .unwrap();
         let scheduler = Scheduler::new(Default::default()).unwrap();
         let summary = if push {
+            let namespace = client
+                .request_handle()
+                .begin_namespace_qualification()
+                .await
+                .unwrap();
+            namespace
+                .qualify(sy::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace.seal().await.unwrap();
             let executor = RemotePushExecutor::new(
                 authority,
                 client.request_handle(),
@@ -272,12 +287,27 @@ async fn selected_address_matrix(push: bool) {
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap();
+            let mut binding = sy::rooted_fs::operand::BoundDestination::open(
+                destination.path().into(),
+                sy::rooted_fs::operand::SourceShape::Directory { basename: None },
+            )
+            .await
+            .unwrap();
+            let (root, namespace) = binding.root.with_namespace_qualification().await.unwrap();
+            use sy::engine::namespace::NamespaceQualification;
+            namespace
+                .qualify(sy::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace.seal().await.unwrap();
+            binding.root = root;
             let executor = RemotePullExecutor::new(
                 destination.path().into(),
                 client.request_handle(),
                 client.sender(),
                 scheduler,
             )
+            .with_destination_binding(binding)
             .with_xattrs(case.preserves_xattrs())
             .with_backup_enabled(true)
             .with_backup_suffix("~".into());
@@ -411,10 +441,15 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
                 destination: relative("renamed-a"),
             },
         );
+        let rooted = sy::rooted_fs::RootedFs::open(destination.path().into())
+            .await
+            .unwrap();
+        let (_rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
         let mut plan = preflight_sync_scoped_with_content(
             reconciler,
             Default::default(),
             None,
+            sy::engine::namespace::NamespacePreflight::new(&namespace),
             |_| true,
             |_| futures::future::ready(Ok(false)),
             |_, _| async { panic!("new leaf requires no content comparison") },
@@ -458,6 +493,16 @@ async fn selected_hardlink_member_uses_physical_source_and_renamed_destination()
         let scheduler = Scheduler::new(Default::default()).unwrap();
         let execution = async {
             if push {
+                let namespace = client
+                    .request_handle()
+                    .begin_namespace_qualification()
+                    .await
+                    .unwrap();
+                namespace
+                    .qualify(sy::engine::namespace::NamespaceParent::Root)
+                    .await
+                    .unwrap();
+                namespace.seal().await.unwrap();
                 SyncController::new(
                     RemotePushExecutor::new(
                         authority,

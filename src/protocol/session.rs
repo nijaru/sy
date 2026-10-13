@@ -124,8 +124,7 @@ impl NameFolding {
     }
 }
 
-/// Destination name-comparison semantics, probed by the server for the
-/// negotiated root. The client maps this into its namespace preflight model.
+/// Name-comparison axes returned by one parent qualification, not a tree profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WireNamespaceSemantics {
     pub case: NameFolding,
@@ -133,11 +132,11 @@ pub struct WireNamespaceSemantics {
 }
 
 impl WireNamespaceSemantics {
-    fn encode(self) -> u8 {
+    pub(super) fn encode(self) -> u8 {
         (self.case as u8) | ((self.normalization as u8) << 2)
     }
 
-    fn decode(value: u8) -> Result<Self> {
+    pub(super) fn decode(value: u8) -> Result<Self> {
         if value & 0xF0 != 0 {
             return Err(ProtocolError::InvalidField {
                 field: "namespace_semantics",
@@ -152,29 +151,22 @@ impl WireNamespaceSemantics {
 }
 
 /// Reports the resolved physical query and its held or pending root authority.
-/// A pending destination has no filesystem-qualified namespace profile.
+/// Name rules are qualified separately for each containing destination parent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionReady {
     pub capabilities: CapabilitySet,
     /// Timestamp comparison resolution for this endpoint. Zero means unknown.
     pub modtime_precision_ns: u64,
-    /// Name semantics of the actual root; pending roots are unqualified.
-    pub namespace_semantics: WireNamespaceSemantics,
     pub resolved: ResolvedOperand,
     pub source_shape: Option<SourceShape>,
     pub pending: bool,
 }
 
 impl SessionReady {
-    pub const fn new(
-        capabilities: CapabilitySet,
-        modtime_precision_ns: u64,
-        namespace_semantics: WireNamespaceSemantics,
-    ) -> Self {
+    pub const fn new(capabilities: CapabilitySet, modtime_precision_ns: u64) -> Self {
         Self {
             capabilities,
             modtime_precision_ns,
-            namespace_semantics,
             resolved: ResolvedOperand::Tree,
             source_shape: None,
             pending: false,
@@ -222,7 +214,6 @@ impl SessionReady {
         let mut out = BytesMut::new();
         out.put_u64(self.capabilities.bits());
         out.put_u64(self.modtime_precision_ns);
-        out.put_u8(self.namespace_semantics.encode());
         self.resolved.put(&mut out)?;
         match &self.source_shape {
             None => out.put_u8(0),
@@ -239,7 +230,6 @@ impl SessionReady {
         let mut reader = SliceReader::new(payload);
         let capabilities = CapabilitySet::from_bits_retain(reader.u64()?);
         let modtime_precision_ns = reader.u64()?;
-        let namespace_semantics = WireNamespaceSemantics::decode(reader.u8()?)?;
         let resolved = ResolvedOperand::get(&mut reader)?;
         let source_shape = match reader.u8()? {
             0 => None,
@@ -259,7 +249,6 @@ impl SessionReady {
         Ok(Self {
             capabilities,
             modtime_precision_ns,
-            namespace_semantics,
             resolved,
             source_shape,
             pending,
@@ -301,14 +290,7 @@ mod tests {
 
     #[test]
     fn session_ready_round_trip_retains_future_capability_bits() {
-        let ready = SessionReady::new(
-            CapabilitySet::from_bits_retain(1_u64 << 63),
-            1,
-            WireNamespaceSemantics {
-                case: NameFolding::Folded,
-                normalization: NameFolding::Unspecified,
-            },
-        );
+        let ready = SessionReady::new(CapabilitySet::from_bits_retain(1_u64 << 63), 1);
         let decoded = SessionReady::decode(&ready.encode().unwrap()).unwrap();
         assert_eq!(decoded, ready);
     }
@@ -348,14 +330,7 @@ mod tests {
         let mut invalid = encoded.to_vec();
         invalid[0] = Operation::Pull as u8;
         assert!(SessionOpen::decode(&invalid).is_err());
-        let mut ready = SessionReady::new(
-            CapabilitySet::BLAKE3,
-            0,
-            WireNamespaceSemantics {
-                case: NameFolding::Unspecified,
-                normalization: NameFolding::Unspecified,
-            },
-        );
+        let mut ready = SessionReady::new(CapabilitySet::BLAKE3, 0);
         ready.resolved = ResolvedOperand::Entry { name: name.clone() };
         ready.source_shape = Some(SourceShape::Leaf { name });
         let encoded = ready.encode().unwrap();
@@ -363,13 +338,13 @@ mod tests {
         for len in 0..encoded.len() {
             assert!(SessionReady::decode(&encoded[..len]).is_err());
         }
-        for offset in [16, 17, 27, 28, encoded.len() - 1] {
+        for offset in [16, 26, 27, encoded.len() - 1] {
             let mut invalid = encoded.to_vec();
             invalid[offset] = 255;
             assert!(SessionReady::decode(&invalid).is_err());
         }
         let mut oversized = encoded.to_vec();
-        oversized[18..22].copy_from_slice(&((MAX_WIRE_PATH_BYTES + 1) as u32).to_be_bytes());
+        oversized[17..21].copy_from_slice(&((MAX_WIRE_PATH_BYTES + 1) as u32).to_be_bytes());
         assert!(matches!(
             SessionReady::decode(&oversized),
             Err(ProtocolError::PathTooLong { .. })

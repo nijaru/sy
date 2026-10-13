@@ -27,6 +27,7 @@ type RequestResult = std::result::Result<(), String>;
 #[derive(Clone)]
 struct RequestHandlers {
     scan: ServerScanHandler,
+    namespace: Option<crate::remote::namespace::NamespaceHandler>,
     native: Option<NativeRequestHandlers>,
 }
 
@@ -104,6 +105,22 @@ async fn serve_requests(
                         }.await;
                         drained
                     }
+                    Ok(Some(IncomingRequest::NamespaceBegin(incoming))) => {
+                        let begun = async {
+                            let (request, inbox) = crate::remote::namespace::decode_request(incoming)
+                                .map_err(|error| ServeError::Request(error.to_string()))?;
+                            if request != crate::protocol::WireNamespaceRequest::Begin {
+                                return Err(ServeError::Request("invalid namespace begin phase".into()));
+                            }
+                            // The opener no longer owns shared frame permits.
+                            // Earlier requests keep their owners through this drain.
+                            while !tasks.is_empty() { check_joined(tasks.join_next().await)?; }
+                            session.begin_namespace(inbox).await?;
+                            handlers = RequestHandlers::new(session)?;
+                            Ok(())
+                        }.await;
+                        begun
+                    }
                     Ok(Some(request)) => spawn_request(tasks, &handlers, request),
                     Ok(None) => {
                         accepting = false;
@@ -174,6 +191,7 @@ impl RequestHandlers {
     fn new(session: &ServerRemoteSession) -> Result<Self> {
         Ok(Self {
             scan: session.scan_handler(),
+            namespace: session.namespace_handler(),
             native: if session.has_root() {
                 Some(NativeRequestHandlers {
                     hash: session.hash_handler()?,
@@ -210,6 +228,22 @@ fn spawn_request(
     match request {
         IncomingRequest::AcquireRoot(_) => {
             return Err(ServeError::Request("acquisition bypassed barrier".into()))
+        }
+        IncomingRequest::NamespaceBegin(_) => {
+            return Err(ServeError::Request(
+                "namespace begin bypassed barrier".into(),
+            ))
+        }
+        IncomingRequest::Namespace(incoming) => {
+            let handler = handlers.namespace.clone().ok_or_else(|| {
+                ServeError::Request("namespace qualification was not begun".into())
+            })?;
+            tasks.spawn(async move {
+                handler
+                    .serve(incoming)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
         }
         IncomingRequest::Scan(incoming) => {
             let handler = handlers.scan.clone();
@@ -926,6 +960,46 @@ mod tests {
             );
             let client = client.unwrap();
             let mut server = server.unwrap();
+            let (qualified, served) = tokio::join!(
+                async {
+                    let namespace = client
+                        .request_handle()
+                        .begin_namespace_qualification()
+                        .await
+                        .unwrap();
+                    namespace
+                        .qualify(crate::engine::namespace::NamespaceParent::Root)
+                        .await
+                        .unwrap();
+                    namespace
+                        .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                            crate::engine::domain::RelativePath::new("admitted").unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                    namespace.seal().await.unwrap();
+                },
+                async {
+                    for _ in 0..4 {
+                        match server.next_request().await.unwrap().unwrap() {
+                            IncomingRequest::NamespaceBegin(incoming) => {
+                                let (request, inbox) =
+                                    crate::remote::namespace::decode_request(incoming).unwrap();
+                                assert_eq!(request, crate::protocol::WireNamespaceRequest::Begin);
+                                server.begin_namespace(inbox).await.unwrap();
+                            }
+                            IncomingRequest::Namespace(incoming) => server
+                                .namespace_handler()
+                                .unwrap()
+                                .serve(incoming)
+                                .await
+                                .unwrap(),
+                            _ => panic!("expected namespace preflight"),
+                        }
+                    }
+                },
+            );
+            let ((), ()) = (qualified, served);
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let rooted = server.scan_handler_rooted().unwrap();
@@ -949,6 +1023,7 @@ mod tests {
             let paused = tokio::time::timeout(Duration::from_secs(5), reached_rx).await;
             let mut tasks = JoinSet::new();
             tasks.spawn(async move { worker.await.map_err(|error| error.to_string())? });
+            let mut invalid_stream = None;
             match cause {
                 "request" => {
                     tasks.spawn(async { Err("handler failed".to_string()) });
@@ -960,6 +1035,7 @@ mod tests {
                 }
                 "router" => {
                     let inbox = client.sender().open_stream().unwrap();
+                    invalid_stream = Some(inbox.stream_id().get());
                     client
                         .sender()
                         .send(
@@ -1009,7 +1085,7 @@ mod tests {
                 ),
                 "task" => assert!(matches!(result, Err(ServeError::Task(_)))),
                 "router" => assert!(
-                    matches!(result, Err(ServeError::Session(RemoteSessionError::Router(error))) if matches!(*error, crate::remote::router::RouterError::InvalidStreamOpen { stream_id: 1, kind: FrameKind::Entry }))
+                    matches!(result, Err(ServeError::Session(RemoteSessionError::Router(error))) if matches!(*error, crate::remote::router::RouterError::InvalidStreamOpen { stream_id, kind: FrameKind::Entry } if Some(stream_id) == invalid_stream))
                 ),
                 "eof" => assert!(result.is_ok()),
                 _ => unreachable!(),

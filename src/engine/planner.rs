@@ -13,8 +13,6 @@ pub enum ComparisonMode {
     Always,
 }
 
-use super::namespace::NamespaceSemantics;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComparisonPolicy {
     pub mode: ComparisonMode,
@@ -23,9 +21,6 @@ pub struct ComparisonPolicy {
     pub update_only: bool,
     pub preserve_permissions: bool,
     pub preserve_times: bool,
-    /// Name-comparison rules of the destination root, used by namespace
-    /// alias preflight before any mutation.
-    pub namespace_semantics: NamespaceSemantics,
 }
 
 /// Preservation policy attached to a completed semantic plan.

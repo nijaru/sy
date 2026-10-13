@@ -35,7 +35,7 @@ async fn setup(
             .unwrap();
     // Only one live file is available: group execution must not nest permits
     // or leave ordinary workers running ahead of its prepared directories.
-    let executor = RemotePullExecutor::new(
+    let mut executor = RemotePullExecutor::new(
         destination.to_path_buf(),
         client.request_handle(),
         client.sender(),
@@ -58,16 +58,14 @@ async fn setup(
         },
         ..Default::default()
     };
-    let (namespace_semantics, destination) = executor.destination_entries(request).await.unwrap();
+    let (namespace, destination) = executor.destination_entries(request).await.unwrap();
     let source = client.request_handle().scan(request).await.unwrap();
     let mut plan = preflight_sync(
         source,
         destination,
-        ComparisonPolicy {
-            namespace_semantics,
-            ..policy
-        },
+        policy,
         None,
+        crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
         |_| false,
     )
     .await

@@ -1,21 +1,21 @@
 //! Backup/delete safety across the real local and v3 mutation adapters.
 #![cfg(unix)]
 
+use crate::engine::controller::SyncPlanExecutor;
+use crate::engine::delete_plan::DeleteAction;
+use crate::engine::domain::{EntryKind, RelativePath};
+use crate::engine::scheduler::{ResourceBudget, Scheduler};
+use crate::protocol::{Frame, FrameFlags, FrameKind, Operation};
+use crate::remote::local_executor::LocalSyncExecutor;
+use crate::remote::pull::RemotePullExecutor;
+use crate::remote::push::{RemoteBackupPlan, RemotePushExecutor};
+use crate::remote::router::RouterConfig;
+use crate::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
+use crate::rooted_fs::RootedFs;
+use crate::transfer::delta::BasisIndexLimits;
 use bytes::Bytes;
 use std::path::Path;
 use std::time::Duration;
-use sy::engine::controller::SyncPlanExecutor;
-use sy::engine::delete_plan::DeleteAction;
-use sy::engine::domain::{EntryKind, RelativePath};
-use sy::engine::scheduler::{ResourceBudget, Scheduler};
-use sy::protocol::{Frame, FrameFlags, FrameKind, Operation};
-use sy::remote::local_executor::LocalSyncExecutor;
-use sy::remote::pull::RemotePullExecutor;
-use sy::remote::push::{RemoteBackupPlan, RemotePushExecutor};
-use sy::remote::router::RouterConfig;
-use sy::remote::runtime::{ClientRemoteSession, IncomingRequest, ServerRemoteSession};
-use sy::rooted_fs::RootedFs;
-use sy::transfer::delta::BasisIndexLimits;
 
 #[derive(Clone, Copy, Debug)]
 enum Direction {
@@ -48,12 +48,25 @@ async fn delete_with_backup(
 ) -> anyhow::Result<()> {
     let source = tempfile::tempdir().unwrap();
     let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
+    let mut binding = crate::rooted_fs::operand::BoundDestination::open(
+        destination.to_path_buf(),
+        crate::rooted_fs::operand::SourceShape::Directory { basename: None },
+    )
+    .await?;
+    let (root, namespace) = binding.root.with_namespace_qualification().await?;
+    binding.root = root;
+    use crate::engine::namespace::NamespaceQualification;
+    namespace
+        .qualify(crate::engine::namespace::NamespaceParent::Root)
+        .await?;
+    namespace.seal().await?;
     if matches!(direction, Direction::Local) {
         let executor = LocalSyncExecutor::new(
-            sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+            crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                 .await
                 .unwrap(),
-            sy::endpoint::local::LocalEndpoint::new(destination.to_path_buf()),
+            crate::endpoint::local::LocalEndpoint::new(destination.to_path_buf())
+                .with_destination_authority(binding.root),
             scheduler,
         )
         .with_backup(true, None, "~".into());
@@ -88,14 +101,34 @@ async fn delete_with_backup(
     let client = client.unwrap();
     let mut server = server.unwrap();
     let task = tokio::spawn(async move {
-        let handler = server.mutation_handler().unwrap();
         let sender = server.sender();
         while let Some(request) = server.next_request().await.unwrap() {
-            let IncomingRequest::Mutation(incoming) = request else {
-                panic!("expected mutation")
+            let incoming = match request {
+                IncomingRequest::NamespaceBegin(incoming) => {
+                    let (_, inbox) = crate::remote::namespace::decode_request(incoming).unwrap();
+                    server.begin_namespace(inbox).await.unwrap();
+                    continue;
+                }
+                IncomingRequest::Namespace(incoming) => {
+                    server
+                        .namespace_handler()
+                        .unwrap()
+                        .serve(incoming)
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                IncomingRequest::Mutation(incoming) => incoming,
+                _ => panic!("expected namespace or mutation request"),
             };
             let stream = incoming.first.frame().stream_id();
-            if handler.serve(incoming).await.is_err() {
+            if server
+                .mutation_handler()
+                .unwrap()
+                .serve(incoming)
+                .await
+                .is_err()
+            {
                 // Keep the peer alive after a real filesystem rejection. A
                 // client must not rely on disconnect to prevent a later delete.
                 sender
@@ -110,8 +143,18 @@ async fn delete_with_backup(
     });
     let result = match direction {
         Direction::Push => {
+            let namespace = client
+                .request_handle()
+                .begin_namespace_qualification()
+                .await
+                .unwrap();
+            namespace
+                .qualify(crate::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace.seal().await.unwrap();
             let executor = RemotePushExecutor::new(
-                sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+                crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                     .await
                     .unwrap(),
                 client.request_handle(),
@@ -131,6 +174,7 @@ async fn delete_with_backup(
                 client.sender(),
                 scheduler,
             )
+            .with_destination_binding(binding)
             .with_backup_enabled(true)
             .with_backup_suffix("~".into());
             executor.execute_delete(action).await.map_err(Into::into)
@@ -304,10 +348,10 @@ async fn local_delete_cannot_follow_a_raced_ancestor_outside_the_root() {
         std::os::unix::fs::symlink(&moved, root.path().join("parent")).unwrap();
         let source = tempfile::tempdir().unwrap();
         let executor = LocalSyncExecutor::new(
-            sy::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+            crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
                 .await
                 .unwrap(),
-            sy::endpoint::local::LocalEndpoint::new(root.path().to_path_buf()),
+            crate::endpoint::local::LocalEndpoint::new(root.path().to_path_buf()),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
         .with_backup(backup, None, "~".into());

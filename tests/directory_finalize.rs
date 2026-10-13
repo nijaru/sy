@@ -139,6 +139,25 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     }
 }
 
+async fn qualify_push_directories(client: &ClientRemoteSession, paths: &[&str]) {
+    use sy::engine::namespace::NamespaceParent;
+    let namespace = client
+        .request_handle()
+        .begin_namespace_qualification()
+        .await
+        .unwrap();
+    namespace.qualify(NamespaceParent::Root).await.unwrap();
+    for path in paths {
+        namespace
+            .qualify(NamespaceParent::Directory(
+                sy::engine::domain::RelativePath::new(*path).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+    namespace.seal().await.unwrap();
+}
+
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
@@ -249,6 +268,10 @@ async fn run_case(
     let stream = |entries: Vec<Entry>| -> sy::engine::reconcile::EntryStream {
         sy::engine::reconcile::EntryStream::new(futures::stream::iter(entries.into_iter().map(Ok)))
     };
+    let rooted = sy::rooted_fs::RootedFs::open(destination.path().into())
+        .await
+        .unwrap();
+    let (_rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
     let plan = preflight_sync(
         stream(source_entries),
         stream(destination_entries),
@@ -257,6 +280,7 @@ async fn run_case(
             limit: DeleteLimit::Percentage(100),
             force: false,
         }),
+        sy::engine::namespace::NamespacePreflight::new(&namespace),
         |_| true,
     )
     .await
@@ -306,6 +330,9 @@ async fn run_case(
                 ClientRemoteSession::connect(cr, cw, operation, root, RouterConfig::default())
                     .await
                     .unwrap();
+            if matches!(direction, Direction::Push) {
+                qualify_push_directories(&client, &["dir"]).await;
+            }
             if matches!(direction, Direction::Pull) {
                 // PULL originals belong to the serving session, not the local
                 // fixture scan used to build the direction-neutral plan.
@@ -507,6 +534,10 @@ async fn interleaved_hardlink_parents_are_prepared_before_leaves_and_finalized_l
     let mut request = ScanRequest::default();
     request.metadata.unix_mode = true;
     request.metadata.hardlink_group = true;
+    let rooted = sy::rooted_fs::RootedFs::open(destination.path().into())
+        .await
+        .unwrap();
+    let (_rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
     let mut plan = preflight_sync(
         authority.entries(request),
         local_entry_stream(destination.path().into(), request),
@@ -516,6 +547,7 @@ async fn interleaved_hardlink_parents_are_prepared_before_leaves_and_finalized_l
             ..Default::default()
         },
         None,
+        sy::engine::namespace::NamespacePreflight::new(&namespace),
         |_| true,
     )
     .await
@@ -708,6 +740,10 @@ async fn failed_parent_finalization_retains_published_and_unchanged_sources() {
                     entries.into_iter().map(Ok),
                 ))
             };
+            let rooted = sy::rooted_fs::RootedFs::open(destination.path().into())
+                .await
+                .unwrap();
+            let (_rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
             let plan = preflight_sync(
                 stream(source_entries),
                 stream(destination_entries),
@@ -716,6 +752,7 @@ async fn failed_parent_finalization_retains_published_and_unchanged_sources() {
                     ..Default::default()
                 },
                 None,
+                sy::engine::namespace::NamespacePreflight::new(&namespace),
                 |_| true,
             )
             .await
@@ -765,6 +802,7 @@ async fn failed_parent_finalization_retains_published_and_unchanged_sources() {
                     )
                     .await
                     .unwrap();
+                    qualify_push_directories(&client, &["dir"]).await;
                     let executor = RemotePushExecutor::new(
                         authority,
                         client.request_handle(),

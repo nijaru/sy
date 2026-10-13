@@ -1,11 +1,18 @@
 #[cfg(all(unix, feature = "acl"))]
 mod acl_state;
 mod directory;
+#[cfg(unix)]
+mod namespace;
+#[cfg(not(unix))]
+#[path = "rooted_fs/namespace/unsupported.rs"]
+mod namespace;
+pub use namespace::DestinationNamespace;
 mod metadata;
 #[cfg(all(unix, feature = "acl"))]
 use acl_state::{acl_matches_fd, apply_acl_fd, desired_acl_entries, read_acl_entries_fd};
 mod group;
 pub(crate) use group::RootedStagedGroup;
+pub mod backup;
 mod group_metadata;
 #[cfg(all(test, unix))]
 mod group_tests;
@@ -93,6 +100,9 @@ pub enum RootedFsError {
     #[error("backup destination aliases its source: {0}")]
     BackupAliasesSource(PathBuf),
 
+    #[error("backup address reaches a different native spelling: {0}")]
+    BackupAddressAlias(PathBuf),
+
     #[error(
         "hardlink group is empty or a member publication failed; no finalized proof is available"
     )]
@@ -126,6 +136,17 @@ pub enum RootedFsError {
 
     #[error("source observation catalogue is terminal")]
     SourceCatalogueTerminal,
+
+    #[error("destination namespace catalogue is terminal")]
+    NamespaceCatalogueTerminal,
+
+    #[error("destination namespace qualification is not sealed")]
+    NamespaceUnsealed,
+
+    #[error("destination directory has no original namespace qualification: {0}")]
+    NamespaceUnqualified(PathBuf),
+    #[error("original backup root acquisition failed: {0}")]
+    BackupRootCapture(#[source] Arc<RootedFsError>),
 
     #[error("destination was committed at {path}, but its parent no longer matches the rooted path: {reason}")]
     CommittedParentChanged { path: PathBuf, reason: String },
@@ -245,6 +266,13 @@ pub struct RootedFs {
     source_path_continuity: bool,
     #[cfg(unix)]
     source_observations: Arc<std::sync::Mutex<source_observations::CatalogueState>>,
+    // Clones retain their run's proof; beginning another run never rebinds them.
+    #[cfg(unix)]
+    destination_namespace: Option<namespace::Shared>,
+    namespace_qualification_required: bool,
+    // Catalogue key of this held root; acquisition retains the original index.
+    #[cfg(unix)]
+    namespace_prefix: PathBuf,
     #[cfg(all(test, unix))]
     mutation_pause: Arc<std::sync::Mutex<Option<(usize, PublicationPause)>>>,
     #[cfg(all(test, unix))]
@@ -431,9 +459,11 @@ impl RootedCopySource<'_> {
 
     fn copy_to(self, rooted: &RootedFs, destination: &Path) -> Result<()> {
         self.verify()?;
+        rooted.require_writable()?;
         if let Some(parent) = destination.parent() {
-            rooted.ensure_directories_blocking(parent)?;
+            rooted.ensure_directories_checked(parent, Some(destination))?;
         }
+        rooted.verify_backup_address_blocking(destination)?;
         let (parent, leaf) = rooted.open_parent_blocking(destination)?;
         // Compare observations, not spellings: case/normalization aliases and
         // hardlinks must not let a backup overwrite the held source inode.
@@ -452,6 +482,7 @@ impl RootedCopySource<'_> {
 
         let mut staged =
             rooted.begin_staged_path_blocking(destination, ExpectedDestination::SnapshotAtOpen)?;
+        staged.namespace.backup_address = true;
         let mut prepare = || -> Result<()> {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let metadata = self.file.metadata()?;
@@ -561,6 +592,9 @@ struct RootedNamespaceTransaction {
     // Group aliases/anchor may already share a visible inode. Refuse cleanup
     // after foreign metadata edits and account only our verified own unlink.
     strict_cleanup: bool,
+    // Backup-only spelling proof supplements SnapshotAtOpen, including late
+    // same-inode case/normalization renames that identity cannot detect.
+    backup_address: bool,
     committed: bool,
 }
 
@@ -1145,6 +1179,10 @@ impl RootedNamespaceTransaction {
 
     #[cfg(unix)]
     fn verify_parent_binding(&self) -> Result<()> {
+        if self.backup_address {
+            self.rooted
+                .verify_backup_address_blocking(&self.destination_path)?;
+        }
         let changed = || RootedFsError::DestinationChanged(self.destination_path.clone());
         let (parent, leaf) = self
             .rooted
@@ -1153,6 +1191,10 @@ impl RootedNamespaceTransaction {
         if leaf != self.destination_name {
             return Err(changed());
         }
+        self.rooted.verify_namespace_directory(
+            self.destination_path.parent().unwrap_or(Path::new("")),
+            self.parent_fd.as_raw_fd(),
+        )?;
         let held = stat_fd(self.parent_fd.as_raw_fd())?;
         let current = stat_fd(parent.as_raw_fd())?;
         if held.st_dev == current.st_dev && held.st_ino == current.st_ino {
@@ -1322,10 +1364,18 @@ impl RootedFs {
         }
     }
 
+    /// Session/endpoint destination owners must require preflight before cloning
+    /// handlers. An unstarted owner then cannot mutate by omitting NamespaceBegin.
+    pub fn require_namespace_qualification(&mut self) {
+        self.namespace_qualification_required = true;
+    }
+
     fn require_writable(&self) -> Result<()> {
         if matches!(self.mutation_admission, RootedMutationAdmission::ReadOnly) {
             return Err(RootedFsError::ReadOnlyRoot);
         }
+        #[cfg(unix)]
+        self.require_namespace_sealed()?;
         Ok(())
     }
 
@@ -1399,9 +1449,10 @@ impl RootedFs {
             let rooted = self.clone();
             tokio::task::spawn_blocking(move || {
                 crate::fs_util::namespace::directory_semantics(rooted.root_fd.as_fd())
+                    .map_err(RootedFsError::Io)
             })
             .await
-            .map_err(|error| RootedFsError::Worker(error.to_string()))
+            .map_err(|error| RootedFsError::Worker(error.to_string()))?
         }
         #[cfg(not(unix))]
         {
@@ -2041,11 +2092,22 @@ impl RootedFs {
     /// Local deletion backups may use an operator-selected directory outside
     /// the sync root. Validate and hold the source before creating any backup
     /// directories; the backup itself uses the same staged-copy transaction.
+    #[cfg(test)]
     pub(crate) fn backup_file_blocking(
         &self,
         source: &RelativePath,
         destination: &Path,
         expected_source_identity: EntryIdentity,
+    ) -> Result<()> {
+        self.backup_file_with_root_blocking(source, destination, expected_source_identity, None)
+    }
+
+    pub(crate) fn backup_file_with_root_blocking(
+        &self,
+        source: &RelativePath,
+        destination: &Path,
+        expected_source_identity: EntryIdentity,
+        backup_root: Option<&backup::BackupRoot>,
     ) -> Result<()> {
         #[cfg(unix)]
         {
@@ -2062,24 +2124,21 @@ impl RootedFs {
                 // reopening a pathname here would lose both authorities.
                 return source.copy_to(self, relative);
             }
-            {
-                let _permit = self.admit_mutation_blocking()?;
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut backup_root = Self::open_blocking(parent.to_path_buf())?;
-            // An operator-selected external backup directory is another root,
-            // not an exemption from the owning session's cancellation cutoff.
-            backup_root.mutation_admission = self.mutation_admission.clone();
-            backup_root.run_admission = self.run_admission.clone();
-            // An external backup can retire an inode with aliases beneath the
-            // destination root too; namespace confinement differs, run ownership
-            // of those exact native transitions does not.
-            backup_root.retirement = Arc::clone(&self.retirement);
-            source.copy_to(&backup_root, Path::new(leaf))
+            let _ = (parent, leaf);
+            let backup_root = backup_root
+                .ok_or_else(|| RootedFsError::NamespaceUnqualified(destination.to_path_buf()))?;
+            let root = backup_root.original_path()?;
+            let relative = RelativePath::new(
+                destination
+                    .strip_prefix(root)
+                    .map_err(|_| RootedFsError::InvalidRelativePath)?,
+            )
+            .map_err(|_| RootedFsError::InvalidRelativePath)?;
+            backup_root.copy_blocking(self, source, &relative)
         }
         #[cfg(not(unix))]
         {
-            let _ = (source, destination, expected_source_identity);
+            let _ = (source, destination, expected_source_identity, backup_root);
             Err(RootedFsError::UnsupportedPlatform)
         }
     }
@@ -2544,6 +2603,9 @@ impl RootedFs {
             run_admission: None,
             source_path_continuity: false,
             source_observations: Arc::new(std::sync::Mutex::new(Default::default())),
+            destination_namespace: None,
+            namespace_qualification_required: false,
+            namespace_prefix: PathBuf::new(),
             #[cfg(test)]
             mutation_pause: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(all(test, unix))]
@@ -2660,6 +2722,7 @@ impl RootedFs {
                 cleanup_owned: None,
                 sealed: None,
                 strict_cleanup: false,
+                backup_address: false,
                 committed: false,
             });
         }
@@ -2995,7 +3058,28 @@ impl RootedFs {
     /// directories are accepted; other leaf kinds are errors.
     #[cfg(unix)]
     fn ensure_directories_blocking(&self, relative: &Path) -> Result<()> {
+        self.ensure_directories_checked(relative, None)
+    }
+
+    #[cfg(unix)]
+    fn ensure_directories_checked(
+        &self,
+        relative: &Path,
+        backup_address: Option<&Path>,
+    ) -> Result<()> {
         self.require_writable()?;
+        let gate = self.namespace_creation_gate()?;
+        let _creation = gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| RootedFsError::NamespaceCatalogueTerminal)?;
+        // A confirmed owned mkdir advances the catalogue before another backup
+        // may validate that prediction; never observe our own in-progress mkdir
+        // as a foreign winner.
+        if let Some(address) = backup_address {
+            self.verify_backup_address_blocking(address)?;
+        }
         let mut current_fd = self.root_fd.try_clone()?;
         let mut prefix = PathBuf::new();
         for component in relative.components() {
@@ -3003,12 +3087,20 @@ impl RootedFs {
                 return Err(RootedFsError::InvalidRelativePath);
             };
             prefix.push(name);
+            let predicted = self.namespace_predicts_absent(&prefix, current_fd.as_raw_fd())?;
             current_fd = match open_dir_at(current_fd.as_raw_fd(), name) {
+                Ok(_) if predicted => return Err(RootedFsError::DestinationChanged(prefix)),
                 Ok(fd) => fd,
                 Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::ENOENT) => {
                     let name_c = component_cstring(name)?;
                     self.verify_parent_binding_blocking(&prefix, &current_fd)?;
+                    if let Some(address) = backup_address {
+                        self.verify_backup_address_blocking(address)?;
+                    }
                     let _permit = self.admit_mutation_blocking()?;
+                    if let Some(address) = backup_address {
+                        self.verify_backup_address_blocking(address)?;
+                    }
                     let result = unsafe {
                         // SAFETY: `current_fd` remains open and `name_c` is a
                         // live single component. mkdirat creates only beneath
@@ -3017,26 +3109,39 @@ impl RootedFs {
                     };
                     if result != 0 {
                         let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() != Some(libc::EEXIST) {
-                            return Err(error.into());
-                        }
+                        // Never adopt a concurrent mkdir winner as our child.
+                        return Err(error.into());
                     }
-                    // A concurrent creator may win mkdirat; reopen with the
-                    // same no-follow directory checks in either case.
-                    open_dir_at(current_fd.as_raw_fd(), name)?
+                    let child = open_dir_at(current_fd.as_raw_fd(), name)?;
+                    self.advance_namespace_directory(
+                        &prefix,
+                        current_fd.as_raw_fd(),
+                        child.as_raw_fd(),
+                    )?;
+                    child
                 }
                 Err(error) => return Err(error),
             };
+            self.verify_namespace_directory(&prefix, current_fd.as_raw_fd())?;
         }
         Ok(())
     }
 
     #[cfg(unix)]
     fn create_directory_path_blocking(&self, relative: &Path) -> Result<EntryIdentity> {
+        let gate = self.namespace_creation_gate()?;
+        let _creation = gate
+            .as_ref()
+            .map(|gate| gate.lock())
+            .transpose()
+            .map_err(|_| RootedFsError::NamespaceCatalogueTerminal)?;
         let (parent, leaf) = self.open_parent_blocking(relative)?;
         let leaf_c = component_cstring(&leaf)?;
+        self.require_writable()?;
+        self.namespace_predicts_absent(relative, parent.as_raw_fd())?;
         self.verify_parent_binding_blocking(relative, &parent)?;
         let _permit = self.admit_mutation_blocking()?;
+        self.verify_parent_binding_blocking(relative, &parent)?;
         let result = unsafe {
             // SAFETY: `parent` remains open and `leaf_c` is a live single
             // component. mkdirat creates only beneath the already-resolved
@@ -3055,6 +3160,7 @@ impl RootedFs {
         if opened != created {
             return Err(RootedFsError::DestinationChanged(relative.to_path_buf()));
         }
+        self.advance_namespace_directory(relative, parent.as_raw_fd(), directory.as_raw_fd())?;
         Ok(opened)
     }
 
@@ -3244,7 +3350,11 @@ impl RootedFs {
                 }
                 file
             }
-            EntryKind::Directory => File::from(open_dir_at(parent.as_raw_fd(), &leaf)?),
+            EntryKind::Directory => {
+                let directory = open_dir_at(parent.as_raw_fd(), &leaf)?;
+                self.verify_namespace_directory(relative, directory.as_raw_fd())?;
+                File::from(directory)
+            }
             EntryKind::Symlink => return Err(RootedFsError::UnsupportedSymlinkXattrs),
         };
         Ok(file)
@@ -3259,6 +3369,9 @@ impl RootedFs {
     ) -> Result<()> {
         let path = RelativePath::new(relative.to_path_buf())
             .map_err(|_| RootedFsError::InvalidRelativePath)?;
+        if kind == EntryKind::Directory {
+            self.verify_namespace_directory(relative, file.as_raw_fd())?;
+        }
         let held = identity_from_stat(&stat_fd(file.as_raw_fd())?)
             .ok_or_else(|| RootedFsError::DestinationChanged(relative.to_path_buf()))?;
         if self.path_identity_blocking(&path)? != Some((kind, held)) {
@@ -3270,6 +3383,10 @@ impl RootedFs {
     #[cfg(unix)]
     fn verify_parent_binding_blocking(&self, relative: &Path, held: &OwnedFd) -> Result<()> {
         let (current, _) = self.open_parent_blocking(relative)?;
+        self.verify_namespace_directory(
+            relative.parent().unwrap_or(Path::new("")),
+            held.as_raw_fd(),
+        )?;
         let current = stat_fd(current.as_raw_fd())?;
         let held = stat_fd(held.as_raw_fd())?;
         if held.st_dev != current.st_dev || held.st_ino != current.st_ino {
@@ -3299,6 +3416,10 @@ impl RootedFs {
         }
 
         let leaf = leaf.ok_or(RootedFsError::InvalidRelativePath)?;
+        self.verify_namespace_directory(
+            relative.parent().unwrap_or(Path::new("")),
+            current_fd.as_raw_fd(),
+        )?;
         Ok((current_fd, leaf))
     }
 }
@@ -4308,6 +4429,10 @@ mod tests {
         std::fs::hard_link(root.path().join("source"), root.path().join("linked")).unwrap();
         // Adding a hardlink changes ctime, so observe the new stable identity.
         let (_, expected) = rooted.path_identity_blocking(&source).unwrap().unwrap();
+        let (rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
+        crate::engine::namespace::NamespaceQualification::seal(&namespace)
+            .await
+            .unwrap();
         for destination in [&source, &relative("linked")] {
             assert!(matches!(
                 rooted.copy_file_blocking(&source, destination, expected),
@@ -4472,26 +4597,6 @@ mod tests {
             b"replacement"
         );
         assert_eq!(std::fs::read_dir(&moved_parent).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn concurrent_parent_creation_reopens_winning_directory() {
-        let root = tempfile::TempDir::new().unwrap();
-        let rooted = Arc::new(RootedFs::open(root.path().to_path_buf()).await.unwrap());
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-        let mut workers = Vec::new();
-        for _ in 0..8 {
-            let rooted = Arc::clone(&rooted);
-            let barrier = Arc::clone(&barrier);
-            workers.push(tokio::task::spawn_blocking(move || {
-                barrier.wait();
-                rooted.create_directories_blocking(&relative("shared/nested"))
-            }));
-        }
-        for worker in workers {
-            worker.await.unwrap().unwrap();
-        }
-        assert!(root.path().join("shared/nested").is_dir());
     }
 
     #[tokio::test]

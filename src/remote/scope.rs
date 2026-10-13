@@ -68,6 +68,23 @@ pub(crate) fn authorize(
                 WireScanScope::Tree => Err(mismatch(RequestedScope::Tree)),
             };
         }
+        FrameKind::NamespaceRequest => {
+            return match crate::protocol::WireNamespaceRequest::decode(payload)? {
+                // COPY backup destinations already have explicit root-confined
+                // authority. Parent profiles grant no sibling SOURCE data,
+                // metadata-setter or removal access.
+                crate::protocol::WireNamespaceRequest::QualifyBackup(_)
+                | crate::protocol::WireNamespaceRequest::ValidateBackupAddress(_)
+                | crate::protocol::WireNamespaceRequest::Begin
+                | crate::protocol::WireNamespaceRequest::Seal
+                | crate::protocol::WireNamespaceRequest::Qualify(
+                    crate::protocol::WireNamespaceParent::Root,
+                ) => Ok(()),
+                crate::protocol::WireNamespaceRequest::Qualify(
+                    crate::protocol::WireNamespaceParent::Directory(path),
+                ) => Err(mismatch(RequestedScope::Path(path))),
+            };
+        }
         FrameKind::AcquireRoot => AcquireRoot::decode(payload)?.create,
         FrameKind::SourceIgnoreRequest => {
             crate::protocol::WireSourceIgnoreRequest::decode(payload)?.path

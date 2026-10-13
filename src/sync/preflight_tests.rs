@@ -73,6 +73,58 @@ async fn limited_peer(
 }
 
 #[tokio::test]
+async fn pending_push_namespace_preflight_preserves_preview_and_admits_creation() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for dry_run in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            let missing = fixture.path().join("missing");
+            let destination = missing.join("parents/destination");
+            std::fs::create_dir_all(source.join("directory")).unwrap();
+            std::fs::write(source.join("directory/file"), b"SOURCE payload").unwrap();
+            let mut config = SyncConfig::test_default();
+            config.dry_run = dry_run;
+            let (mut client, server, relay) = limited_peer(
+                if dry_run {
+                    Operation::PreviewPush
+                } else {
+                    Operation::Push
+                },
+                &destination,
+                CapabilitySet::empty(),
+            )
+            .await;
+            super::push::execute_with_handle(
+                &source,
+                &destination,
+                client.request_handle(),
+                &config,
+                ScanOptions::default(),
+            )
+            .await
+            .unwrap();
+            client.finish().await.unwrap();
+            server.await.unwrap();
+            relay.await.unwrap();
+            if dry_run {
+                assert!(!missing.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(destination.join("directory/file")).unwrap(),
+                    b"SOURCE payload"
+                );
+            }
+            assert_eq!(
+                std::fs::read(source.join("directory/file")).unwrap(),
+                b"SOURCE payload"
+            );
+        }
+    })
+    .await
+    .expect("namespace preflight and admitted acquisition must finish");
+}
+
+#[tokio::test]
 async fn remote_preservation_admission_precedes_directory_root_and_backup_effects() {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         for pull in [false, true] {

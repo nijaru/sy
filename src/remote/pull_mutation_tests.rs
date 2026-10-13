@@ -1,5 +1,6 @@
 //! Pull source-completion checks and native mutation cutoff/drain contracts.
 use super::*;
+use crate::engine::namespace::NamespaceQualification;
 use crate::engine::scheduler::ResourceBudget;
 use crate::protocol::Operation;
 use crate::remote::router::{RouterConfig, RouterError};
@@ -289,6 +290,37 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
             if matches!(mutation, Mutation::Directory) {
                 std::fs::remove_dir(destination_root.path().join("directory")).unwrap();
             }
+            let (namespace, entries) = executor
+                .destination_entries(Default::default())
+                .await
+                .unwrap();
+            entries.try_collect::<Vec<_>>().await.unwrap();
+            namespace
+                .qualify(crate::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace
+                .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                    directory.path.clone(),
+                ))
+                .await
+                .unwrap();
+            if matches!(mutation, Mutation::ExternalBackup) {
+                let backup = crate::rooted_fs::backup::BackupRoot::capture(
+                    external_backup.path().join("new-directory"),
+                )
+                .await;
+                let (qualification, entries) = backup.prepare().await.unwrap();
+                entries.try_collect::<Vec<_>>().await.unwrap();
+                qualification
+                    .qualify(crate::engine::namespace::NamespaceParent::Root)
+                    .await
+                    .unwrap();
+                qualification.seal().await.unwrap();
+                executor = executor.with_backup_root(Some(backup));
+            }
+            namespace.seal().await.unwrap();
+            let rooted = executor.metadata_authority().await.unwrap().clone();
             let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = std::sync::mpsc::channel();
             rooted.pause_mutation_at(
@@ -399,7 +431,7 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                 .unwrap();
             assert!(
                 matches!(reached, Ok(Ok(()))),
-                "{mutation:?}/{admitted}: gate not reached"
+                "{mutation:?}/{admitted}: gate not reached; result: {result:?}"
             );
             assert!(
                 closed.is_ok(),
@@ -436,7 +468,7 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                     // Initial root creation is authority too, not just mkdir
                     // beneath an already pinned root.
                     let absent_root = destination_root.path().join("absent/nested");
-                    let fresh = RemotePullExecutor::new(
+                    let mut fresh = RemotePullExecutor::new(
                         absent_root.clone(),
                         client.request_handle(),
                         client.sender(),
@@ -444,8 +476,14 @@ async fn queued_pull_mutations_obey_client_cutoff_without_blocking_router() {
                     );
                     // Discovery is now read-only even for a real run. The
                     // separate post-preflight acquisition owns mkdir admission.
-                    let (_, entries) = fresh.destination_entries(Default::default()).await.unwrap();
+                    let (namespace, entries) =
+                        fresh.destination_entries(Default::default()).await.unwrap();
                     assert!(entries.try_collect::<Vec<_>>().await.unwrap().is_empty());
+                    namespace
+                        .qualify(crate::engine::namespace::NamespaceParent::Root)
+                        .await
+                        .unwrap();
+                    namespace.seal().await.unwrap();
                     assert!(matches!(
                         fresh
                             .acquire_destination_for_create(&RelativePath::new("file").unwrap())

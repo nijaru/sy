@@ -98,6 +98,38 @@ impl ClientRemoteSession {
 }
 
 impl ClientRemoteHandle {
+    /// Begin before scans: sealing and all native effects use the same
+    /// server-owned per-run original parent catalogue.
+    pub async fn begin_namespace_qualification(
+        &self,
+    ) -> Result<std::sync::Arc<dyn crate::engine::namespace::NamespaceQualification>> {
+        if self.operation == Operation::Pull {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind: FrameKind::NamespaceRequest,
+            });
+        }
+        let qualification = crate::remote::namespace::begin(self.sender.clone(), self.peer).await?;
+        Ok(std::sync::Arc::new(qualification))
+    }
+
+    /// Observes explicit backup DEST parents in this run's existing owner.
+    /// Begin remains mandatory; this proxy cannot establish native authority.
+    pub fn backup_namespace_qualification(
+        &self,
+    ) -> Result<std::sync::Arc<dyn crate::engine::namespace::NamespaceQualification>> {
+        if self.operation == Operation::Pull {
+            return Err(RemoteSessionError::OperationMismatch {
+                operation: self.operation,
+                kind: FrameKind::NamespaceRequest,
+            });
+        }
+        Ok(std::sync::Arc::new(crate::remote::namespace::backup(
+            self.sender.clone(),
+            self.peer,
+        )))
+    }
+
     pub async fn source_ignored(
         &self,
         path: &RelativePath,
@@ -220,11 +252,6 @@ impl ClientRemoteHandle {
         request.validate(source)?;
         request.validate(destination)?;
         Ok(())
-    }
-
-    /// Actual held-root semantics; pending roots remain unqualified.
-    pub fn namespace_semantics(&self) -> crate::engine::namespace::NamespaceSemantics {
-        self.binding().namespace_semantics.into()
     }
 
     /// The session's frame router sender. Executors open fetch streams

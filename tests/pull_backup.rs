@@ -24,6 +24,7 @@ struct Pull {
     destination_root: tempfile::TempDir,
     source: Entry,
     destination: Entry,
+    destination_binding: sy::rooted_fs::operand::BoundDestination,
     client: ClientRemoteSession,
     child: Child,
 }
@@ -64,6 +65,27 @@ impl Pull {
                 source = Some(entry);
             }
         }
+        let mut destination_binding = sy::rooted_fs::operand::BoundDestination::open(
+            destination_root.path().to_path_buf(),
+            sy::rooted_fs::operand::SourceShape::Directory { basename: None },
+        )
+        .await
+        .unwrap();
+        let (root, namespace) = destination_binding
+            .root
+            .with_namespace_qualification()
+            .await
+            .unwrap();
+        use sy::engine::namespace::{NamespaceParent, NamespaceQualification};
+        namespace.qualify(NamespaceParent::Root).await.unwrap();
+        namespace
+            .qualify(NamespaceParent::Directory(
+                sy::engine::domain::RelativePath::new("nested").unwrap(),
+            ))
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        destination_binding.root = root;
         let mut destination_entries = sy::endpoint::local_entry_scan::local_entry_stream(
             destination_root.path().to_path_buf(),
             request,
@@ -80,6 +102,7 @@ impl Pull {
             destination_root,
             source: source.unwrap(),
             destination: destination.unwrap(),
+            destination_binding,
             client,
             child,
         }
@@ -90,13 +113,46 @@ impl Pull {
         backup_dir: Option<PathBuf>,
         suffix: &str,
     ) -> Result<(), RemotePullError> {
+        let backup_root = if let Some(directory) = &backup_dir {
+            use sy::engine::namespace::NamespaceQualification;
+            let root = sy::rooted_fs::backup::BackupRoot::capture(directory.clone()).await;
+            let (namespace, mut existing) = root.prepare().await.unwrap();
+            let mut detector = sy::engine::namespace::NamespaceCollisionDetector::new();
+            while let Some(entry) = existing.next().await {
+                detector
+                    .record(&entry.unwrap().path, &namespace)
+                    .await
+                    .unwrap();
+            }
+            existing.close().await.unwrap();
+            let policy = sy::engine::backup::BackupPolicy::local(
+                self.destination_root.path(),
+                Some(directory),
+                suffix.into(),
+            )
+            .unwrap();
+            let sy::engine::backup::BackupAddress::FixedRoot(path) =
+                policy.destination(&self.destination.path).unwrap()
+            else {
+                panic!("expected external backup");
+            };
+            detector.record(&path, &namespace).await.unwrap();
+            namespace.validate_backup_address(path).await.unwrap();
+            detector.finish().await.unwrap();
+            namespace.seal().await.unwrap();
+            Some(root)
+        } else {
+            None
+        };
         let executor = RemotePullExecutor::new(
             self.destination_root.path().to_path_buf(),
             self.client.request_handle(),
             self.client.sender(),
             Scheduler::new(ResourceBudget::default()).unwrap(),
         )
+        .with_destination_binding(self.destination_binding.clone())
         .with_backup_enabled(true)
+        .with_backup_root(backup_root)
         .with_backup(backup_dir)
         .with_backup_suffix(suffix.into());
         let work = lower_pull_op(

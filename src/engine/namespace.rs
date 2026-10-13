@@ -12,8 +12,8 @@
 //!   bounded fan-in instead of retaining a whole-tree map. Inactive runs own
 //!   only scratch paths, not descriptors.
 //! - **Honesty.** Filesystem name rules are not fully knowable from an OS name
-//!   or a Unicode transform. `NamespaceSemantics` records what the destination
-//!   root actually folds; when a rule is unknown the check stays conservative
+//!   or a Unicode transform. `NamespaceSemantics` records what each containing
+//!   directory actually folds; when a rule is unknown the check stays conservative
 //!   (assumes folding) and reports `NamespaceAmbiguity` instead of claiming a
 //!   definitive collision. Known folding axes still do not qualify a native
 //!   Unicode table/version: generic Unicode matches remain ambiguity too.
@@ -21,7 +21,9 @@
 use super::domain::RelativePath;
 use super::native_path;
 use caseless::Caseless;
+use futures::future::BoxFuture;
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::io;
 use tokio::io::AsyncWriteExt;
 use unicode_normalization::UnicodeNormalization;
@@ -34,7 +36,7 @@ pub enum Folding {
     /// The axis folds names (case folding and/or Unicode canonical
     /// decomposition), so distinct byte names can alias.
     Folded,
-    /// The axis could not be determined for this root.
+    /// The axis could not be determined for this containing directory.
     ///
     /// Preflight treats an unknown axis as folding (the conservative
     /// direction) and reports detected aliases as ambiguity rather than as a
@@ -42,7 +44,7 @@ pub enum Folding {
     Unspecified,
 }
 
-/// Name-comparison semantics of one destination root.
+/// Name-comparison semantics of one containing destination directory.
 ///
 /// These describe the destination filesystem, not the endpoint OS: APFS can be
 /// case-sensitive, ext4 directories can opt into case folding, and removable
@@ -66,7 +68,7 @@ impl NamespaceSemantics {
         normalization: Folding::Exact,
     };
 
-    /// Nothing is known about the root; assume folding and stay conservative.
+    /// Nothing is known about the directory; assume folding and stay conservative.
     pub const UNSPECIFIED: Self = Self {
         case: Folding::Unspecified,
         normalization: Folding::Unspecified,
@@ -78,7 +80,7 @@ impl NamespaceSemantics {
         normalization: Folding::Folded,
     };
 
-    /// True when distinct byte names can never alias, letting preflight skip.
+    /// True when distinct child names cannot alias in this directory only.
     pub const fn is_byte_exact(self) -> bool {
         matches!(self.case, Folding::Exact) && matches!(self.normalization, Folding::Exact)
     }
@@ -99,33 +101,96 @@ impl NamespaceSemantics {
         }
     }
 
-    /// Alias key for `path`.
+    /// Alias key for one child name, never its containing directory.
     ///
     /// `lenient` folds every axis that is `Folded` *or* `Unspecified`. The
-    /// strict form transforms only ASCII paths under proven-folded axes.
+    /// strict form transforms only ASCII names under proven-folded axes.
     /// Non-ASCII transformations have no qualified native Unicode profile, so
     /// their matches are ambiguity, not proof of filesystem equivalence.
-    fn key(self, path: &RelativePath, lenient: bool) -> Vec<u8> {
+    fn key(self, child: &OsStr, lenient: bool) -> Vec<u8> {
         // Native folding capabilities do not specify a Unicode table/version
         // or every filesystem collation detail. Only ASCII transformations
         // can establish a strict key; Unicode matches remain conservative.
-        if !lenient && !path.as_path().as_os_str().as_encoded_bytes().is_ascii() {
-            return native_path::encode(path.as_path().as_os_str());
+        if !lenient && !child.as_encoded_bytes().is_ascii() {
+            return native_path::encode(child);
         }
         let fold_case = self.folds_case(lenient);
         let fold_norm = self.folds_normalization(lenient);
         if !fold_case && !fold_norm {
-            return native_path::encode(path.as_path().as_os_str());
+            return native_path::encode(child);
         }
 
         let mut bytes = Vec::new();
-        for (index, component) in path.as_path().components().enumerate() {
-            if index > 0 {
-                bytes.push(0); // NUL cannot occur inside a path component.
-            }
-            fold_component(&mut bytes, component.as_os_str(), fold_case, fold_norm);
-        }
+        fold_component(&mut bytes, child, fold_case, fold_norm);
         bytes
+    }
+}
+
+/// The directory whose native rules govern a child name. Root is an explicit
+/// empty parent, not an invalid/empty `RelativePath`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NamespaceParent {
+    Root,
+    Directory(RelativePath),
+}
+
+/// Run-owned qualification of original containing-directory observations.
+///
+/// The backend retains observation authority; a fresh stat cannot substitute for
+/// that authority. `seal` validates the completed qualification set, but does not
+/// establish collision proof or turn an incomplete scan into an admitted plan.
+pub trait NamespaceQualification: Send + Sync {
+    fn qualify<'a>(&'a self, parent: NamespaceParent) -> BoxFuture<'a, Result<NamespaceSemantics>>;
+    /// Prove that native lookup of a derived backup does not reach an unscanned
+    /// differently spelled name, including its original in-root ancestors.
+    fn validate_backup_address<'a>(&'a self, path: RelativePath) -> BoxFuture<'a, Result<()>>;
+    fn seal(&self) -> BoxFuture<'_, Result<()>>;
+}
+
+/// Complete effect declarations for MAIN and the one optional BACKUP root.
+pub struct NamespacePreflight<'a> {
+    pub destination: &'a dyn NamespaceQualification,
+    pub backup: Option<BackupNamespace<'a>>,
+}
+impl<'a> NamespacePreflight<'a> {
+    pub fn new(destination: &'a dyn NamespaceQualification) -> Self {
+        Self {
+            destination,
+            backup: None,
+        }
+    }
+    pub fn with_backup(mut self, backup: BackupNamespace<'a>) -> Self {
+        self.backup = Some(backup);
+        self
+    }
+}
+pub struct BackupNamespace<'a> {
+    pub policy: &'a super::backup::BackupPolicy,
+    /// Same native run owner, with explicit backup-purpose routing on SSH.
+    pub qualification: &'a dyn NamespaceQualification,
+    pub external: Option<&'a crate::rooted_fs::backup::BackupRoot>,
+    /// Hardlink topology repair may publish an otherwise unchanged member.
+    pub potential_hardlinks: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct FixedNamespaceQualification(pub NamespaceSemantics);
+
+#[cfg(test)]
+impl NamespaceQualification for FixedNamespaceQualification {
+    fn qualify<'a>(
+        &'a self,
+        _parent: NamespaceParent,
+    ) -> BoxFuture<'a, Result<NamespaceSemantics>> {
+        Box::pin(async { Ok(self.0) })
+    }
+
+    fn validate_backup_address(&self, _path: RelativePath) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn seal(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -243,7 +308,10 @@ pub enum NamespacePreflightError {
     #[error(transparent)]
     Ambiguity(#[from] NamespaceAmbiguity),
 
-    #[error("namespace preflight scratch I/O failed: {0}")]
+    #[error("native byte collation is unqualified for non-UTF-8 destination name: {0}")]
+    UnqualifiedByteCollation(RelativePath),
+
+    #[error("namespace preflight I/O failed: {0}")]
     Io(#[from] io::Error),
 
     #[error("namespace preflight scratch worker failed: {0}")]
@@ -281,7 +349,9 @@ impl Default for SpillBudget {
     }
 }
 
-/// One alias-check record: sort key, classification key, and native name bytes.
+/// One alias-check record: parent-scoped keys and the full native diagnostic path.
+/// Both keys start with an exact, length-tagged containing-parent spelling.
+/// Ancestor aliases are checked as children in their own containing directory.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SortRecord {
     lenient_key: Vec<u8>,
@@ -291,11 +361,41 @@ struct SortRecord {
 
 impl SortRecord {
     fn new(semantics: NamespaceSemantics, path: &RelativePath) -> Result<Self> {
-        let path_bytes = native_path::encode(path.as_path().as_os_str());
+        let native = path.as_path();
+        let parent = native
+            .parent()
+            .ok_or(NamespacePreflightError::InvalidRecord(
+                "relative path has no containing parent",
+            ))?;
+        let child = native
+            .file_name()
+            .ok_or(NamespacePreflightError::InvalidRecord(
+                "relative path has no child name",
+            ))?;
+        // Unknown collation may fold non-UTF-8 bytes (for example XFS ascii-ci
+        // folds Latin-1 C0/E0). ASCII folding is not a safe substitute.
+        if semantics.case == Folding::Unspecified && child.to_str().is_none() {
+            return Err(NamespacePreflightError::UnqualifiedByteCollation(
+                path.clone(),
+            ));
+        }
+        let parent_bytes = native_path::encode(parent.as_os_str());
+        if parent_bytes.len() > MAX_RECORD_BYTES {
+            return Err(NamespacePreflightError::RecordTooLarge {
+                actual: parent_bytes.len(),
+                maximum: MAX_RECORD_BYTES,
+            });
+        }
+        let scoped_key = |lenient| {
+            let mut key = (parent_bytes.len() as u32).to_be_bytes().to_vec();
+            key.extend_from_slice(&parent_bytes);
+            key.extend_from_slice(&semantics.key(child, lenient));
+            key
+        };
         let record = Self {
-            lenient_key: semantics.key(path, true),
-            strict_key: semantics.key(path, false),
-            path: path_bytes,
+            lenient_key: scoped_key(true),
+            strict_key: scoped_key(false),
+            path: native_path::encode(native.as_os_str()),
         };
         let size = record.lenient_key.len() + record.strict_key.len() + record.path.len() + 12;
         if size > MAX_RECORD_BYTES {
@@ -570,7 +670,6 @@ impl RunFile {
 /// `SpillBudget::merge_fan_in + 1`, accounting for the output.
 #[derive(Debug)]
 pub struct NamespaceCollisionDetector {
-    semantics: NamespaceSemantics,
     budget: SpillBudget,
     buffer: Vec<SortRecord>,
     buffered_bytes: usize,
@@ -581,14 +680,19 @@ pub struct NamespaceCollisionDetector {
     descriptors: std::sync::Arc<DescriptorCounts>,
 }
 
+impl Default for NamespaceCollisionDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NamespaceCollisionDetector {
-    pub fn new(semantics: NamespaceSemantics) -> Self {
-        Self::with_budget(semantics, SpillBudget::default())
+    pub fn new() -> Self {
+        Self::with_budget(SpillBudget::default())
     }
 
-    pub fn with_budget(semantics: NamespaceSemantics, budget: SpillBudget) -> Self {
+    pub fn with_budget(budget: SpillBudget) -> Self {
         Self {
-            semantics,
             budget: SpillBudget {
                 run_bytes: budget.run_bytes.max(1),
                 merge_fan_in: budget.merge_fan_in.max(2),
@@ -603,26 +707,36 @@ impl NamespaceCollisionDetector {
         }
     }
 
-    pub const fn semantics(&self) -> NamespaceSemantics {
-        self.semantics
-    }
-
-    /// Record `path` and every ancestor directory prefix.
-    pub async fn record(&mut self, path: &RelativePath) -> Result<()> {
-        if self.semantics.is_byte_exact() {
-            return Ok(());
-        }
-        self.record_single(path).await?;
+    /// Qualify and record `path` and every ancestor directory prefix. Exact
+    /// rules omit only that parent's child record, never descendant qualification.
+    pub async fn record(
+        &mut self,
+        path: &RelativePath,
+        qualification: &dyn NamespaceQualification,
+    ) -> Result<()> {
+        self.record_single(path, qualification).await?;
         let mut current = path.parent();
         while let Some(parent) = current {
-            self.record_single(&parent).await?;
+            self.record_single(&parent, qualification).await?;
             current = parent.parent();
         }
         Ok(())
     }
 
-    async fn record_single(&mut self, path: &RelativePath) -> Result<()> {
-        let record = SortRecord::new(self.semantics, path)?;
+    async fn record_single(
+        &mut self,
+        path: &RelativePath,
+        qualification: &dyn NamespaceQualification,
+    ) -> Result<()> {
+        let parent = match path.parent() {
+            Some(parent) => NamespaceParent::Directory(parent),
+            None => NamespaceParent::Root,
+        };
+        let semantics = qualification.qualify(parent).await?;
+        if semantics.is_byte_exact() {
+            return Ok(());
+        }
+        let record = SortRecord::new(semantics, path)?;
         self.buffered_bytes += record.encoded_len();
         self.buffer.push(record);
         #[cfg(test)]
@@ -638,9 +752,6 @@ impl NamespaceCollisionDetector {
     /// Prove that no two recorded names alias. Runs complete before any
     /// destination mutation.
     pub async fn finish(mut self) -> Result<()> {
-        if self.semantics.is_byte_exact() {
-            return Ok(());
-        }
         if self.levels.is_empty() {
             return scan_buffered(std::mem::take(&mut self.buffer));
         }
@@ -850,9 +961,10 @@ mod tests {
         budget: SpillBudget,
         paths: &[&str],
     ) -> Result<()> {
-        let mut detector = NamespaceCollisionDetector::with_budget(semantics, budget);
+        let mut detector = NamespaceCollisionDetector::with_budget(budget);
+        let qualification = FixedNamespaceQualification(semantics);
         for path in paths {
-            detector.record(&rel(path)).await?;
+            detector.record(&rel(path), &qualification).await?;
         }
         detector.finish().await
     }
@@ -875,8 +987,146 @@ mod tests {
         assert_eq!(collision.colliding, rel("foo"));
     }
 
+    struct ParentProfiles(fn(&NamespaceParent) -> NamespaceSemantics);
+
+    impl NamespaceQualification for ParentProfiles {
+        fn qualify<'a>(
+            &'a self,
+            parent: NamespaceParent,
+        ) -> BoxFuture<'a, Result<NamespaceSemantics>> {
+            Box::pin(async move { Ok((self.0)(&parent)) })
+        }
+
+        fn validate_backup_address(&self, _path: RelativePath) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn seal(&self) -> BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    async fn detect_parents(
+        qualification: &dyn NamespaceQualification,
+        budget: SpillBudget,
+        paths: &[&str],
+    ) -> Result<()> {
+        let mut detector = NamespaceCollisionDetector::with_budget(budget);
+        for path in paths {
+            detector.record(&rel(path), qualification).await?;
+        }
+        detector.finish().await
+    }
+
     #[tokio::test]
-    async fn byte_exact_mode_skips_tracking() {
+    async fn byte_exact_root_does_not_skip_folded_descendants() {
+        let qualification = ParentProfiles(|parent| match parent {
+            NamespaceParent::Root => NamespaceSemantics::BYTE_EXACT,
+            NamespaceParent::Directory(_) => insensitive(),
+        });
+        for budget in [SpillBudget::default(), tiny_budget()] {
+            let error = detect_parents(&qualification, budget, &["child/A", "child/a"])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, NamespacePreflightError::Collision(collision)
+                if collision.existing == rel("child/A") && collision.colliding == rel("child/a"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_parent_spellings_and_individual_profiles_scope_child_keys() {
+        let qualification = ParentProfiles(|parent| match parent {
+            NamespaceParent::Directory(path) if path == &rel("Dir") => insensitive(),
+            _ => NamespaceSemantics::BYTE_EXACT,
+        });
+        // Root admits both spellings; Dir folds its children, dir does not.
+        // Neither child profile may fold the parent spelling or govern siblings.
+        detect_parents(&qualification, tiny_budget(), &["Dir/A", "dir/A", "dir/a"])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ancestor_aliases_are_checked_even_when_their_children_are_exact() {
+        let qualification = ParentProfiles(|parent| match parent {
+            NamespaceParent::Root => insensitive(),
+            NamespaceParent::Directory(_) => NamespaceSemantics::BYTE_EXACT,
+        });
+        let error = detect_parents(&qualification, tiny_budget(), &["Dir/x", "dir/y"])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NamespacePreflightError::Collision(collision)
+            if collision.existing == rel("Dir") && collision.colliding == rel("dir"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unicode_parent_does_not_weaken_ascii_child_collision_proof() {
+        let error = detect(insensitive(), tiny_budget(), &["café/A", "café/a"])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NamespacePreflightError::Collision(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_profile_is_classified_per_parent() {
+        let qualification = ParentProfiles(|parent| match parent {
+            NamespaceParent::Directory(path) if path == &rel("unknown") => {
+                NamespaceSemantics::UNSPECIFIED
+            }
+            _ => NamespaceSemantics::BYTE_EXACT,
+        });
+        let error = detect_parents(&qualification, tiny_budget(), &["unknown/A", "unknown/a"])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NamespacePreflightError::Ambiguity(_)));
+    }
+
+    #[tokio::test]
+    async fn wide_folded_directory_under_exact_root_keeps_sort_bounds() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let qualification = ParentProfiles(|parent| match parent {
+            NamespaceParent::Root => NamespaceSemantics::BYTE_EXACT,
+            NamespaceParent::Directory(_) => insensitive(),
+        });
+        let budget = SpillBudget {
+            run_bytes: 128,
+            merge_fan_in: 2,
+        };
+        let mut detector = NamespaceCollisionDetector::with_budget(budget);
+        let counts = std::sync::Arc::clone(&detector.descriptors);
+        let largest_record = SortRecord::new(insensitive(), &rel("child/name-0000"))
+            .unwrap()
+            .encoded_len();
+        for index in 0..1024 {
+            detector
+                .record(&rel(&format!("child/name-{index:04}")), &qualification)
+                .await
+                .unwrap();
+            assert_eq!(counts.active.load(Relaxed), 0);
+        }
+        assert!(detector.peak_buffered_bytes <= budget.run_bytes + largest_record);
+        assert!(counts.peak.load(Relaxed) <= budget.merge_fan_in + 1);
+        // The collision must also be found across existing spill boundaries.
+        let outcome = match detector
+            .record(&rel("child/NAME-1000"), &qualification)
+            .await
+        {
+            Err(error) => Err(error),
+            Ok(()) => detector.finish().await,
+        };
+        assert!(matches!(
+            outcome,
+            Err(NamespacePreflightError::Collision(_))
+        ));
+        assert_eq!(counts.active.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn fixed_byte_exact_mode_skips_child_records() {
         detect(
             NamespaceSemantics::BYTE_EXACT,
             tiny_budget(),
@@ -917,12 +1167,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn native_unicode_aliases_cannot_pass_preflight() {
+    async fn generic_unicode_check_classifies_native_alias_examples_as_ambiguity() {
+        // This exercises generic folding, not native directory qualification.
         let root = tempfile::tempdir().unwrap();
-        let rooted = crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
-            .await
-            .unwrap();
-        let semantics = rooted.namespace_semantics().await.unwrap();
         for (index, pair) in [["Straße", "STRASSE"], ["σ", "ς"], ["ﬃ", "ffi"]]
             .into_iter()
             .enumerate()
@@ -934,10 +1181,10 @@ mod tests {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     assert!(
                         matches!(
-                            detect(semantics, tiny_budget(), &pair).await,
+                            detect(insensitive(), tiny_budget(), &pair).await,
                             Err(NamespacePreflightError::Ambiguity(_))
                         ),
-                        "native alias passed preflight: {pair:?}, {semantics:?}"
+                        "generic Unicode folding must not claim native proof: {pair:?}"
                     );
                 }
                 result => result.unwrap(),
@@ -1041,8 +1288,11 @@ mod tests {
             merge_fan_in: 2,
         };
         let largest_record = SortRecord::new(insensitive(), &path).unwrap().encoded_len();
-        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), budget);
-        detector.record(&path).await.unwrap();
+        let mut detector = NamespaceCollisionDetector::with_budget(budget);
+        detector
+            .record(&path, &FixedNamespaceQualification(insensitive()))
+            .await
+            .unwrap();
         // All ancestors fit this single-record maximum, not a depth-dependent
         // sum. Measure the peak at every append, before any spill resets it.
         assert!(detector.peak_buffered_bytes <= budget.run_bytes + largest_record);
@@ -1054,13 +1304,14 @@ mod tests {
     async fn inactive_levels_close_descriptors_and_clean_scratch() {
         use std::sync::atomic::Ordering::Relaxed;
 
-        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), tiny_budget());
+        let mut detector = NamespaceCollisionDetector::with_budget(tiny_budget());
+        let qualification = FixedNamespaceQualification(insensitive());
         let counts = std::sync::Arc::clone(&detector.descriptors);
         // 127 one-record runs leave seven occupied binary merge levels, more
         // than the three permitted active descriptors (two inputs + output).
         for index in 0..127 {
             detector
-                .record(&rel(&format!("name-{index:03}")))
+                .record(&rel(&format!("name-{index:03}")), &qualification)
                 .await
                 .unwrap();
             assert_eq!(counts.active.load(Relaxed), 0);
@@ -1089,11 +1340,18 @@ mod tests {
     async fn merge_collision_closes_handles_and_removes_owned_runs() {
         use std::sync::atomic::Ordering::Relaxed;
 
-        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), tiny_budget());
-        detector.record(&rel("alias")).await.unwrap();
+        let mut detector = NamespaceCollisionDetector::with_budget(tiny_budget());
+        let qualification = FixedNamespaceQualification(insensitive());
+        detector
+            .record(&rel("alias"), &qualification)
+            .await
+            .unwrap();
         let scratch = detector.levels[0][0].path.to_path_buf();
         let counts = std::sync::Arc::clone(&detector.descriptors);
-        let error = detector.record(&rel("ALIAS")).await.unwrap_err();
+        let error = detector
+            .record(&rel("ALIAS"), &qualification)
+            .await
+            .unwrap_err();
         assert!(matches!(error, NamespacePreflightError::Collision(_)));
         assert_eq!(counts.active.load(Relaxed), 0);
         assert!(counts.peak.load(Relaxed) <= tiny_budget().merge_fan_in + 1);
@@ -1157,6 +1415,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unqualified_byte_collation_cannot_admit_xfs_latin1_aliases() {
+        use std::os::unix::ffi::OsStringExt;
+        for byte in [0xc0, 0xe0] {
+            let path = RelativePath::new(std::ffi::OsString::from_vec(vec![byte, b'~'])).unwrap();
+            let mut detector = NamespaceCollisionDetector::new();
+            let qualification = FixedNamespaceQualification(NamespaceSemantics::UNSPECIFIED);
+            assert!(matches!(
+                detector.record(&path, &qualification).await,
+                Err(NamespacePreflightError::UnqualifiedByteCollation(_))
+            ));
+            let mut exact = NamespaceCollisionDetector::new();
+            exact
+                .record(
+                    &path,
+                    &FixedNamespaceQualification(NamespaceSemantics::BYTE_EXACT),
+                )
+                .await
+                .unwrap();
+            exact.finish().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn non_utf8_paths_round_trip_without_false_aliases() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -1165,9 +1447,10 @@ mod tests {
             b'a', 0xff, b'b',
         ])))
         .unwrap();
-        let mut detector = NamespaceCollisionDetector::with_budget(insensitive(), tiny_budget());
-        detector.record(&raw).await.unwrap();
-        detector.record(&rel("c")).await.unwrap();
+        let mut detector = NamespaceCollisionDetector::with_budget(tiny_budget());
+        let qualification = FixedNamespaceQualification(insensitive());
+        detector.record(&raw, &qualification).await.unwrap();
+        detector.record(&rel("c"), &qualification).await.unwrap();
         detector.finish().await.unwrap();
     }
 }

@@ -70,6 +70,16 @@ async fn quick_unchanged_push_preserves_destination_bytes_and_removes_source_onl
         )
         .await
         .unwrap();
+        let namespace = client
+            .request_handle()
+            .begin_namespace_qualification()
+            .await
+            .unwrap();
+        namespace
+            .qualify(sy::engine::namespace::NamespaceParent::Root)
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
         let scheduler = Scheduler::new(ResourceBudget::default()).unwrap();
         let executor = RemotePushExecutor::new(
             authority,

@@ -208,7 +208,21 @@ async fn execute_bound(
             sy::sync::ratelimit::RateLimiter::new(limit),
         ))
     });
-    let executor = RemotePullExecutor::new(
+    let backup_directory = pull_backup_dir(config, destination_root);
+    let backup_namespace = if config.backup.is_some() {
+        Some(
+            sy::engine::backup::BackupPolicy::capture_local(
+                destination_root,
+                backup_directory.as_deref(),
+                config.suffix.clone(),
+            )
+            .await
+            .map_err(map_io)?,
+        )
+    } else {
+        None
+    };
+    let mut executor = RemotePullExecutor::new(
         destination_root.to_path_buf(),
         remote.clone(),
         sender,
@@ -218,6 +232,7 @@ async fn execute_bound(
     .with_backup_enabled(config.backup.is_some())
     .with_backup(pull_backup_dir(config, destination_root))
     .with_backup_suffix(config.suffix.clone())
+    .with_backup_root(backup_namespace.as_ref().and_then(|(_, root)| root.clone()))
     .with_reporter(Some(reporter.clone()))
     .with_compression(compression_policy(config))
     .with_hardlinks(config.preserve.hardlinks)
@@ -228,10 +243,19 @@ async fn execute_bound(
     reporter.start(source_root, destination_root);
     // Pin local destination authority before admitting the remote producer.
     // Its complete scan never inherits source selection rules.
-    let (namespace_semantics, mut destination) = executor
+    let (namespace, mut destination) = executor
         .destination_entries(destination_scan_request(config))
         .await
         .map_err(map_io)?;
+    let mut preflight = sy::engine::namespace::NamespacePreflight::new(namespace.as_ref());
+    if let Some((policy, root)) = &backup_namespace {
+        preflight = preflight.with_backup(sy::engine::namespace::BackupNamespace {
+            policy,
+            qualification: namespace.as_ref(),
+            external: root.as_ref(),
+            potential_hardlinks: config.preserve.hardlinks,
+        });
+    }
     let source_scan = match &scope {
         sy::engine::domain::SyncScope::Tree => {
             remote.scan(source_scan_request(config, scan_options)).await
@@ -274,8 +298,9 @@ async fn execute_bound(
     // Every reply belongs to no-mutation preflight; errors prevent all effects.
     let mut plan = preflight_sync_scoped_with_content(
         OrderedReconciler::with_scope(source, destination, scope),
-        comparison_policy(config, namespace_semantics),
+        comparison_policy(config),
         delete_policy(&config.delete),
+        preflight,
         move |entry| {
             entry_in_size_scope(entry, min_size, max_size)
                 && entry_selected_by_symlink_mode(entry, skip_symlinks)

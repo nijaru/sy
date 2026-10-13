@@ -17,7 +17,7 @@ use sy::engine::compression::CompressionPolicy;
 use sy::engine::controller::{ControllerError, PreviewOp, SyncPreview, SyncSummary};
 use sy::engine::delete_plan::{DeletePlanError, DeletePolicy};
 use sy::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
-use sy::engine::namespace::{NamespacePreflightError, NamespaceSemantics};
+use sy::engine::namespace::NamespacePreflightError;
 use sy::engine::planner::{ComparisonMode, ComparisonPolicy};
 use sy::engine::reconcile::EntryStream;
 use sy::engine::scan::{EntryMetadataRequest, ScanRequest};
@@ -297,10 +297,7 @@ pub(crate) fn compression_policy(config: &SyncConfig) -> Option<CompressionPolic
     }
 }
 
-pub(crate) fn comparison_policy(
-    config: &SyncConfig,
-    namespace_semantics: NamespaceSemantics,
-) -> ComparisonPolicy {
+pub(crate) fn comparison_policy(config: &SyncConfig) -> ComparisonPolicy {
     let mode = if config.comparison.checksum {
         ComparisonMode::Checksum
     } else if config.comparison.ignore_times {
@@ -317,7 +314,6 @@ pub(crate) fn comparison_policy(
         update_only: config.comparison.update_only,
         preserve_permissions: config.preserve.permissions,
         preserve_times: config.preserve.times,
-        namespace_semantics,
     }
 }
 
@@ -575,10 +571,7 @@ mod tests {
         config.preserve.permissions = true;
         config.preserve.times = true;
 
-        let policy = comparison_policy(
-            &config,
-            sy::engine::namespace::NamespaceSemantics::BYTE_EXACT,
-        );
+        let policy = comparison_policy(&config);
         assert_eq!(policy.mode, ComparisonMode::SizeOnly);
         assert!(policy.update_only);
         assert!(policy.preserve_permissions);
@@ -651,14 +644,7 @@ mod tests {
         let mut config = test_config();
         config.comparison.checksum = true;
 
-        assert_eq!(
-            comparison_policy(
-                &config,
-                sy::engine::namespace::NamespaceSemantics::BYTE_EXACT
-            )
-            .mode,
-            ComparisonMode::Checksum
-        );
+        assert_eq!(comparison_policy(&config).mode, ComparisonMode::Checksum);
     }
 
     #[test]
@@ -666,12 +652,6 @@ mod tests {
         let mut config = test_config();
         config.existing = true;
 
-        assert!(
-            comparison_policy(
-                &config,
-                sy::engine::namespace::NamespaceSemantics::BYTE_EXACT
-            )
-            .existing_only
-        );
+        assert!(comparison_policy(&config).existing_only);
     }
 }

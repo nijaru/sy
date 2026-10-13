@@ -186,6 +186,7 @@ pub struct RemotePullExecutor {
     backup: bool,
     backup_dir: Option<std::path::PathBuf>,
     backup_suffix: String,
+    backup_root: Option<crate::rooted_fs::backup::BackupRoot>,
     reporter: Option<Arc<crate::sync::output::SyncReporter>>,
     rate_limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
     /// -z/--compress: per-chunk zstd for fetches. The negotiated ZSTD
@@ -226,6 +227,7 @@ impl RemotePullExecutor {
             backup: false,
             backup_dir: None,
             backup_suffix: String::new(),
+            backup_root: None,
             reporter: None,
             rate_limiter: None,
             compression: None,
@@ -288,6 +290,11 @@ impl RemotePullExecutor {
             crate::rooted_fs::RootedFsError::RootChanged(self.destination_root.clone())
         })?;
         Ok(())
+    }
+
+    pub fn with_backup_root(mut self, root: Option<crate::rooted_fs::backup::BackupRoot>) -> Self {
+        self.backup_root = root;
+        self
     }
 
     pub fn with_backup(mut self, backup_dir: Option<std::path::PathBuf>) -> Self {
@@ -386,33 +393,38 @@ impl RemotePullExecutor {
     /// using the same authority as execution. All fallible discovery precedes
     /// producer admission. A pending root is empty and unqualified.
     pub async fn destination_entries(
-        &self,
+        &mut self,
         request: crate::engine::scan::ScanRequest,
     ) -> Result<(
-        crate::engine::namespace::NamespaceSemantics,
+        Arc<dyn crate::engine::namespace::NamespaceQualification>,
         crate::engine::reconcile::EntryStream,
     )> {
         #[cfg(unix)]
         {
-            let binding = self.binding().await?;
-            if self.metadata_authority.get().is_none()
-                && matches!(
-                    binding.root,
-                    crate::rooted_fs::operand::DestinationRoot::Pending(_)
-                )
-            {
+            let mut binding = self.binding().await?.clone();
+            let original = match self.metadata_authority.get() {
+                Some(rooted) => crate::rooted_fs::operand::DestinationRoot::Present(rooted.clone()),
+                None => binding.root.clone(),
+            };
+            let (bound, namespace) = original.with_namespace_qualification().await?;
+            binding.root = bound;
+            self.destination_binding = tokio::sync::OnceCell::new_with(Some(binding));
+            self.metadata_authority = tokio::sync::OnceCell::new();
+            if matches!(
+                self.binding().await?.root,
+                crate::rooted_fs::operand::DestinationRoot::Pending(_)
+            ) {
                 return Ok((
-                    crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+                    Arc::new(namespace),
                     crate::engine::reconcile::EntryStream::new(futures::stream::empty()),
                 ));
             }
             let rooted = self.metadata_authority().await?;
-            let namespace = rooted.namespace_semantics().await?;
-            let entries = match &binding.name {
+            let entries = match &self.binding().await?.name {
                 Some(name) => rooted.selected_entry_stream(name.clone(), request),
                 None => rooted.entry_stream(request),
             };
-            Ok((namespace, entries))
+            Ok((Arc::new(namespace), entries))
         }
         #[cfg(not(unix))]
         {
@@ -552,6 +564,7 @@ impl RemotePullExecutor {
                 let target = source.symlink_target.as_deref().ok_or_else(|| {
                     RemotePullError::MissingSymlinkTarget(source.path.as_path().to_path_buf())
                 })?;
+                self.backup_replacement(destination.as_ref()).await?;
                 let expected = destination_expectation(destination.as_ref())?;
                 let rooted = self.metadata_authority().await?.clone();
                 let relative = destination_path.clone();
@@ -793,9 +806,15 @@ impl RemotePullExecutor {
         let backup_abs = self.backup_destination_for(relative)?;
         let rooted = self.metadata_authority().await?.clone();
         let relative = relative.clone();
+        let backup_root = self.backup_root.clone();
         tokio::task::spawn_blocking(move || {
             rooted.verify_root_path_blocking()?;
-            rooted.backup_file_blocking(&relative, &backup_abs, expected)?;
+            rooted.backup_file_with_root_blocking(
+                &relative,
+                &backup_abs,
+                expected,
+                backup_root.as_ref(),
+            )?;
             crate::endpoint::local::verify_committed_root(&rooted, &backup_abs)?;
             Ok::<_, RemotePullError>(())
         })
@@ -853,24 +872,13 @@ impl RemotePullExecutor {
     /// --backup-dir), so callers can never write relative to the process
     /// working directory.
     fn backup_destination_for(&self, relative: &RelativePath) -> Result<PathBuf> {
-        let mut backup_name = relative
-            .as_path()
-            .file_name()
-            .ok_or_else(|| RemotePullError::InvalidBackupPath(relative.as_path().to_path_buf()))?
-            .to_os_string();
-        backup_name.push(&self.backup_suffix);
-        match &self.backup_dir {
-            Some(dir) => {
-                let mut backup = dir.join(relative.as_path());
-                backup.set_file_name(backup_name);
-                Ok(backup)
-            }
-            None => {
-                let mut backup = self.destination_root.join(relative.as_path());
-                backup.set_file_name(backup_name);
-                Ok(backup)
-            }
-        }
+        super::local_executor::backup_destination_path(
+            &self.destination_root,
+            relative,
+            self.backup_dir.as_deref(),
+            &self.backup_suffix,
+        )
+        .map_err(|_| RemotePullError::InvalidBackupPath(relative.as_path().to_path_buf()))
     }
 
     /// Delete one destination-only entry after the delete-threshold gate.

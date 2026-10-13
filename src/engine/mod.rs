@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod compression;
 pub mod controller;
 #[doc(hidden)]

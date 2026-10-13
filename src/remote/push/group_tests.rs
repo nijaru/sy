@@ -47,15 +47,16 @@ async fn plan(
         },
         ..Default::default()
     };
+    let namespace = remote.begin_namespace_qualification().await.unwrap();
     let mut plan = preflight_sync(
         root.entries(request),
         remote.scan(request).await.unwrap(),
         ComparisonPolicy {
             preserve_permissions: permissions,
-            namespace_semantics: remote.namespace_semantics(),
             ..Default::default()
         },
         None,
+        crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
         |_| true,
     )
     .await

@@ -745,7 +745,8 @@ async fn remote_selected_links_are_opaque_and_type_transitions_are_transactional
                 std::fs::remove_file(&destination).unwrap();
             }
             std::fs::write(&destination, b"old leaf").unwrap();
-            copy(&source_arg, &destination_arg, &[], &search_path).await;
+            copy(&source_arg, &destination_arg, &["--backup"], &search_path).await;
+            assert_eq!(std::fs::read(scope.join("renamed~")).unwrap(), b"old leaf");
             assert_eq!(
                 std::fs::read_link(&destination).unwrap(),
                 std::path::Path::new(target)
@@ -920,6 +921,21 @@ async fn copy(
     flags: &[&str],
     search_path: &OsStr,
 ) -> std::process::Output {
+    let output = run_copy(source, destination, flags, search_path).await;
+    assert!(
+        output.status.success(),
+        "remote copy failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+async fn run_copy(
+    source: &OsStr,
+    destination: &OsStr,
+    flags: &[&str],
+    search_path: &OsStr,
+) -> std::process::Output {
     let log = std::env::split_paths(search_path)
         .next()
         .unwrap()
@@ -938,11 +954,6 @@ async fn copy(
         .await
         .expect("remote CLI transfer stalled")
         .unwrap();
-    assert!(
-        output.status.success(),
-        "remote copy failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
     if source.as_bytes().starts_with(b"test-peer:")
         || destination.as_bytes().starts_with(b"test-peer:")
     {
@@ -953,4 +964,67 @@ async fn copy(
         );
     }
     output
+}
+
+#[tokio::test]
+async fn selected_remote_backup_rejects_unscanned_native_aliases_before_effects() {
+    let fixture = tempfile::tempdir().unwrap();
+    let search_path = ssh_path(fixture.path());
+    for pull in [false, true] {
+        for prefix in [false, true] {
+            let scope = fixture.path().join(format!("pull-{pull}-prefix-{prefix}"));
+            std::fs::create_dir(&scope).unwrap();
+            let source = scope.join("original");
+            let destination = scope.join("renamed");
+            std::os::unix::fs::symlink("opaque", &source).unwrap();
+            std::fs::write(&destination, b"old").unwrap();
+            std::fs::write(scope.join("unrelated"), b"untouched").unwrap();
+            let kept = if prefix {
+                std::fs::create_dir(scope.join("BACKUPS")).unwrap();
+                scope.join("BACKUPS/keep")
+            } else {
+                scope.join("RENAMED~")
+            };
+            std::fs::write(&kept, b"keep").unwrap();
+            let alias = if prefix {
+                scope.join("backups")
+            } else {
+                scope.join("renamed~")
+            };
+            if !alias.exists() {
+                eprintln!("observed prerequisite unavailable: native case aliases do not resolve");
+                return;
+            }
+            let (source_arg, destination_arg) = operands(&source, &destination, pull);
+            for preview in [false, true] {
+                let mut flags = vec!["--backup"];
+                if prefix {
+                    flags.push("--backup-dir=backups");
+                }
+                if preview {
+                    flags.push("--dry-run");
+                }
+                let output = run_copy(&source_arg, &destination_arg, &flags, &search_path).await;
+                assert!(
+                    !output.status.success(),
+                    "pull={pull} prefix={prefix} preview={preview}"
+                );
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("native spelling"),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+                assert_eq!(std::fs::read(&kept).unwrap(), b"keep");
+                assert_eq!(
+                    std::fs::read(scope.join("unrelated")).unwrap(),
+                    b"untouched"
+                );
+                assert_eq!(
+                    std::fs::read_link(&source).unwrap(),
+                    std::path::Path::new("opaque")
+                );
+            }
+        }
+    }
 }

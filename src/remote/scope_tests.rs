@@ -395,6 +395,28 @@ async fn selected_entry_reads_and_backup_retain_original_parent_fd_after_relocat
             )
             .await
             .unwrap();
+            if operation == Operation::Push {
+                let namespace = client
+                    .request_handle()
+                    .begin_namespace_qualification()
+                    .await
+                    .unwrap();
+                namespace
+                    .qualify(crate::engine::namespace::NamespaceParent::Root)
+                    .await
+                    .unwrap();
+                let backup = client
+                    .request_handle()
+                    .backup_namespace_qualification()
+                    .unwrap();
+                backup
+                    .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                        RelativePath::new("backups").unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                namespace.seal().await.unwrap();
+            }
             std::fs::rename(&root, &moved).unwrap();
             std::fs::create_dir(&root).unwrap();
             std::fs::write(root.join(&name), b"replacement root victim").unwrap();

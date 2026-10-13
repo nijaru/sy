@@ -861,6 +861,7 @@ fn is_stream_opening_kind(kind: FrameKind) -> bool {
             | FrameKind::AclRequest
             | FrameKind::BsdFlagsRequest
             | FrameKind::SourceIgnoreRequest
+            | FrameKind::NamespaceRequest
             | FrameKind::AcquireRoot
             | FrameKind::GroupOpen
     )

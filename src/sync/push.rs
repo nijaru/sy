@@ -163,6 +163,38 @@ async fn execute_bound(
     let scan_started = std::time::Instant::now();
     let source_request = source_scan_request(config, scan_options);
     let source_rooted = source_authority.rooted();
+    let backup_plan = if config.backup.is_some() {
+        let dir = match &config.backup_dir {
+            Some(dir) => {
+                if dir.is_absolute() {
+                    return Err(SyncError::Config(format!("--backup-dir must be relative to the remote destination root for v3 push, got {}", dir.display())));
+                }
+                Some(sy::engine::domain::RelativePath::new(dir.clone()).map_err(map_io)?)
+            }
+            None => None,
+        };
+        Some(RemoteBackupPlan {
+            suffix: config.suffix.clone(),
+            dir,
+        })
+    } else {
+        None
+    };
+    let backup_policy = backup_plan.as_ref().map(RemoteBackupPlan::policy);
+    let namespace = remote
+        .begin_namespace_qualification()
+        .await
+        .map_err(map_io)?;
+    let backup_namespace = remote.backup_namespace_qualification().map_err(map_io)?;
+    let mut preflight = sy::engine::namespace::NamespacePreflight::new(namespace.as_ref());
+    if let Some(policy) = &backup_policy {
+        preflight = preflight.with_backup(sy::engine::namespace::BackupNamespace {
+            policy,
+            qualification: backup_namespace.as_ref(),
+            external: None,
+            potential_hardlinks: config.preserve.hardlinks,
+        });
+    }
     let destination = match &scope {
         sy::engine::domain::SyncScope::Tree => remote.scan(destination_scan_request(config)).await,
         sy::engine::domain::SyncScope::SelectedLeaf { destination, .. } => {
@@ -197,14 +229,12 @@ async fn execute_bound(
             scan_options.respect_gitignore,
         ),
     ));
-    // Both exact-version peers report root semantics. Unknown filesystem
-    // semantics remain conservative, never an OS-derived aliasing guess.
-    let namespace_semantics = remote.namespace_semantics();
     let hash_remote = remote.clone();
     let mut plan = preflight_sync_scoped_with_content(
         sy::engine::reconcile::OrderedReconciler::with_scope(source, destination, scope),
-        comparison_policy(config, namespace_semantics),
+        comparison_policy(config),
         delete_policy(&config.delete),
+        preflight,
         move |entry| {
             entry_in_size_scope(entry, min_size, max_size)
                 && entry_selected_by_symlink_mode(entry, skip_symlinks)
@@ -273,30 +303,6 @@ async fn execute_bound(
         ..ResourceBudget::default()
     };
     let scheduler = Scheduler::new(budget).map_err(map_io)?;
-    // --backup on v3: all backup locations must stay beneath the pinned
-    // destination root. An absolute --backup-dir cannot be honored without
-    // breaking root confinement, so it is rejected instead of silently
-    // relocated.
-    let backup_plan = if config.backup.is_some() {
-        let dir = match &config.backup_dir {
-            Some(dir) => {
-                if dir.is_absolute() {
-                    return Err(SyncError::Config(format!(
-                        "--backup-dir must be relative to the remote destination root for v3 push, got {}",
-                        dir.display()
-                    )));
-                }
-                Some(sy::engine::domain::RelativePath::new(dir.clone()).map_err(map_io)?)
-            }
-            None => None,
-        };
-        Some(RemoteBackupPlan {
-            suffix: config.suffix.clone(),
-            dir,
-        })
-    } else {
-        None
-    };
     let executor = RemotePushExecutor::new(
         source_authority,
         remote,
@@ -342,6 +348,17 @@ mod tests {
                 fixture.destination.path(),
             )
             .await;
+            let namespace = client
+                .request_handle()
+                .begin_namespace_qualification()
+                .await
+                .unwrap();
+            namespace
+                .qualify(crate::engine::namespace::NamespaceParent::Root)
+                .await
+                .unwrap();
+            namespace.seal().await.unwrap();
+            drop(namespace);
             let inner = RemotePushExecutor::new(
                 fixture.source.clone(),
                 client.request_handle(),
@@ -670,30 +687,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let mutation = session.mutation_handler().unwrap();
-            // destination scan, backup copy (updated), two file transfers,
-            // delete-backup copy, file remove, directory remove. The source
-            // scan is local and produces no request.
-            for _ in 0..7 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected backup v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -720,7 +718,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_updated, 1);
         // sub/gone plus the sub directory (its removal request is issued;
@@ -819,25 +817,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            // Two passes of destination scan + file transfer each; xattr
-            // preservation rides the transfer stream into staging.
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected xattr v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -885,7 +869,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(
             xattr::get(&destination_file, name).unwrap(),
             Some(b"second".to_vec())
@@ -909,41 +893,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let xattr = session.xattr_handler().unwrap();
-            for _ in 0..7 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        session
-                            .mutation_handler()
-                            .unwrap()
-                            .serve(incoming)
-                            .await
-                            .unwrap();
-                    }
-                    IncomingRequest::Metadata(incoming) => {
-                        session
-                            .metadata_handler()
-                            .unwrap()
-                            .serve(incoming)
-                            .await
-                            .unwrap();
-                    }
-                    IncomingRequest::Xattr(incoming) => xattr.serve(incoming).await.unwrap(),
-                    _ => panic!("unexpected unchanged xattr push request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -991,7 +945,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(
             xattr::get(&destination_file, name).unwrap(),
             Some(b"source-file".to_vec())
@@ -1034,25 +988,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            // Two passes of destination scan + file transfer each; ACL
-            // preservation rides the transfer stream into staging.
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected acl v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1096,7 +1036,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         let cleared = exacl::to_string(&exacl::getfacl(&destination_file, None).unwrap()).unwrap();
         assert_eq!(cleared, second_text);
         assert_ne!(cleared, first_text);
@@ -1132,25 +1072,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            // Two passes: flags are finalized on the file transaction's
-            // held descriptor before its ACK, not by a fresh-path RPC.
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected bsd flags v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1193,7 +1119,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(std::fs::metadata(&destination_file).unwrap().st_flags(), 0);
     }
 
@@ -1215,23 +1141,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected compression v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1254,7 +1168,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 1);
         assert_eq!(
             std::fs::read(destination_root.path().join("compressible")).unwrap(),
@@ -1275,6 +1189,14 @@ mod tests {
             "remove",
         ))]));
         let delete_filter = filter.clone();
+        let fixture = tempfile::tempdir().unwrap();
+        let rooted = sy::rooted_fs::RootedFs::open(fixture.path().into())
+            .await
+            .unwrap();
+        let (_bound, namespace) = sy::rooted_fs::operand::DestinationRoot::Present(rooted)
+            .with_namespace_qualification()
+            .await
+            .unwrap();
 
         let result = preflight_sync(
             filtered_source_stream(source, filter),
@@ -1284,6 +1206,7 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&namespace),
             move |entry| delete_filter.should_include(entry.path.as_path(), entry.is_directory()),
         )
         .await;
@@ -1313,10 +1236,15 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            match session.next_request().await.unwrap().unwrap() {
-                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                _ => panic!("absolute delete limit emitted a mutation-capable request before preflight rejection"),
+            let mut tasks = tokio::task::JoinSet::new();
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move { scan.serve(incoming).await.map_err(|error| error.to_string()) });
+                    }
+                    _ => panic!("absolute delete limit emitted a mutation-capable request before preflight rejection"),
+                }
             }
         });
 
@@ -1344,6 +1272,7 @@ mod tests {
         .await
         .unwrap_err();
 
+        drop(session);
         server.await.unwrap();
         assert!(matches!(
             error,
@@ -1372,15 +1301,26 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            let mutation = session.mutation_handler().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
             let mut mutations = 0_usize;
-            for _ in 0..3 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
                     IncomingRequest::Mutation(incoming) => {
                         mutations += 1;
-                        mutation.serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _ => panic!("unexpected absolute delete limit request"),
                 }
@@ -1412,6 +1352,7 @@ mod tests {
         .await
         .unwrap();
 
+        drop(session);
         assert_eq!(server.await.unwrap(), 2);
         assert_eq!(stats.files_deleted, 2);
         assert!(!destination_root.path().join("first").exists());
@@ -1445,19 +1386,34 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let mutation = session.mutation_handler().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
             let mut mutations = 0_usize;
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
                     IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
+                        session
+                            .file_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Mutation(incoming) => {
                         mutations += 1;
-                        mutation.serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _ => panic!("unexpected gitignore-scoped v3 adapter request kind"),
                 }
@@ -1495,6 +1451,7 @@ mod tests {
         .unwrap();
 
         // One deletion (remove-me.txt) plus creates (.gitignore, keep.txt).
+        drop(session);
         assert_eq!(server.await.unwrap(), 1);
         assert_eq!(stats.files_deleted, 1);
         assert!(
@@ -1553,19 +1510,34 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let mutation = session.mutation_handler().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
             let mut mutations = 0_usize;
-            for _ in 0..3 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
                     IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
+                        session
+                            .file_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Mutation(incoming) => {
                         mutations += 1;
-                        mutation.serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     _ => panic!("unexpected gitignore limit v3 adapter request"),
                 }
@@ -1605,7 +1577,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Requests: scan, create .gitignore, delete c.txt.
+        // Only delete c.txt is a mutation request; file population is separate.
+        drop(session);
         assert_eq!(server.await.unwrap(), 1);
         assert_eq!(stats.files_deleted, 1);
         assert!(!destination_root.path().join("c.txt").exists());
@@ -1626,23 +1599,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let mutation = session.mutation_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected filtered v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1669,7 +1630,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_deleted, 1);
         assert!(excluded.join("keep").exists());
         assert!(!destination_root.path().join("remove").exists());
@@ -1688,23 +1649,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let mutation = session.mutation_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected dirs-only v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1735,7 +1684,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_deleted, 1);
         assert!(protected.join("keep").exists());
         assert!(!destination_root.path().join("remove").exists());
@@ -1754,23 +1703,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let mutation = session.mutation_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected exclude-vcs v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1800,7 +1737,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_deleted, 1);
         assert!(git_dir.join("config").exists());
         assert!(!destination_root.path().join("remove").exists());
@@ -1819,27 +1756,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            let mutation = session.mutation_handler().unwrap();
-            for _ in 0..3 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    IncomingRequest::Mutation(incoming) => {
-                        mutation.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected size-filtered v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1866,8 +1787,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
-        eprintln!("STATS: {stats:?}");
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(
@@ -1893,23 +1813,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected existing-only v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -1932,7 +1840,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_created, 0);
         assert_eq!(stats.files_updated, 1);
         assert_eq!(stats.files_skipped, 1);
@@ -1961,10 +1869,19 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            match session.next_request().await.unwrap().unwrap() {
-                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                _ => panic!("dry-run emitted a mutation-capable v3 request"),
+            let mut tasks = tokio::task::JoinSet::new();
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    _ => panic!("dry-run emitted a mutation-capable v3 request"),
+                }
             }
         });
 
@@ -1993,6 +1910,7 @@ mod tests {
         .await
         .unwrap();
 
+        drop(session);
         server.await.unwrap();
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_updated, 1);
@@ -2025,16 +1943,13 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            let hash = session.hash_handler().unwrap();
-            let file = session.file_handler().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
             let mut hashes = 0;
             let mut files = 0;
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
                     IncomingRequest::Scan(incoming) => {
-                        let scan = scan.clone();
+                        let scan = session.scan_handler();
                         tasks.spawn(async move {
                             scan.serve(incoming)
                                 .await
@@ -2043,7 +1958,7 @@ mod tests {
                     }
                     IncomingRequest::Hash(incoming) => {
                         hashes += 1;
-                        let hash = hash.clone();
+                        let hash = session.hash_handler().unwrap();
                         tasks.spawn(async move {
                             hash.serve(incoming)
                                 .await
@@ -2052,7 +1967,7 @@ mod tests {
                     }
                     IncomingRequest::File(incoming) => {
                         files += 1;
-                        let file = file.clone();
+                        let file = session.file_handler().unwrap();
                         tasks.spawn(async move {
                             file.serve(incoming)
                                 .await
@@ -2090,6 +2005,7 @@ mod tests {
         .await
         .unwrap();
 
+        drop(session);
         assert_eq!(server.await.unwrap(), (2, 1));
         assert_eq!(stats.files_updated, 1);
         assert_eq!(stats.files_skipped, 1);
@@ -2119,13 +2035,11 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            let hash = session.hash_handler().unwrap();
             let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
                     IncomingRequest::Scan(incoming) => {
-                        let scan = scan.clone();
+                        let scan = session.scan_handler();
                         tasks.spawn(async move {
                             scan.serve(incoming)
                                 .await
@@ -2133,7 +2047,7 @@ mod tests {
                         });
                     }
                     IncomingRequest::Hash(incoming) => {
-                        let hash = hash.clone();
+                        let hash = session.hash_handler().unwrap();
                         tasks.spawn(async move {
                             hash.serve(incoming)
                                 .await
@@ -2170,6 +2084,7 @@ mod tests {
         .await
         .unwrap();
 
+        drop(session);
         server.await.unwrap();
         assert_eq!(stats.files_updated, 1);
         assert_eq!(stats.bytes_would_change, 4);
@@ -2189,23 +2104,11 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let (server_reader, server_writer) = tokio::io::split(server_io);
-        let server = tokio::spawn(async move {
-            let mut session =
-                ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
-                    .await
-                    .unwrap();
-            let scan = session.scan_handler();
-            let file = session.file_handler().unwrap();
-            for _ in 0..2 {
-                match session.next_request().await.unwrap().unwrap() {
-                    IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                    IncomingRequest::File(incoming) => {
-                        file.serve(incoming).await.unwrap();
-                    }
-                    _ => panic!("unexpected v3 adapter request"),
-                }
-            }
-        });
+        let server = tokio::spawn(crate::remote::serve::serve_transport(
+            server_reader,
+            server_writer,
+            RouterConfig::default(),
+        ));
 
         let session = ClientRemoteSession::connect(
             client_reader,
@@ -2227,7 +2130,7 @@ mod tests {
         .await
         .unwrap();
 
-        server.await.unwrap();
+        super::super::hardlink_tests::finish_session(session, server).await;
         assert_eq!(stats.files_scanned, 1);
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_updated, 0);
@@ -2256,11 +2159,19 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan = session.scan_handler();
-            // Diff-mode dry-run performs the scan preflight only.
-            match session.next_request().await.unwrap().unwrap() {
-                IncomingRequest::Scan(incoming) => scan.serve(incoming).await.unwrap(),
-                _ => panic!("diff-mode dry-run must not emit mutation requests"),
+            let mut tasks = tokio::task::JoinSet::new();
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
+                    IncomingRequest::Scan(incoming) => {
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
+                    }
+                    _ => panic!("diff-mode dry-run must not emit mutation requests"),
+                }
             }
         });
 
@@ -2295,6 +2206,7 @@ mod tests {
         .await
         .unwrap();
 
+        drop(session);
         server.await.unwrap();
         assert_eq!(stats.files_created, 1);
         assert_eq!(stats.files_updated, 1);

@@ -6,6 +6,8 @@ pub mod fetch;
 pub(crate) mod group;
 pub mod hash;
 pub mod local_executor;
+mod namespace;
+pub use namespace::NamespaceRpcError;
 pub mod operand;
 pub mod path;
 pub mod preservation;
@@ -233,14 +235,7 @@ where
     let capabilities = negotiated_capabilities(client.capabilities);
     // Native stat timestamp fields do not certify filesystem timestamp precision.
     let modtime_precision_ns = 0;
-    // Root-scoped name semantics: the client's alias preflight must follow the
-    // opened filesystem, not the peer OS name.
-    let namespace_semantics = match &rooted {
-        SessionRoot::Present(rooted) => rooted.namespace_semantics().await?,
-        SessionRoot::Pending(_) => crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
-    }
-    .into();
-    let mut ready = SessionReady::new(capabilities, modtime_precision_ns, namespace_semantics);
+    let mut ready = SessionReady::new(capabilities, modtime_precision_ns);
     ready.resolved = resolved;
     ready.source_shape = source_shape;
     ready.pending = matches!(rooted, SessionRoot::Pending(_));
@@ -532,16 +527,6 @@ mod tests {
         let opened = server.await.unwrap().unwrap();
 
         assert_eq!(client.server.version, SUPPORTED_VERSIONS.max);
-        // The client receives the probed root semantics, not an OS guess.
-        assert_eq!(
-            crate::engine::namespace::NamespaceSemantics::from(client.ready.namespace_semantics),
-            crate::rooted_fs::RootedFs::open(root.path().to_path_buf())
-                .await
-                .unwrap()
-                .namespace_semantics()
-                .await
-                .unwrap()
-        );
         assert_eq!(opened.operation, Operation::Push);
         assert_eq!(opened.root, root.path());
         let SessionRoot::Present(rooted) = opened.rooted else {

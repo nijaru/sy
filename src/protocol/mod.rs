@@ -14,6 +14,7 @@ mod handshake;
 mod hash;
 mod metadata;
 mod mutation;
+mod namespace;
 mod observation;
 mod path;
 mod scan;
@@ -44,6 +45,7 @@ pub use handshake::{
 pub use hash::{WireHashRequest, WireHashResult, HASH_DIGEST_LEN, HASH_IDENTITY_LEN};
 pub use metadata::{WireMetadata, WireMetadataTarget};
 pub use mutation::{WireMutation, WireMutationKind};
+pub use namespace::{WireNamespaceParent, WireNamespaceRequest, WireNamespaceResult};
 pub use observation::{WireObservationRead, OBSERVATION_READ};
 pub use path::{
     RelativeWirePath, WirePath, MAX_WIRE_COMPONENTS, MAX_WIRE_COMPONENT_BYTES, MAX_WIRE_PATH_BYTES,

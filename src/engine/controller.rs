@@ -4,6 +4,7 @@ use crate::engine::domain::{Entry, EntryKind, RelativePath, SyncOp};
 use crate::engine::finalize_journal::{
     DirectoryTarget, FinalizeJournal, FinalizeJournalError, FinalizeJournalReader, FinalizeMetadata,
 };
+use crate::engine::namespace::NamespaceQualification;
 use crate::engine::plan_journal::{PlanJournal, PlanJournalError, PlanJournalReader};
 use crate::engine::planner::{
     finish_content_comparison, plan_entry, ComparisonPolicy, PlanDecision,
@@ -268,11 +269,14 @@ impl std::fmt::Debug for SyncPlan {
 /// `delete_in_scope` is evaluated only when deletion is enabled. Keeping scope
 /// policy at this boundary lets excluded destination subtrees protect candidate
 /// ancestors while the engine retains ownership of exact counting and replay.
+/// `qualification` owns the original containing-directory observations for
+/// namespace rules; it is sealed only after collision proof and scan drain.
 pub async fn preflight_sync(
     source: EntryStream,
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    namespace: crate::engine::namespace::NamespacePreflight<'_>,
     delete_in_scope: impl FnMut(&Entry) -> bool,
 ) -> Result<SyncPlan> {
     preflight_sync_scoped(
@@ -280,6 +284,7 @@ pub async fn preflight_sync(
         destination,
         policy,
         delete_policy,
+        namespace,
         |_| true,
         delete_in_scope,
     )
@@ -299,6 +304,7 @@ pub async fn preflight_sync_scoped(
     destination: EntryStream,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    namespace: crate::engine::namespace::NamespacePreflight<'_>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: impl FnMut(&Entry) -> bool,
 ) -> Result<SyncPlan> {
@@ -306,6 +312,7 @@ pub async fn preflight_sync_scoped(
         OrderedReconciler::new(source, destination),
         policy,
         delete_policy,
+        namespace,
         plan_in_scope,
         |entry| futures::future::ready(Ok(delete_in_scope(entry))),
         |source, _destination| async move {
@@ -329,6 +336,7 @@ pub async fn preflight_sync_scoped_with_content<F, Fut, D, DFut>(
     mut reconciler: OrderedReconciler,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    namespace: crate::engine::namespace::NamespacePreflight<'_>,
     plan_in_scope: impl FnMut(&Entry) -> bool,
     delete_in_scope: D,
     compare_content: F,
@@ -343,6 +351,7 @@ where
         &mut reconciler,
         policy,
         delete_policy,
+        namespace.destination,
         plan_in_scope,
         delete_in_scope,
         compare_content,
@@ -356,18 +365,26 @@ where
         }),
         (Err(operation), _) => Err(operation),
         (_, Err(drain)) => Err(drain.into()),
-        (Ok(plan), Ok(())) => Ok(plan),
+        (Ok((plan, detector)), Ok(())) => {
+            backup_preflight::complete(plan, detector, &namespace).await
+        }
     }
 }
+
+mod backup_preflight;
 
 async fn collect_preflight_plan<F, Fut, D, DFut>(
     reconciler: &mut OrderedReconciler,
     policy: ComparisonPolicy,
     delete_policy: Option<DeletePolicy>,
+    qualification: &dyn NamespaceQualification,
     mut plan_in_scope: impl FnMut(&Entry) -> bool,
     mut delete_in_scope: D,
     mut compare_content: F,
-) -> Result<SyncPlan>
+) -> Result<(
+    SyncPlan,
+    crate::engine::namespace::NamespaceCollisionDetector,
+)>
 where
     F: FnMut(Entry, Entry) -> Fut,
     Fut: Future<Output = Result<bool>>,
@@ -384,8 +401,7 @@ where
         Some(policy) => Some(DeleteTracker::new(policy).await?),
         None => None,
     };
-    let mut collision_detector =
-        crate::engine::namespace::NamespaceCollisionDetector::new(policy.namespace_semantics);
+    let mut collision_detector = crate::engine::namespace::NamespaceCollisionDetector::new();
     let mut operations = 0_u64;
     let mut active_replaced_dir: Option<(RelativePath, u64)> = None;
     let mut unsupported_nonempty = None;
@@ -435,7 +451,9 @@ where
                             .observe_replaced_directory_descendant(&destination)
                             .await?;
                     }
-                    collision_detector.record(&destination.path).await?;
+                    collision_detector
+                        .record(&destination.path, qualification)
+                        .await?;
                     continue;
                 }
                 ReconcileItem::SourceOnly { source, .. }
@@ -460,8 +478,17 @@ where
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.record(&destination_path).await?;
+                collision_detector
+                    .record(&destination_path, qualification)
+                    .await?;
                 if !policy.existing_only {
+                    if source.is_directory() {
+                        qualification
+                            .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                                destination_path.clone(),
+                            ))
+                            .await?;
+                    }
                     append_directory_finalize(&mut finalize, &source, None, policy).await?;
                 }
                 plan_entry(source, None, destination_path, policy)
@@ -474,10 +501,21 @@ where
                     let in_scope = delete_in_scope(&destination).await?;
                     delete.observe_matched(&destination, in_scope).await?;
                 }
+                // Kept destination names still constrain selected siblings even
+                // when their matched SOURCE is outside semantic work scope.
+                collision_detector
+                    .record(&destination.path, qualification)
+                    .await?;
                 if !plan_in_scope(&source) {
                     continue;
                 }
-                collision_detector.record(&destination.path).await?;
+                if source.is_directory() && destination.is_directory() {
+                    qualification
+                        .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                            destination.path.clone(),
+                        ))
+                        .await?;
+                }
                 append_directory_finalize(&mut finalize, &source, Some(&destination), policy)
                     .await?;
                 let destination_path = destination.path.clone();
@@ -490,7 +528,9 @@ where
                         .observe_destination_only(&destination, in_scope)
                         .await?;
                 }
-                collision_detector.record(&destination.path).await?;
+                collision_detector
+                    .record(&destination.path, qualification)
+                    .await?;
                 continue;
             }
         };
@@ -557,7 +597,6 @@ where
 
     // Alias proof completes with the rest of preflight: no mutation may run
     // before both the collision check and the delete threshold have passed.
-    collision_detector.finish().await?;
     let delete = match delete {
         Some(delete) => Some(delete.finish().await?),
         None => None,
@@ -571,14 +610,17 @@ where
             discarded_entries,
         });
     }
-    Ok(SyncPlan {
-        reader: journal.seal().await?,
-        hardlinks: HardlinkPreflight::NotRequested,
-        finalize: finalize.seal().await?,
-        operations,
-        delete,
-        execution_policy,
-    })
+    Ok((
+        SyncPlan {
+            reader: journal.seal().await?,
+            hardlinks: HardlinkPreflight::NotRequested,
+            finalize: finalize.seal().await?,
+            operations,
+            delete,
+            execution_policy,
+        },
+        collision_detector,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1473,6 +1515,16 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
         .ok_or(ControllerError::CounterOverflow(counter))
 }
 
+#[cfg(test)]
+#[path = "controller/namespace_tests.rs"]
+mod namespace_tests;
+
+#[cfg(test)]
+const TEST_NAMESPACE: crate::engine::namespace::FixedNamespaceQualification =
+    crate::engine::namespace::FixedNamespaceQualification(
+        crate::engine::namespace::NamespaceSemantics::UNSPECIFIED,
+    );
+
 #[cfg(all(test, unix))]
 #[path = "controller/lifecycle_tests.rs"]
 mod lifecycle_tests;
@@ -1488,7 +1540,9 @@ mod tests {
     use super::*;
     use crate::engine::delete_plan::DeleteLimit;
     use crate::engine::domain::{Entry, EntryKind, SyncOp, Timestamp};
-    use crate::engine::namespace::NamespacePreflightError;
+    use crate::engine::namespace::{
+        FixedNamespaceQualification, NamespacePreflightError, NamespaceSemantics,
+    };
     use crate::engine::reconcile::BoxError;
     use futures::stream;
     use std::path::PathBuf;
@@ -1552,6 +1606,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         ));
         let ((source_closed, source_release), (dest_closed, dest_release)) =
@@ -1620,6 +1675,7 @@ mod tests {
                 entries(vec![old_a, old_b]),
                 ComparisonPolicy::default(),
                 None,
+                crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
                 |_| true,
             )
             .await
@@ -1767,6 +1823,7 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -1810,6 +1867,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -1839,6 +1897,7 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| false,
             |_| true,
         )
@@ -1873,6 +1932,7 @@ mod tests {
                 ..ComparisonPolicy::default()
             },
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -1909,6 +1969,7 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -1934,7 +1995,7 @@ mod tests {
         };
 
         assert!(matches!(
-            preflight_sync(source, destination, policy, None, |_| true).await,
+            preflight_sync(source, destination, policy, None, crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE), |_| true).await,
             Err(ControllerError::UnsupportedContentComparison(value))
                 if value == path("a")
         ));
@@ -1953,6 +2014,7 @@ mod tests {
             ),
             policy,
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
             |_| futures::future::ready(Ok(true)),
             |_source, _destination| async { Ok(true) },
@@ -1971,6 +2033,7 @@ mod tests {
             ),
             policy,
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
             |_| futures::future::ready(Ok(true)),
             |_source, _destination| async { Ok(false) },
@@ -1999,6 +2062,7 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2033,6 +2097,7 @@ mod tests {
                     limit: DeleteLimit::Percentage(49),
                     force: false,
                 }),
+                crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
                 |_| true,
             )
             .await,
@@ -2060,6 +2125,7 @@ mod tests {
                 ..ComparisonPolicy::default()
             },
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2128,29 +2194,46 @@ mod tests {
                 ServerRemoteSession::accept(server_reader, server_writer, RouterConfig::default())
                     .await
                     .unwrap();
-            let scan_handler = session.scan_handler();
-            let file_handler = session.file_handler().unwrap();
-            let mutation_handler = session.mutation_handler().unwrap();
-            let metadata_handler = session.metadata_handler().unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
             let mut order = Vec::new();
 
-            for _ in 0..4 {
-                match session.next_request().await.unwrap().unwrap() {
+            while let Some(request) = session.next_fixture_request(&mut tasks).await {
+                match request {
                     IncomingRequest::Scan(incoming) => {
                         order.push("scan");
-                        scan_handler.serve(incoming).await.unwrap();
+                        let scan = session.scan_handler();
+                        tasks.spawn(async move {
+                            scan.serve(incoming)
+                                .await
+                                .map_err(|error| error.to_string())
+                        });
                     }
                     IncomingRequest::File(incoming) => {
                         order.push("file");
-                        file_handler.serve(incoming).await.unwrap();
+                        session
+                            .file_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Mutation(incoming) => {
                         order.push("mutation");
-                        mutation_handler.serve(incoming).await.unwrap();
+                        session
+                            .mutation_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::Metadata(incoming) => {
                         order.push("metadata");
-                        metadata_handler.serve(incoming).await.unwrap();
+                        session
+                            .metadata_handler()
+                            .unwrap()
+                            .serve(incoming)
+                            .await
+                            .unwrap();
                     }
                     IncomingRequest::SourceIgnore(_) => panic!("unexpected source ignore request"),
                     IncomingRequest::Hash(_) => panic!("unexpected hash request"),
@@ -2161,6 +2244,9 @@ mod tests {
                     IncomingRequest::Acl(_) => panic!("unexpected acl request"),
                     IncomingRequest::BsdFlags(_) => panic!("unexpected bsd flags request"),
                     IncomingRequest::AcquireRoot(_) => panic!("unexpected acquisition request"),
+                    IncomingRequest::NamespaceBegin(_) | IncomingRequest::Namespace(_) => {
+                        panic!("unexpected namespace request")
+                    }
                 }
             }
             order
@@ -2188,6 +2274,7 @@ mod tests {
                 hardlink_group: false,
             },
         };
+        let namespace = handle.begin_namespace_qualification().await.unwrap();
         let destination = handle.scan(scan_request).await.unwrap();
         let authority =
             crate::endpoint::source_root::SourceRoot::open(source_root.path().to_path_buf())
@@ -2207,10 +2294,12 @@ mod tests {
                 limit: DeleteLimit::Percentage(100),
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(namespace.as_ref()),
             |_| true,
         )
         .await
         .unwrap();
+        drop(namespace);
 
         let executor = RemotePushExecutor::new(
             authority,
@@ -2220,6 +2309,9 @@ mod tests {
         );
         let controller = SyncController::new(executor, NonZeroUsize::new(4).unwrap());
         let summary = controller.execute(plan).await.unwrap();
+        controller.close().await.unwrap();
+        drop(controller);
+        drop(session);
         let order = server.await.unwrap();
 
         assert_eq!(order, vec!["scan", "file", "mutation", "metadata"]);
@@ -2252,15 +2344,19 @@ mod tests {
             file("dir/file.txt", 10, 1),
         ]);
         let destination = entries(vec![]);
-        let policy = ComparisonPolicy {
-            namespace_semantics:
-                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
-            ..ComparisonPolicy::default()
-        };
+        let qualification =
+            FixedNamespaceQualification(NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED);
 
-        let err = preflight_sync(source, destination, policy, None, |_| true)
-            .await
-            .unwrap_err();
+        let err = preflight_sync(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            crate::engine::namespace::NamespacePreflight::new(&qualification),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
 
         match err {
             ControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
@@ -2275,15 +2371,19 @@ mod tests {
     async fn preflight_detects_source_destination_case_collision_on_case_insensitive_target() {
         let source = entries(vec![file("foo.txt", 10, 1)]);
         let destination = entries(vec![file("FOO.txt", 10, 1)]);
-        let policy = ComparisonPolicy {
-            namespace_semantics:
-                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
-            ..ComparisonPolicy::default()
-        };
+        let qualification =
+            FixedNamespaceQualification(NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED);
 
-        let err = preflight_sync(source, destination, policy, None, |_| true)
-            .await
-            .unwrap_err();
+        let err = preflight_sync(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            crate::engine::namespace::NamespacePreflight::new(&qualification),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
 
         match err {
             ControllerError::Namespace(NamespacePreflightError::Collision(collision)) => {
@@ -2300,15 +2400,19 @@ mod tests {
         let nfd = "cafe\u{301}.txt";
         let source = entries(vec![file(nfd, 10, 1), file(nfc, 10, 1)]);
         let destination = entries(vec![]);
-        let policy = ComparisonPolicy {
-            namespace_semantics:
-                crate::engine::namespace::NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED,
-            ..ComparisonPolicy::default()
-        };
+        let qualification =
+            FixedNamespaceQualification(NamespaceSemantics::CASE_AND_NORMALIZATION_FOLDED);
 
-        let err = preflight_sync(source, destination, policy, None, |_| true)
-            .await
-            .unwrap_err();
+        let err = preflight_sync(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            crate::engine::namespace::NamespacePreflight::new(&qualification),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             err,
@@ -2320,14 +2424,18 @@ mod tests {
     async fn preflight_permits_case_differences_on_case_sensitive_target() {
         let source = entries(vec![file("FILE.txt", 10, 1), file("file.txt", 10, 1)]);
         let destination = entries(vec![]);
-        let policy = ComparisonPolicy {
-            namespace_semantics: crate::engine::namespace::NamespaceSemantics::BYTE_EXACT,
-            ..ComparisonPolicy::default()
-        };
+        let qualification = FixedNamespaceQualification(NamespaceSemantics::BYTE_EXACT);
 
-        let plan = preflight_sync(source, destination, policy, None, |_| true)
-            .await
-            .unwrap();
+        let plan = preflight_sync(
+            source,
+            destination,
+            ComparisonPolicy::default(),
+            None,
+            crate::engine::namespace::NamespacePreflight::new(&qualification),
+            |_| true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(plan.operations, 2);
     }
@@ -2341,6 +2449,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2360,6 +2469,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2388,6 +2498,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2413,6 +2524,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(policy),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2443,6 +2555,7 @@ mod tests {
             destination,
             ComparisonPolicy::default(),
             Some(policy),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
         )
         .await
@@ -2471,6 +2584,7 @@ mod tests {
                 limit: crate::engine::delete_plan::DeleteLimit::Unlimited,
                 force: false,
             }),
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
             |_| true,
             |dest| dest.path.as_path() != std::path::Path::new("swap/protected"),
         )
@@ -2494,9 +2608,16 @@ mod tests {
         let destination = entries(vec![]);
         let policy = ComparisonPolicy::default();
 
-        let err = preflight_sync(source, destination, policy, None, |_| true)
-            .await
-            .unwrap_err();
+        let err = preflight_sync(
+            source,
+            destination,
+            policy,
+            None,
+            crate::engine::namespace::NamespacePreflight::new(&TEST_NAMESPACE),
+            |_| true,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             err,

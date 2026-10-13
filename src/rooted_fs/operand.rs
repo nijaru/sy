@@ -47,6 +47,37 @@ impl PendingRoot {
 }
 
 impl DestinationRoot {
+    #[cfg(unix)]
+    pub(super) fn inherit_backup_ownership(&mut self, main: &RootedFs) {
+        let rooted = match self {
+            Self::Present(rooted) => rooted,
+            Self::Pending(pending) => &mut pending.ancestor,
+        };
+        rooted.mutation_admission = main.mutation_admission.clone();
+        rooted.run_admission = main.run_admission.clone();
+        rooted.retirement = Arc::clone(&main.retirement);
+        #[cfg(test)]
+        {
+            rooted.mutation_pause = Arc::clone(&main.mutation_pause);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn acquire_backup_blocking(
+        self,
+        local: bool,
+        path: &RelativePath,
+    ) -> Result<RootedFs> {
+        match self {
+            Self::Present(rooted) => Ok(rooted),
+            Self::Pending(pending) => {
+                let prefix: PathBuf = pending.missing.iter().collect();
+                let address = prefix.join(path.as_path());
+                pending.acquire_checked(local, Some(&address))
+            }
+        }
+    }
+
     pub(crate) fn bind_run_mutations(&mut self, admission: Arc<PublicationAdmission>) {
         match self {
             Self::Present(rooted) => rooted.bind_run_mutations(admission),
@@ -59,6 +90,35 @@ impl DestinationRoot {
             Self::Present(rooted) => rooted.bind_session_mutations(admission, read_only),
             Self::Pending(pending) => pending.bind_mutations(admission, read_only),
         }
+    }
+
+    pub fn require_namespace_qualification(&mut self) {
+        match self {
+            Self::Present(rooted) => rooted.require_namespace_qualification(),
+            Self::Pending(pending) => pending.ancestor.require_namespace_qualification(),
+        }
+    }
+
+    /// Return the original held authority newly bound to this run's proof.
+    #[cfg(unix)]
+    pub async fn with_namespace_qualification(self) -> Result<(Self, DestinationNamespace)> {
+        match self {
+            Self::Present(rooted) => {
+                let (rooted, proof) = rooted.with_namespace_qualification().await?;
+                Ok((Self::Present(rooted), proof))
+            }
+            Self::Pending(mut pending) => {
+                let prefix: PathBuf = pending.missing.iter().collect();
+                let (ancestor, proof) = pending.ancestor.with_namespace_prefix(prefix).await?;
+                pending.ancestor = ancestor;
+                Ok((Self::Pending(pending), proof))
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub async fn with_namespace_qualification(self) -> Result<(Self, DestinationNamespace)> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     pub fn path(&self) -> &Path {
@@ -377,6 +437,10 @@ fn destination_root_blocking(path: PathBuf) -> Result<DestinationRoot> {
 #[cfg(unix)]
 impl PendingRoot {
     fn acquire_blocking(self, local: bool) -> Result<RootedFs> {
+        self.acquire_checked(local, None)
+    }
+
+    fn acquire_checked(self, local: bool, backup_address: Option<&Path>) -> Result<RootedFs> {
         self.ancestor.require_writable()?;
         let mut fd = self.ancestor.root_fd.try_clone()?;
         let mut prefix = PathBuf::new();
@@ -390,7 +454,16 @@ impl PendingRoot {
                 return Err(RootedFsError::DestinationChanged(self.path));
             }
             let name_c = component_cstring(name)?;
+            self.ancestor
+                .namespace_predicts_absent(&prefix, fd.as_raw_fd())?;
+            if let Some(address) = backup_address {
+                self.ancestor.verify_backup_address_blocking(address)?;
+            }
             let _permit = self.ancestor.admit_mutation_blocking()?;
+            self.ancestor.verify_parent_binding_blocking(&prefix, &fd)?;
+            if let Some(address) = backup_address {
+                self.ancestor.verify_backup_address_blocking(address)?;
+            }
             // SAFETY: fd is held, name_c is one live NUL-terminated component.
             if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), 0o777) } != 0 {
                 return Err(std::io::Error::last_os_error().into());
@@ -405,6 +478,11 @@ impl PendingRoot {
             {
                 return Err(RootedFsError::DestinationChanged(self.path));
             }
+            self.ancestor.advance_namespace_directory(
+                &prefix,
+                fd.as_raw_fd(),
+                child.as_raw_fd(),
+            )?;
             fd = child;
         }
         if local {
@@ -421,6 +499,14 @@ impl PendingRoot {
         let mut rooted = RootedFs::from_operand_fd(self.path, fd);
         rooted.mutation_admission = self.ancestor.mutation_admission;
         rooted.run_admission = self.ancestor.run_admission;
+        rooted.retirement = self.ancestor.retirement;
+        #[cfg(test)]
+        {
+            rooted.mutation_pause = self.ancestor.mutation_pause;
+        }
+        rooted.destination_namespace = self.ancestor.destination_namespace;
+        rooted.namespace_qualification_required = self.ancestor.namespace_qualification_required;
+        rooted.namespace_prefix = self.ancestor.namespace_prefix.join(prefix);
         Ok(rooted)
     }
 }
@@ -499,15 +585,19 @@ mod tests {
         )
         .await
         .unwrap();
+        let (root, proof) = binding.root.with_namespace_qualification().await.unwrap();
+        use crate::engine::namespace::{NamespaceParent, NamespaceQualification};
+        proof.qualify(NamespaceParent::Root).await.unwrap();
+        proof.seal().await.unwrap();
         std::fs::rename(&ancestor, &moved).unwrap();
         std::fs::create_dir(&ancestor).unwrap();
         assert!(matches!(
-            binding.root.clone().acquire_local().await,
+            root.clone().acquire_local().await,
             Err(RootedFsError::RootChanged(_))
         ));
         assert!(!ancestor.join("new").exists());
         assert!(!moved.join("new").exists());
-        let root = binding.root.acquire().await.unwrap();
+        let root = root.acquire().await.unwrap();
         assert!(moved.join("new/nested").is_dir());
         assert!(!ancestor.join("new").exists());
         assert!(matches!(

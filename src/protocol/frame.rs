@@ -77,6 +77,9 @@ pub enum FrameKind {
     DeltaFetchRequest = 41,
     /// Server admission for delta PULL signature upload; empty flags/payload.
     DeltaFetchReady = 42,
+    /// Read-only per-parent destination qualification, including pending roots.
+    NamespaceRequest = 43,
+    NamespaceResult = 44,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -125,6 +128,8 @@ impl TryFrom<u8> for FrameKind {
             40 => Ok(Self::SourceIgnoreResult),
             41 => Ok(Self::DeltaFetchRequest),
             42 => Ok(Self::DeltaFetchReady),
+            43 => Ok(Self::NamespaceRequest),
+            44 => Ok(Self::NamespaceResult),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }
