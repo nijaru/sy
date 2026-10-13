@@ -163,15 +163,23 @@ jobs:
         timeout-minutes: 15
 
   test-macos:
-    name: Test (macOS)
+    name: Test (macOS, ${{ matrix.features }})
     runs-on: macos-latest
     needs: [fmt, clippy]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default
+            args: ''
+          - features: all-features
+            args: --all-features
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.features }}
       - name: Run tests
-        run: |
-          cargo test --locked
-          cargo test --locked --all-features
+        run: cargo test --locked ${{ matrix.args }}
         timeout-minutes: 15
