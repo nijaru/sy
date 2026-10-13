@@ -329,26 +329,25 @@ fn source_acl_override_skips_only_the_discarded_old_acl_read() {
         std::fs::write(&path, b"OLD bytes").unwrap();
         xattr::set(&path, "user.sy-default", b"retained").unwrap();
         let original = File::open(&path).unwrap();
-        let uid = stat_fd(original.as_raw_fd()).unwrap().st_uid;
-        assert_ne!(uid, 0);
-        exacl::setfacl(
-            &[&path],
-            &[exacl::AclEntry::deny_user(
-                &uid.to_string(),
-                exacl::Perm::READSECURITY,
-                exacl::Flag::empty(),
-            )],
-            None,
-        )
-        .unwrap();
+        assert_ne!(stat_fd(original.as_raw_fd()).unwrap().st_uid, 0);
+        // A well-known everyone UUID avoids asynchronous account-membership
+        // lookup: the fixture must deny READ_SECURITY, not test its cache.
+        let denied = [exacl::AclEntry::deny_group(
+            "abcdefab-cdef-abcd-efab-cdef0000000c",
+            exacl::Perm::READSECURITY,
+            exacl::Flag::empty(),
+        )];
+        acl_macos::write_fd_entries(original.as_raw_fd(), &denied).unwrap();
         let before = stat_fd(original.as_raw_fd()).unwrap();
         let rooted = RootedFs::open_blocking(root.path().into()).unwrap();
         // The held OLD descriptor is intentional: macOS also denies pathname
         // stat under this ACE. This test does not waive namespace validation.
-        assert!(matches!(
-            rooted.read_open_file_acl_blocking(&original, &relative("old")),
-            Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied
-        ));
+        let required_read = rooted.read_open_file_acl_blocking(&original, &relative("old"));
+        assert!(
+            matches!(required_read,
+                Err(RootedFsError::Io(ref error)) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "{required_read:?}"
+        );
         let requested = crate::endpoint::io::Preservation {
             acl: override_acl.then(String::new),
             ..Default::default()

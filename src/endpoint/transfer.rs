@@ -1701,11 +1701,13 @@ mod tests {
             exacl::Flag::empty(),
         ));
         exacl::setfacl(&[&fixture.source_file()], &original_acl, None).unwrap();
-        let original_acl_text =
-            exacl::to_string(&exacl::getfacl(fixture.source_file(), None).unwrap())
-                .unwrap()
-                .trim()
-                .to_string();
+        let original_acl_text = source_endpoint
+            .read_acl(Path::new(NAME))
+            .await
+            .unwrap()
+            .unwrap()
+            .trim()
+            .to_string();
 
         let source = ReplacePathDuringCapture {
             inner: source_endpoint,

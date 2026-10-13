@@ -5,7 +5,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 /// Hard cap on exacl unified-entry text, shared by source reads and mutations.
 pub const MAX_ACL_TEXT_BYTES: usize = 64 * 1024;
 
-/// Unified exacl text. An empty string requests clearing the ACL.
+/// Ordered exacl text with decimal Linux UID/GIDs or raw macOS UUIDs as
+/// principals, never account names. An empty string requests clearing the ACL.
+/// Native endpoints validate principal syntax; the codec preserves text/order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireAcl {
     text: String,
@@ -77,7 +79,7 @@ mod tests {
 
     #[test]
     fn acl_text_round_trips_including_explicit_clear() {
-        for text in ["", "allow::user:nick:read\n"] {
+        for text in ["", "allow::user:0:read\n", "allow::user:ffffeeee-dddd-cccc-bbbb-aaaa00000000:read\ndeny::user:ffffeeee-dddd-cccc-bbbb-aaaa00000000:write\n"] {
             let result = WireAclResult::new(WireAcl::new(text.to_owned()).unwrap());
             let encoded = result.encode().unwrap();
             assert_eq!(WireAclResult::decode(&encoded).unwrap(), result);

@@ -360,12 +360,41 @@ mod tests {
             .unwrap();
         server_task.await.unwrap();
 
-        // The OS user database canonicalizes the numeric uid to its name on
-        // read, so compare against exacl's own path read of the same file
-        // rather than the planted literal.
-        let via_path =
-            exacl::to_string(&exacl::getfacl(root.path().join("file"), None).unwrap()).unwrap();
-        assert!(!via_path.is_empty());
-        assert_eq!(read.as_deref(), Some(via_path.as_str()));
+        let exported = exacl::from_str(read.as_deref().unwrap()).unwrap();
+        let principal = &exported
+            .iter()
+            .find(|entry| !entry.name.is_empty())
+            .unwrap()
+            .name;
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: getuid only reads process credentials.
+            assert_eq!(principal, &unsafe { libc::getuid() }.to_string());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // Independently obtain the native UUID, not exacl's name mapping.
+            extern "C" {
+                fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> i32;
+            }
+            let mut uuid = [0; 16];
+            // SAFETY: getuid has no pointer arguments; uuid is 16 writable bytes.
+            assert_eq!(
+                unsafe { mbr_uid_to_uuid(libc::getuid(), uuid.as_mut_ptr()) },
+                0
+            );
+            let hex: String = uuid.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(
+                principal,
+                &format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..]
+                )
+            );
+        }
     }
 }

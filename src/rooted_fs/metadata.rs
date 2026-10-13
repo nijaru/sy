@@ -43,7 +43,7 @@ impl MetadataPreservation<'_> {
                 });
             }
             #[cfg(all(feature = "acl", any(target_os = "linux", target_os = "macos")))]
-            exacl::from_str(acl)?;
+            acl_state::validate_acl_entries(&exacl::from_str(acl)?)?;
             #[cfg(not(all(feature = "acl", any(target_os = "linux", target_os = "macos"))))]
             return Err(RootedFsError::AclUnsupported(
                 "ACL preservation requires supported Unix and the acl feature",

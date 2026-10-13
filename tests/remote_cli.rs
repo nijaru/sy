@@ -8,6 +8,10 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
+#[cfg(all(feature = "acl", any(target_os = "linux", target_os = "macos")))]
+#[path = "remote_cli/acl_principals.rs"]
+mod acl_principals;
+
 #[tokio::test]
 async fn remote_roots_and_filenames_survive_cli_dispatch_in_both_directions() {
     let fixture = tempfile::TempDir::new().unwrap();

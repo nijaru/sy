@@ -509,45 +509,6 @@ pub(crate) fn write_xattrs_blocking(
     Ok(())
 }
 
-/// Replace a local path's ACL with `acl`'s exacl-unified text. Empty text
-/// restores the mode-derived base entries.
-#[cfg(all(unix, feature = "acl"))]
-pub(crate) fn write_acl_blocking(full_path: &Path, acl: &str) -> Result<()> {
-    use std::str::FromStr;
-
-    let entries = if acl.is_empty() {
-        #[cfg(target_os = "macos")]
-        {
-            Vec::new()
-        }
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(full_path)?.permissions().mode();
-            exacl::from_mode(mode & 0o777)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
-        {
-            Vec::new()
-        }
-    } else {
-        acl.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                exacl::AclEntry::from_str(line).map_err(|error| {
-                    SyncError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        error.to_string(),
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    exacl::setfacl(&[&full_path], &entries, None)?;
-    Ok(())
-}
-
 /// Copy from a held source descriptor into the still-private staging inode.
 /// macOS `fcopyfile` keeps the operating system's native copy path available
 /// without reopening a user-visible destination pathname.
@@ -866,36 +827,6 @@ fn read_up_to(file: &mut std::fs::File, buffer: &mut [u8]) -> std::io::Result<us
     Ok(filled)
 }
 
-/// Apply a preservation payload to one local staging path before commit.
-pub(crate) fn apply_preservation_blocking(
-    full_path: &Path,
-    preservation: &crate::endpoint::io::Preservation,
-) -> Result<()> {
-    if let Some(xattrs) = &preservation.xattrs {
-        #[cfg(unix)]
-        write_xattrs_blocking(full_path, xattrs)?;
-        #[cfg(not(unix))]
-        {
-            let _ = (full_path, xattrs);
-            return Err(SyncError::Config(
-                "local extended attributes are unsupported on this platform".to_string(),
-            ));
-        }
-    }
-    if let Some(acl) = &preservation.acl {
-        #[cfg(all(unix, feature = "acl"))]
-        write_acl_blocking(full_path, acl)?;
-        #[cfg(not(all(unix, feature = "acl")))]
-        {
-            let _ = (full_path, acl);
-            return Err(SyncError::Config(
-                "local ACL preservation requires the acl feature on Unix".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[async_trait]
 impl StagedWriter for LocalStagedWriter {
     async fn write(&mut self, data: &[u8]) -> Result<()> {
@@ -1209,11 +1140,23 @@ impl Endpoint for LocalEndpoint {
     async fn write_acl(&self, path: &Path, acl: &str) -> Result<()> {
         #[cfg(all(unix, feature = "acl"))]
         {
-            let full_path = self.resolve(path);
-            let acl = acl.to_string();
-            return tokio::task::spawn_blocking(move || write_acl_blocking(&full_path, &acl))
-                .await
-                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            let relative = self.relative_path(path)?;
+            let rooted = self.rooted_fs(false).await?;
+            let acl = acl.to_owned();
+            return tokio::task::spawn_blocking(move || {
+                rooted
+                    .verify_root_path_blocking()
+                    .map_err(map_rooted_fs_error)?;
+                let (kind, _) = rooted
+                    .path_identity_blocking(&relative)
+                    .map_err(map_rooted_fs_error)?
+                    .ok_or_else(|| SyncError::Io(std::io::ErrorKind::NotFound.into()))?;
+                rooted
+                    .write_acl_blocking(&relative, kind, &acl)
+                    .map_err(map_rooted_fs_error)
+            })
+            .await
+            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
         }
 
         #[cfg(not(all(unix, feature = "acl")))]

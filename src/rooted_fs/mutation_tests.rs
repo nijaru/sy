@@ -169,14 +169,18 @@ fn mutate(rooted: &RootedFs, mutation: Mutation) -> Result<()> {
         }
         #[cfg(feature = "acl")]
         Mutation::Acl => {
-            let mut entries = exacl::getfacl(rooted.root_path().join("target"), None)?;
+            let file = rooted.open_xattr_entry_blocking(target.as_path(), EntryKind::File)?;
+            let mut entries = read_acl_entries_fd(&file)?;
+            #[cfg(target_os = "linux")]
+            let principal = "1";
+            #[cfg(target_os = "macos")]
+            let principal = "ffffeeee-dddd-cccc-bbbb-aaaa00000001";
             entries.push(exacl::AclEntry::allow_user(
-                "1",
+                principal,
                 exacl::Perm::READ,
                 exacl::Flag::empty(),
             ));
-            // Only fixture construction uses exacl's ordinary path API; the
-            // operation under test must mutate through its held descriptor.
+            // The operation under test uses the same raw identity codec as -A.
             rooted.write_acl_blocking(&target, EntryKind::File, &exacl::to_string(&entries)?)
         }
         #[cfg(target_os = "macos")]

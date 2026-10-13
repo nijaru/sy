@@ -1,6 +1,5 @@
-//! Held-inode comparison reads numeric qualifiers, never reverse NSS names.
-//! exacl still owns wire text, desired entries and SET; its public read API
-//! resolves native IDs to names, which need not resolve back to the same IDs.
+//! Held-inode ACL capture and application use kernel UID/GIDs exclusively.
+//! exacl owns only the ordered text codec, never principal resolution.
 use super::fd_alias_path;
 use exacl::{AclEntry, AclEntryKind, Flag, Perm};
 use std::ffi::CString;
@@ -35,6 +34,16 @@ extern "C" {
     fn acl_get_qualifier(entry: EntryT) -> *mut c_void;
     fn acl_get_permset(entry: EntryT, permset: *mut PermsetT) -> c_int;
     fn acl_get_perm(permset: PermsetT, perm: c_uint) -> c_int;
+    fn acl_init(count: c_int) -> AclT;
+    fn acl_create_entry(acl: *mut AclT, entry: *mut EntryT) -> c_int;
+    fn acl_set_tag_type(entry: EntryT, tag: c_int) -> c_int;
+    fn acl_set_qualifier(entry: EntryT, qualifier: *const c_void) -> c_int;
+    fn acl_clear_perms(permset: PermsetT) -> c_int;
+    fn acl_add_perm(permset: PermsetT, perm: c_uint) -> c_int;
+    fn acl_valid(acl: AclT) -> c_int;
+    fn acl_set_fd(fd: c_int, acl: AclT) -> c_int;
+    fn acl_set_file(path: *const c_char, acl_type: c_uint, acl: AclT) -> c_int;
+    fn acl_delete_def_file(path: *const c_char) -> c_int;
 }
 
 struct OwnedAcl(AclT);
@@ -143,13 +152,135 @@ fn read_numeric_entry(entry: EntryT, flags: Flag) -> io::Result<AclEntry> {
     })
 }
 
+fn invalid_entry() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "ACL requires numeric UID/GID, POSIX tags, permissions and flags",
+    )
+}
+
+pub(super) fn validate_numeric_entries(entries: &[AclEntry]) -> io::Result<()> {
+    for entry in entries {
+        if !entry.allow
+            || !(entry.flags - Flag::DEFAULT).is_empty()
+            || !(entry.perms - (Perm::READ | Perm::WRITE | Perm::EXECUTE)).is_empty()
+        {
+            return Err(invalid_entry());
+        }
+        match entry.kind {
+            AclEntryKind::User | AclEntryKind::Group if !entry.name.is_empty() => {
+                let id = entry.name.parse::<u32>().map_err(|_| invalid_entry())?;
+                if id == u32::MAX || id.to_string() != entry.name {
+                    return Err(invalid_entry());
+                }
+            }
+            AclEntryKind::User | AclEntryKind::Group | AclEntryKind::Mask | AclEntryKind::Other
+                if entry.name.is_empty() => {}
+            _ => return Err(invalid_entry()),
+        }
+    }
+    Ok(())
+}
+
+fn build_acl(entries: &[AclEntry], default: bool) -> io::Result<OwnedAcl> {
+    let count = c_int::try_from(entries.len()).map_err(|_| invalid_entry())?;
+    // SAFETY: count is nonnegative; checked establishes ownership on success.
+    let mut acl = OwnedAcl::checked(unsafe { acl_init(count) })?;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.flags.contains(Flag::DEFAULT) == default)
+    {
+        let tag = match (entry.kind, entry.name.is_empty()) {
+            (AclEntryKind::User, true) => ACL_USER_OBJ,
+            (AclEntryKind::User, false) => ACL_USER,
+            (AclEntryKind::Group, true) => ACL_GROUP_OBJ,
+            (AclEntryKind::Group, false) => ACL_GROUP,
+            (AclEntryKind::Mask, _) => ACL_MASK,
+            (AclEntryKind::Other, _) => ACL_OTHER,
+            _ => return Err(invalid_entry()),
+        };
+        let mut raw = ptr::null_mut();
+        // SAFETY: acl owns the live allocation, including any reallocation;
+        // raw receives a borrowed entry handle, used before the next append.
+        if unsafe { acl_create_entry(&mut acl.0, &mut raw) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw is a live new entry; tag is a supported POSIX tag.
+        if unsafe { acl_set_tag_type(raw, tag) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if matches!(tag, ACL_USER | ACL_GROUP) {
+            let id = entry.name.parse::<u32>().map_err(|_| invalid_entry())?;
+            // SAFETY: raw has a qualifier-bearing tag; id is a live u32
+            // (Linux uid_t/gid_t), copied by libacl without NSS lookup.
+            if unsafe { acl_set_qualifier(raw, (&id as *const u32).cast()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let mut perms = ptr::null_mut();
+        // SAFETY: raw is live and perms is writable out-parameter storage.
+        if unsafe { acl_get_permset(raw, &mut perms) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: perms is borrowed from raw in the owned ACL.
+        if unsafe { acl_clear_perms(perms) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for bit in [Perm::READ, Perm::WRITE, Perm::EXECUTE] {
+            // SAFETY: perms is live; bit is a valid POSIX permission.
+            if entry.perms.contains(bit) && unsafe { acl_add_perm(perms, bit.bits()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(acl)
+}
+
+pub(super) fn write_numeric_entries(file: &File, entries: &[AclEntry]) -> io::Result<()> {
+    validate_numeric_entries(entries)?;
+    let access = build_acl(entries, false)?;
+    let default = build_acl(entries, true)?;
+    let has_default = entries
+        .iter()
+        .any(|entry| entry.flags.contains(Flag::DEFAULT));
+    let directory = file.metadata()?.is_dir();
+    // Validate both ACLs before the first setter; never calculate a new mask.
+    // SAFETY: both objects are live owned allocations.
+    if unsafe { acl_valid(access.0) } != 0
+        || (has_default && unsafe { acl_valid(default.0) } != 0)
+        || (has_default && !directory)
+    {
+        return Err(invalid_entry());
+    }
+    // SAFETY: file holds the destination inode; access is a valid ACL.
+    if unsafe { acl_set_fd(file.as_raw_fd(), access.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if directory {
+        let alias = CString::new(fd_alias_path(file).as_os_str().as_bytes())?;
+        // SAFETY: alias addresses the held inode; default is a valid ACL
+        // when present. Both calls copy state and retain no input pointers.
+        let result = unsafe {
+            if has_default {
+                acl_set_file(alias.as_ptr(), ACL_TYPE_DEFAULT, default.0)
+            } else {
+                acl_delete_def_file(alias.as_ptr())
+            }
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rooted_fs::acl_state::acl_matches_fd;
 
-    #[test]
-    fn comparison_keeps_numeric_principals_defaults_and_held_fd_authority() {
+    #[tokio::test]
+    async fn capture_wire_apply_keeps_numeric_principals_defaults_and_held_fd_authority() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("directory");
         std::fs::create_dir(&path).unwrap();
@@ -168,15 +299,62 @@ mod tests {
         // The original pathname now addresses a different inode with no ACL.
         std::fs::rename(&path, dir.path().join("held")).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let mut actual = read_numeric_entries(&file).unwrap();
-        actual.sort();
-        expected.sort();
-        assert_eq!(actual, expected);
-        let wire = exacl::getfacl(fd_alias_path(&file), None).unwrap();
-        assert!(acl_matches_fd(&file, &wire).unwrap());
-        assert!(acl_matches_fd(&file, &expected).unwrap());
+        let actual = read_numeric_entries(&file).unwrap();
+        // UID/GID 0 normally reverse-resolve to account names; assert the
+        // exported identity independently of our own encode/decode round trip.
+        for kind in [AclEntryKind::User, AclEntryKind::Group] {
+            for flags in [Flag::empty(), Flag::DEFAULT] {
+                assert!(actual
+                    .iter()
+                    .any(|entry| entry.kind == kind && entry.name == "0" && entry.flags == flags));
+            }
+        }
+        use crate::engine::domain::{EntryKind, RelativePath};
+        use crate::protocol::WireAcl;
+        use crate::rooted_fs::RootedFs;
+        let root = RootedFs::open(dir.path().into()).await.unwrap();
+        let held = RelativePath::new("held").unwrap();
+        let source_identity = root.path_identity_blocking(&held).unwrap().unwrap().1;
+        let text = root
+            .read_observed_acl_blocking(&held, EntryKind::Directory, source_identity)
+            .unwrap()
+            .unwrap();
+        let wire = WireAcl::decode(&WireAcl::new(text).unwrap().encode()).unwrap();
+        assert_eq!(exacl::from_str(wire.text()).unwrap(), actual);
+        let destination = RelativePath::new("directory").unwrap();
+        let identity = root
+            .path_identity_blocking(&destination)
+            .unwrap()
+            .unwrap()
+            .1;
+        root.finalize_directory_blocking(
+            &destination,
+            identity,
+            None,
+            None,
+            &crate::endpoint::io::DirectoryPreservation {
+                acl: Some(wire.text().to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let received = File::open(&path).unwrap();
+        assert_eq!(read_numeric_entries(&received).unwrap(), actual);
+        assert!(acl_matches_fd(&file, &actual).unwrap());
+        // Receiver account tables cannot reinterpret numeric strings because
+        // application goes directly to acl_set_qualifier, not exacl/NSS.
+        let mut named = actual.clone();
+        named
+            .iter_mut()
+            .find(|entry| entry.name == "0")
+            .unwrap()
+            .name = "root".into();
+        assert!(write_numeric_entries(&received, &named).is_err());
+        let mut reversed = actual.clone();
+        reversed.reverse();
+        assert!(!acl_matches_fd(&file, &reversed).unwrap());
         // Native IDs remain distinct regardless of their reverse NSS names.
-        let mut different = expected;
+        let mut different = actual;
         different
             .iter_mut()
             .find(|entry| {
@@ -185,5 +363,25 @@ mod tests {
             .unwrap()
             .name = "1".into();
         assert!(!acl_matches_fd(&file, &different).unwrap());
+        let identity = root
+            .path_identity_blocking(&destination)
+            .unwrap()
+            .unwrap()
+            .1;
+        root.finalize_directory_blocking(
+            &destination,
+            identity,
+            None,
+            None,
+            &crate::endpoint::io::DirectoryPreservation {
+                acl: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_numeric_entries(&received).unwrap(),
+            exacl::from_mode(0o740)
+        );
     }
 }

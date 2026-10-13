@@ -336,22 +336,23 @@ async fn effect_free_preservation_revalidates_observation_and_session_closure() 
 #[cfg(all(target_os = "macos", feature = "acl"))]
 #[tokio::test]
 async fn acl_read_denial_does_not_forbid_exclusive_set_or_prove_shared_noop() {
-    use std::os::unix::fs::MetadataExt;
-
     for shared in [false, true] {
         let fixture = tempfile::tempdir().unwrap();
         let path = fixture.path().join("file");
         std::fs::write(&path, b"retained bytes").unwrap();
         let file = File::open(&path).unwrap();
-        let entries = [exacl::AclEntry::deny_user(
-            &file.metadata().unwrap().uid().to_string(),
+        // Account UUID denials are intermittent in aggregate native runs.
+        // The well-known everyone principal makes READ_SECURITY unavailable
+        // without depending on account-membership resolution.
+        let entries = [exacl::AclEntry::deny_group(
+            "abcdefab-cdef-abcd-efab-cdef0000000c",
             exacl::Perm::READSECURITY,
             exacl::Flag::empty(),
         )];
         if shared {
             std::fs::hard_link(&path, fixture.path().join("alias")).unwrap();
         }
-        exacl::setfacl(&[&path], &entries, None).unwrap();
+        acl_macos::write_fd_entries(file.as_raw_fd(), &entries).unwrap();
         let rooted = RootedFs::open(fixture.path().into()).await.unwrap();
         // macOS also denies pathname stat under this ACE, but descriptor stat
         // remains available. Do not weaken required namespace read contracts.
@@ -670,15 +671,19 @@ fn acl(file: &File) -> Option<String> {
             entries
         };
         #[cfg(not(target_os = "linux"))]
-        let mut entries = exacl::getfacl(fd_fixture_path(file), None).unwrap();
+        let mut entries = read_acl_entries_fd(file).unwrap();
+        #[cfg(target_os = "linux")]
+        let principal = "1";
+        #[cfg(target_os = "macos")]
+        let principal = "ffffeeee-dddd-cccc-bbbb-aaaa00000001";
         entries.push(exacl::AclEntry::allow_user(
-            "1",
+            principal,
             exacl::Perm::READ,
             exacl::Flag::empty(),
         ));
         #[cfg(target_os = "macos")]
         entries.push(exacl::AclEntry::deny_user(
-            "1",
+            principal,
             exacl::Perm::WRITE,
             exacl::Flag::empty(),
         ));
@@ -689,13 +694,6 @@ fn acl(file: &File) -> Option<String> {
         let _ = file;
         None
     }
-}
-
-#[cfg(all(feature = "acl", not(target_os = "linux")))]
-fn fd_fixture_path(file: &File) -> PathBuf {
-    // macOS ACL construction is path-based only in this fixture; held FD ACL
-    // implementation is exercised by the operation under test below.
-    PathBuf::from(format!("/dev/fd/{}", file.as_raw_fd()))
 }
 
 #[cfg(all(target_os = "linux", feature = "acl"))]
