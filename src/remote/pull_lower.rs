@@ -1,7 +1,7 @@
 //! Lowering semantic planner operations to v3 pull actions.
 //!
 //! Mirrors `crate::remote::push::lower_sync_op` with the roles inverted:
-//! file transfers become whole-file fetches (delta pull is a follow-up), and
+//! file transfers become fetches (byte policy selects whole or delta), and
 //! every destination mutation is local. Directory type transitions stay
 //! transactional-refused exactly as on push — the planner's contract is
 //! direction-neutral.

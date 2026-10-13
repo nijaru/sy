@@ -48,7 +48,7 @@ pub const PROTOCOL_V3_8: ProtocolVersion = ProtocolVersion { major: 3, minor: 8 
 pub const PROTOCOL_V3_9: ProtocolVersion = ProtocolVersion { major: 3, minor: 9 };
 
 /// Both runtime handshake entrypoints must use this exact range before opening roots.
-pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_12);
+pub const SUPPORTED_VERSIONS: VersionRange = VersionRange::exact(PROTOCOL_V3_13);
 
 /// Typed operand binding and deferred destination-root acquisition.
 /// The former root-only SessionOpen/SessionReady layouts are incompatible.
@@ -69,6 +69,12 @@ pub const PROTOCOL_V3_11: ProtocolVersion = ProtocolVersion {
 pub const PROTOCOL_V3_12: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 12,
+};
+
+/// Read-only streaming delta PULL with client-owned OLD signatures.
+pub const PROTOCOL_V3_13: ProtocolVersion = ProtocolVersion {
+    major: 3,
+    minor: 13,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +132,8 @@ bitflags! {
         /// COMPRESSED). Bounded by the same frame payload cap; the flag must
         /// appear only on frames whose payload is actually compressed.
         const ZSTD = 1 << 14;
+        /// Read-only delta generation from uploaded bounded OLD signatures.
+        const DELTA_PULL = 1 << 15;
     }
 }
 
@@ -449,12 +457,12 @@ mod tests {
 
     #[test]
     fn current_wire_contract_rejects_previous_minor() {
-        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_12));
+        assert_eq!(SUPPORTED_VERSIONS, VersionRange::exact(PROTOCOL_V3_13));
         assert_eq!(
             negotiate_version(SUPPORTED_VERSIONS, SUPPORTED_VERSIONS).unwrap(),
-            PROTOCOL_V3_12
+            PROTOCOL_V3_13
         );
-        for previous in [PROTOCOL_V3_8, PROTOCOL_V3_11] {
+        for previous in [PROTOCOL_V3_8, PROTOCOL_V3_11, PROTOCOL_V3_12] {
             let previous = VersionRange::exact(previous);
             for (client, server) in [
                 (previous, SUPPORTED_VERSIONS),

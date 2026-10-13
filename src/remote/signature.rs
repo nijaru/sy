@@ -315,6 +315,32 @@ fn produce_signatures(
     {
         return Err(RootedFsError::DestinationChanged(relative.as_path().to_path_buf()).into());
     }
+    let (file_size, block_count) = produce_reader_signatures(&mut file, block_size, sender)?;
+    let metadata = file.metadata()?;
+    let final_identity =
+        crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
+            .ok_or(SignatureProducerError::MissingBasisIdentity)?;
+    if rooted.retired_destination_identity_blocking(expected_identity)? != final_identity
+        || rooted.path_identity_blocking(&relative)? != Some((EntryKind::File, final_identity))
+        || initial.len() != file_size
+        || metadata.len() != file_size
+    {
+        return Err(RootedFsError::DestinationChanged(relative.as_path().to_path_buf()).into());
+    }
+    Ok(SignatureSummary {
+        file_size,
+        block_count,
+        basis_identity: expected_identity,
+    })
+}
+
+/// Generate signatures only from a caller-owned genuine reader. The caller
+/// retains observation validation and descriptor lifetime around this pass.
+pub(crate) fn produce_reader_signatures(
+    file: &mut std::fs::File,
+    block_size: SignatureBlockSize,
+    sender: mpsc::Sender<WireSignature>,
+) -> std::result::Result<(u64, u64), SignatureProducerError> {
     let block_size = block_size.get() as usize;
     let mut buffer = vec![0_u8; block_size];
     let mut file_size = 0_u64;
@@ -362,23 +388,7 @@ fn produce_signatures(
         }
     }
 
-    let metadata = file.metadata()?;
-    let final_identity =
-        crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
-            .ok_or(SignatureProducerError::MissingBasisIdentity)?;
-    if rooted.retired_destination_identity_blocking(expected_identity)? != final_identity
-        || rooted.path_identity_blocking(&relative)? != Some((EntryKind::File, final_identity))
-        || initial.len() != file_size
-        || metadata.len() != file_size
-    {
-        return Err(RootedFsError::DestinationChanged(relative.as_path().to_path_buf()).into());
-    }
-
-    Ok(SignatureSummary {
-        file_size,
-        block_count,
-        basis_identity: expected_identity,
-    })
+    Ok((file_size, block_count))
 }
 
 async fn receive_signature_ack(inbox: &mut StreamInbox, stream_id: StreamId) -> Result<()> {

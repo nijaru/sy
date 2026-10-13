@@ -132,6 +132,40 @@ impl LocalEndpoint {
         self
     }
 
+    /// Publish a reconstructed stage through its genuine LOCAL owner. Remote
+    /// held roots deliberately do not use these operator-address checks.
+    pub(crate) fn commit_reconstruction_blocking(
+        &self,
+        relative: &sy::engine::domain::RelativePath,
+        staged: sy::rooted_fs::RootedStagedFile,
+        flags: Option<u32>,
+        admission: &std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
+    ) -> Result<sy::rooted_fs::PublishedFileProof> {
+        let rooted = self.acquired_rooted_fs().ok_or_else(|| {
+            SyncError::Config("local reconstruction has no original root authority".into())
+        })?;
+        if let Err(operation) = rooted.verify_root_path_blocking() {
+            let operation = map_rooted_fs_error(operation);
+            return match staged.abort() {
+                Ok(()) => Err(operation),
+                Err(abort) => Err(SyncError::StagingAbortFailed {
+                    operation: operation.to_string(),
+                    abort: abort.to_string(),
+                }),
+            };
+        }
+        let destination = self.resolve(relative.as_path());
+        let published = staged
+            .commit_with_admission(admission)
+            .map_err(map_rooted_fs_error)?;
+        verify_committed_root(rooted, &destination)?;
+        let proof = published
+            .finalize_blocking(flags)
+            .map_err(map_rooted_fs_error)?;
+        verify_committed_root(rooted, &destination)?;
+        Ok(proof)
+    }
+
     /// The initial root observation, without retrying a missing pathname.
     pub(crate) fn acquired_rooted_fs(&self) -> Option<&sy::rooted_fs::RootedFs> {
         self.rooted.get().map(std::convert::AsRef::as_ref)

@@ -1,4 +1,4 @@
-use crate::remote::fetch::serve_incoming_file_fetch;
+use crate::remote::fetch::{decode_incoming_file_fetch, serve_decoded_file_fetch};
 use crate::remote::router::RouterConfig;
 use crate::remote::runtime::{
     IncomingRequest, RemoteSessionError, ServerAclHandler, ServerBsdFlagsHandler,
@@ -46,7 +46,7 @@ struct NativeRequestHandlers {
     group_slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-/// Pull-session whole-file source producer. The compression policy mirrors
+/// Pull-session whole/delta source producer. The compression policy mirrors
 /// the push direction: the client sets `-z`/`--compress`, and per-chunk
 /// zstd applies only when both sides negotiated the ZSTD capability.
 #[derive(Clone)]
@@ -54,6 +54,9 @@ pub struct ServerFetchHandler {
     rooted: crate::rooted_fs::RootedFs,
     sender: crate::remote::router::RouterSender,
     peer: crate::protocol::PlatformOs,
+    // Shared across all fetch handlers, independently of the peer's stream
+    // count. Each resident signature index and native matcher consumes budget.
+    scheduler: crate::engine::scheduler::Scheduler,
 }
 
 /// Serve one negotiated v3 transport with bounded request-task ownership.
@@ -162,6 +165,8 @@ fn fetch_handler(session: &ServerRemoteSession) -> Result<ServerFetchHandler> {
         rooted: session.scan_handler_rooted()?,
         sender: session.sender(),
         peer: session.client().platform.os,
+        scheduler: crate::engine::scheduler::Scheduler::new(Default::default())
+            .map_err(|error| ServeError::Request(error.to_string()))?,
     })
 }
 
@@ -264,11 +269,52 @@ fn spawn_request(
         IncomingRequest::FileFetch(incoming) => {
             let handler = handlers.native()?.fetch.clone();
             tasks.spawn(async move {
-                serve_incoming_file_fetch(
+                let (decoded, mut inbox) = decode_incoming_file_fetch(incoming, handler.peer);
+                let request = match decoded {
+                    Ok(request) => request,
+                    Err(error) => {
+                        // Keep invalid-request root release on the same joined
+                        // blocking path as the unscheduled fetch entry point.
+                        return serve_decoded_file_fetch(
+                            handler.rooted.clone(),
+                            Err(error),
+                            inbox,
+                            &handler.sender,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                    }
+                };
+                let is_delta = request.is_delta();
+                let resources = crate::engine::scheduler::ResourceRequest {
+                    active_files: 1,
+                    buffered_bytes: if is_delta {
+                        crate::remote::delta_pull::SERVER_WORKING_SET
+                    } else {
+                        crate::remote::pull::REMOTE_FETCH_WORKING_SET
+                    },
+                    metadata_ops: 1,
+                    cpu_tasks: 1,
+                    network_writes: 1,
+                };
+                let _permit = tokio::select! {
+                    biased;
+                    error = handler.sender.closed() => return Err(error.to_string()),
+                    early = inbox.recv(), if is_delta => {
+                        return Err(match early {
+                            Ok(Some(frame)) => format!("delta PULL frame {:?} before readiness", frame.frame().kind()),
+                            Ok(None) => "delta PULL ended before readiness".into(),
+                            Err(error) => error.to_string(),
+                        });
+                    }
+                    permit = handler.scheduler.acquire(resources) => permit.map_err(|error| error.to_string())?,
+                };
+                serve_decoded_file_fetch(
                     handler.rooted.clone(),
-                    incoming,
+                    Ok(request),
+                    inbox,
                     &handler.sender,
-                    handler.peer,
                 )
                 .await
                 .map(|_| ())
@@ -528,6 +574,189 @@ mod tests {
             .unwrap();
         drop(client);
         server.shutdown().await.unwrap();
+    }
+
+    /// Saturate the real router with valid, unadmitted openers after two
+    /// streams have Ready. All 130 fit the 256-stream limit, but the 128 queued
+    /// openers used to retain every inbound permit and block those uploads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn valid_queued_fetch_openers_release_inbound_admission_before_budget_wait() {
+        use crate::protocol::{
+            SignatureBlockSize, WireDeltaFetchRequest, WireFetchCompression, WireFileEnd,
+            WireFileFetchRequest, WireSignature, WireSignatureEnd,
+        };
+        use futures::TryStreamExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let data = b"original SOURCE";
+        std::fs::write(root.path().join("file"), data).unwrap();
+        let config = RouterConfig::default();
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+        let (client, server) = tokio::join!(
+            ClientRemoteSession::connect(cr, cw, Operation::Pull, root.path(), config),
+            ServerRemoteSession::accept(sr, sw, config),
+        );
+        let client = client.unwrap();
+        let mut server = server.unwrap();
+        // Establish originals with the serving session's scanner, not an
+        // independently opened root or peer-supplied identity authority.
+        let rooted = server.scan_handler_rooted().unwrap();
+        let source = rooted
+            .source_entry_stream(crate::engine::scan::ScanRequest {
+                metadata: crate::engine::scan::EntryMetadataRequest {
+                    identity: true,
+                    ..Default::default()
+                },
+                respect_gitignore: false,
+                ..Default::default()
+            })
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .remove(0);
+        let request = WireDeltaFetchRequest {
+            source: WireFileFetchRequest::new(
+                crate::remote::path::encode_relative_path(source.path.as_path()).unwrap(),
+                source.size,
+                *source.identity.unwrap().as_bytes(),
+                WireFetchCompression::None,
+            ),
+            block_size: SignatureBlockSize::new(4096).unwrap(),
+            basis_size: 4096,
+            basis_identity: [9; 32],
+        };
+        let handlers = RequestHandlers::new(&server).unwrap();
+        let mut tasks = JoinSet::new();
+        let mut streams = Vec::new();
+        for index in 0..config.max_inbound_frames as usize + 2 {
+            let mut inbox = client.sender().open_stream().unwrap();
+            client
+                .sender()
+                .send(
+                    Frame::new(
+                        FrameKind::DeltaFetchRequest,
+                        FrameFlags::empty(),
+                        inbox.stream_id(),
+                        request.encode(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Observing every opener through next_request makes saturation
+            // deterministic: no sleep or assumed transport/task progress.
+            let incoming = server.next_request().await.unwrap().unwrap();
+            spawn_request(&mut tasks, &handlers, incoming).unwrap();
+            if index < 2 {
+                let ready = tokio::time::timeout(Duration::from_secs(5), inbox.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(ready.frame().kind(), FrameKind::DeltaFetchReady);
+                assert!(ready.frame().flags().is_empty() && ready.frame().payload().is_empty());
+            }
+            streams.push((inbox, index < 2));
+        }
+        let mut clients = JoinSet::new();
+        for (mut inbox, ready) in streams {
+            let sender = client.sender();
+            clients.spawn(async move {
+                let id = inbox.stream_id();
+                if !ready {
+                    let ready = inbox
+                        .recv()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "fetch ended before Ready".to_string())?;
+                    assert_eq!(ready.frame().kind(), FrameKind::DeltaFetchReady);
+                    assert!(ready.frame().flags().is_empty() && ready.frame().payload().is_empty());
+                }
+                for (kind, payload) in [
+                    (
+                        FrameKind::Signature,
+                        WireSignature::new(0, 4096, 0, [0; 16]).unwrap().encode(),
+                    ),
+                    (
+                        FrameKind::SignatureEnd,
+                        WireSignatureEnd::new(4096, 1, [9; 32]).unwrap().encode(),
+                    ),
+                ] {
+                    sender
+                        .send(Frame::new(kind, FrameFlags::empty(), id, payload).unwrap())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                let mut received = Vec::new();
+                loop {
+                    let routed = inbox
+                        .recv()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "fetch ended before FileEnd".to_string())?;
+                    let frame = routed.frame();
+                    match frame.kind() {
+                        FrameKind::Data => {
+                            assert!(frame.flags().is_empty());
+                            received.extend_from_slice(frame.payload());
+                        }
+                        FrameKind::FileEnd => {
+                            assert_eq!(frame.flags(), FrameFlags::FINAL | FrameFlags::ACK_REQUIRED);
+                            let end = WireFileEnd::decode(frame.payload()).unwrap();
+                            assert_eq!(end.file_size(), data.len() as u64);
+                            assert_eq!(end.digest(), *blake3::hash(data).as_bytes());
+                            assert_eq!(received, data);
+                            drop(routed);
+                            crate::remote::fetch::acknowledge_fetch(&sender, id)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            return Ok::<_, String>(());
+                        }
+                        kind => panic!("unexpected fetch response: {kind:?}"),
+                    }
+                }
+            });
+        }
+        let progress = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(result) = clients.join_next().await {
+                result.unwrap().unwrap();
+            }
+            while let Some(result) = tasks.join_next().await {
+                check_joined(Some(result)).unwrap();
+            }
+        })
+        .await;
+        if progress.is_err() {
+            // Wake and join admitted handlers even when demonstrating the old
+            // deadlock; never abandon SOURCE owners or transport actors.
+            client
+                .sender()
+                .fail(Arc::new(crate::remote::router::RouterError::SessionFailed(
+                    "fetch opener progress deadline".into(),
+                )));
+            server
+                .sender()
+                .fail(Arc::new(crate::remote::router::RouterError::SessionFailed(
+                    "fetch opener progress deadline".into(),
+                )));
+            while let Some(result) = clients.join_next().await {
+                assert!(result.unwrap().is_err());
+            }
+            while let Some(result) = tasks.join_next().await {
+                assert!(result.unwrap().is_err());
+            }
+        }
+        drop(client);
+        server.shutdown().await.unwrap();
+        assert!(
+            progress.is_ok(),
+            "valid queued openers blocked admitted uploads/ACKs"
+        );
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), data);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     /// A frame-boundary EOF is orderly only if admitted fetch work has its

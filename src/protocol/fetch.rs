@@ -139,6 +139,53 @@ impl WireFileFetchRequest {
     }
 }
 
+/// Read-only delta PULL opener (exact 3.13). The basis identity is an opaque
+/// client-owned OLD observation, never remote path or mutation authority.
+/// The client awaits empty unflagged DeltaFetchReady before generating/uploading
+/// signatures, then sends an unflagged SignatureEnd. Only after that exact phase
+/// completes may the server send preservation/operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDeltaFetchRequest {
+    pub source: WireFileFetchRequest,
+    pub block_size: super::SignatureBlockSize,
+    pub basis_size: u64,
+    pub basis_identity: [u8; FETCH_IDENTITY_LEN],
+}
+
+impl WireDeltaFetchRequest {
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::new();
+        out.put_u32(self.block_size.get());
+        out.put_u64(self.basis_size);
+        out.extend_from_slice(&self.basis_identity);
+        out.extend_from_slice(&self.source.encode());
+        out.freeze()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut reader = SliceReader::new(payload);
+        let block_size = super::SignatureBlockSize::new(reader.u32()?)?;
+        let basis_size = reader.u64()?;
+        let basis_identity = reader.array()?;
+        // The exact contract caps the resident matcher index before ingestion.
+        if basis_size.div_ceil(u64::from(block_size.get()))
+            > crate::transfer::delta::DEFAULT_MAX_BASIS_BLOCKS as u64
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "delta_fetch_basis",
+                reason: "basis exceeds bounded signature index",
+            });
+        }
+        let source = WireFileFetchRequest::decode(reader.take_remaining()?)?;
+        Ok(Self {
+            source,
+            block_size,
+            basis_size,
+            basis_identity,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +194,38 @@ mod tests {
         let path =
             RelativeWirePath::from_components([b"dir".as_slice(), b"file.txt".as_slice()]).unwrap();
         WireFileFetchRequest::new(path, 4096, [7_u8; FETCH_IDENTITY_LEN], compression)
+    }
+
+    #[test]
+    fn delta_fetch_request_is_exact_bounded_and_not_a_remote_old_path() {
+        let original = WireDeltaFetchRequest {
+            source: request(WireFetchCompression::Auto).with_preservation(true, true),
+            block_size: super::super::SignatureBlockSize::new(4096).unwrap(),
+            basis_size: 4097,
+            basis_identity: [9; FETCH_IDENTITY_LEN],
+        };
+        let encoded = original.encode();
+        assert_eq!(WireDeltaFetchRequest::decode(&encoded).unwrap(), original);
+        for length in 0..encoded.len() {
+            assert!(WireDeltaFetchRequest::decode(&encoded[..length]).is_err());
+        }
+        let mut trailing = encoded.to_vec();
+        trailing.push(0);
+        assert!(WireDeltaFetchRequest::decode(&trailing).is_err());
+        for invalid_block in [0_u32, 4095, 4097, 2 * 1024 * 1024, u32::MAX] {
+            let mut invalid = encoded.to_vec();
+            invalid[..4].copy_from_slice(&invalid_block.to_be_bytes());
+            assert!(WireDeltaFetchRequest::decode(&invalid).is_err());
+        }
+        let mut oversized = encoded.to_vec();
+        oversized[4..12].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(matches!(
+            WireDeltaFetchRequest::decode(&oversized),
+            Err(ProtocolError::InvalidField {
+                field: "delta_fetch_basis",
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -2,15 +2,13 @@
 //!
 //! The pull inverts the push executor's role split while keeping the same
 //! safety ordering. The remote is a pure SOURCE: it serves scans, content
-//! hashes, and whole-file fetches, and the session router already rejects
+//! hashes, and whole/delta fetches, and the session router rejects
 //! mutation requests in Pull sessions. The client owns reconciliation,
 //! the bounded delete journal, local transactional staging, and metadata.
 //!
-//! Byte strategy for this slice is whole-file fetch with per-chunk
-//! compression when negotiated. Delta pull (uploading local destination
-//! signatures, receiving copy ops) is a follow-up: the wire vocabulary
-//! supports it, but the safety-critical ordering — complete preflight, then
-//! main work, then reverse-order deletes, then finalize — must land first.
+//! Eligible changed large regular files upload adaptive OLD signatures and
+//! reconstruct streamed operations into private local staging. SOURCE stays
+//! read-only; both directions retain BLAKE3-before-publication integrity.
 
 use crate::endpoint::io::{ExpectedDestination, VerificationStatus};
 use crate::endpoint::local::LocalEndpoint;
@@ -528,6 +526,7 @@ impl RemotePullExecutor {
                         &source,
                         &destination_path,
                         expected_destination,
+                        destination.as_ref(),
                         &metadata,
                         bsd_flags,
                     )
@@ -639,6 +638,7 @@ impl RemotePullExecutor {
         source: &Entry,
         destination_path: &RelativePath,
         expected_destination: ExpectedDestination,
+        destination: Option<&Entry>,
         metadata: &PullTransferMetadata,
         final_flags: Option<u32>,
     ) -> Result<(
@@ -647,6 +647,41 @@ impl RemotePullExecutor {
     )> {
         let dest = self.dest_path(destination_path);
         let staged_metadata = staged_file_metadata(metadata, &dest)?;
+        if let Some(old) = destination.filter(|old| {
+            crate::remote::delta_pull::candidate(
+                old,
+                crate::remote::push::DEFAULT_REMOTE_DELTA_MIN_SIZE,
+                self.remote.capabilities(),
+            )
+        }) {
+            return Ok(crate::remote::delta_pull::fetch_delta(
+                &self.sender,
+                source,
+                self.remote.peer_platform(),
+                crate::remote::delta_pull::PullTarget {
+                    endpoint: LocalEndpoint::new(self.destination_root.clone())
+                        .with_rooted_authority(self.metadata_authority().await?.clone())
+                        .with_publication_admission(self.sender.publication_admission()),
+                    path: destination_path.clone(),
+                    old: old.clone(),
+                    unix_mode: staged_metadata
+                        .unix_mode
+                        .ok_or_else(|| RemotePullError::MissingScannedMode(dest.clone()))?,
+                    modified: metadata.modified,
+                    final_flags,
+                },
+                FetchPolicy {
+                    compression: self.compression,
+                    rate_limiter: self.rate_limiter.as_ref(),
+                    preservation: FetchPreservationRequest {
+                        xattrs: self.xattrs,
+                        acls: self.acls,
+                    },
+                    capabilities: self.remote.capabilities(),
+                },
+            )
+            .await?);
+        }
         let endpoint = LocalEndpoint::new(self.destination_root.clone())
             .with_rooted_authority(self.metadata_authority().await?.clone())
             .with_publication_admission(self.sender.publication_admission());

@@ -73,6 +73,10 @@ pub enum FrameKind {
     SourceIgnoreRequest = 39,
     /// Protection decision; uses FINAL|ACK_REQUIRED, then empty unflagged Ack.
     SourceIgnoreResult = 40,
+    /// Read-only PULL; uploaded signatures never grant mutation authority.
+    DeltaFetchRequest = 41,
+    /// Server admission for delta PULL signature upload; empty flags/payload.
+    DeltaFetchReady = 42,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -119,6 +123,8 @@ impl TryFrom<u8> for FrameKind {
             38 => Ok(Self::GroupResult),
             39 => Ok(Self::SourceIgnoreRequest),
             40 => Ok(Self::SourceIgnoreResult),
+            41 => Ok(Self::DeltaFetchRequest),
+            42 => Ok(Self::DeltaFetchReady),
             other => Err(ProtocolError::UnknownFrameKind(other)),
         }
     }

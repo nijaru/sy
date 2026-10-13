@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod bsdflags;
 mod data;
+pub(crate) mod delta_pull;
 pub mod fetch;
 pub(crate) mod group;
 pub mod hash;
@@ -291,7 +292,7 @@ fn process_capabilities() -> CapabilitySet {
     // enforce held-directory-FD confinement and the v3 path encoding has been
     // validated. Linux and macOS are the supported cross-OS family for 0.5.
     if supports_rolling_signatures(os) {
-        capabilities.insert(CapabilitySet::ROLLING_SIGNATURES);
+        capabilities.insert(CapabilitySet::ROLLING_SIGNATURES | CapabilitySet::DELTA_PULL);
     }
     // File transfers now reconstruct into a same-directory no-follow staging
     // file and rename it through the held parent descriptor after verification.
@@ -704,7 +705,7 @@ mod tests {
     async fn incompatible_client_is_rejected_before_root_creation() {
         let parent = tempfile::TempDir::new().unwrap();
         let root = parent.path().join("must-not-be-created");
-        let old = VersionRange::exact(crate::protocol::PROTOCOL_V3_9);
+        let old = VersionRange::exact(crate::protocol::PROTOCOL_V3_12);
         let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
         let (mut reader, mut writer) = tokio::io::split(server_io);
         let hello =
@@ -748,7 +749,7 @@ mod tests {
                 SUPPORTED_VERSIONS
             );
             let response = ServerHello::new(
-                crate::protocol::PROTOCOL_V3_9,
+                crate::protocol::PROTOCOL_V3_12,
                 process_capabilities(),
                 Platform::current(),
                 "old",

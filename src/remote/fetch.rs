@@ -1,11 +1,11 @@
-//! Whole-file source fetch for pull sessions.
+//! Read-only whole-file and delta source fetch for pull sessions.
 //!
 //! Push streams client→server (`FileBegin` … `FileEnd` on a client-opened
 //! stream, server ACKs after staged reconstruction commits). Pull inverts the
 //! direction with the same frame vocabulary and the same ordering rule: the
 //! client requests a scanned source entry, the server validates the entry
 //! identity (a source changed since the scan must fail loudly rather than
-//! deliver mixed bytes), streams `Data` frames server→client, and terminates
+//! deliver mixed bytes), streams `Data`/`DeltaCopy` frames server→client, and terminates
 //! with `FileEnd` carrying the BLAKE3 digest of the uncompressed source bytes.
 //! The client acknowledges only after its staged copy verifies against that
 //! digest and commits — the ack-after-commit ordering that keeps a failing
@@ -319,7 +319,7 @@ pub async fn acknowledge_fetch(
         .map_err(RemoteTransferError::Router)
 }
 
-/// Server side: serve one peer-opened file fetch stream.
+/// Server side: serve a whole-file or delta peer-opened source fetch stream.
 ///
 /// The source entry is validated against the scan identity before streaming;
 /// `FileEnd` carries the source digest; the client's final `Ack` is awaited so
@@ -331,7 +331,32 @@ pub async fn serve_incoming_file_fetch(
     sender: &RouterSender,
     peer: PlatformOs,
 ) -> std::result::Result<TransferSummary, RemoteTransferError> {
-    let IncomingStream { first, mut inbox } = incoming;
+    let (decoded, inbox) = decode_incoming_file_fetch(incoming, peer);
+    serve_decoded_file_fetch(rooted, decoded, inbox, sender).await
+}
+
+pub(crate) struct DecodedFileFetch {
+    request: WireFileFetchRequest,
+    relative: crate::engine::domain::RelativePath,
+    delta: Option<crate::protocol::WireDeltaFetchRequest>,
+}
+
+impl DecodedFileFetch {
+    pub(crate) fn is_delta(&self) -> bool {
+        self.delta.is_some()
+    }
+}
+
+/// Detach the bounded opener before scheduler admission. Waiting requests must
+/// not hold the shared inbound window needed by admitted uploads and ACKs.
+pub(crate) fn decode_incoming_file_fetch(
+    incoming: IncomingStream,
+    peer: PlatformOs,
+) -> (
+    std::result::Result<DecodedFileFetch, RemoteTransferError>,
+    StreamInbox,
+) {
+    let IncomingStream { first, inbox } = incoming;
     let stream_id = inbox.stream_id();
     let decoded = (|| {
         let frame = first.frame();
@@ -347,21 +372,51 @@ pub async fn serve_incoming_file_fetch(
                 flags: frame.flags().bits(),
             });
         }
-        if frame.kind() != FrameKind::FileFetchRequest {
+        if !matches!(
+            frame.kind(),
+            FrameKind::FileFetchRequest | FrameKind::DeltaFetchRequest
+        ) {
             return Err(RemoteTransferError::UnexpectedFrame {
                 expected: FrameKind::FileFetchRequest,
                 actual: frame.kind(),
             });
         }
-        let request = WireFileFetchRequest::decode(frame.payload())?;
+        let delta = if frame.kind() == FrameKind::DeltaFetchRequest {
+            Some(crate::protocol::WireDeltaFetchRequest::decode(
+                frame.payload(),
+            )?)
+        } else {
+            None
+        };
+        let request = match &delta {
+            Some(delta) => delta.source.clone(),
+            None => WireFileFetchRequest::decode(frame.payload())?,
+        };
         let relative = decode_relative_path(request.path.clone(), peer)?;
-        Ok((request, relative))
+        Ok(DecodedFileFetch {
+            request,
+            relative,
+            delta,
+        })
     })();
     drop(first);
+    (decoded, inbox)
+}
 
+pub(crate) async fn serve_decoded_file_fetch(
+    rooted: RootedFs,
+    decoded: std::result::Result<DecodedFileFetch, RemoteTransferError>,
+    mut inbox: StreamInbox,
+    sender: &RouterSender,
+) -> std::result::Result<TransferSummary, RemoteTransferError> {
+    let stream_id = inbox.stream_id();
     // Invalid requests also release their held root on the joined worker.
-    let (source, preservation, request) = tokio::task::spawn_blocking(move || {
-        let (request, relative) = decoded?;
+    let (source, preservation, request, delta) = tokio::task::spawn_blocking(move || {
+        let DecodedFileFetch {
+            request,
+            relative,
+            delta,
+        } = decoded?;
         let source = SourceFile::capture_blocking(
             rooted,
             relative,
@@ -373,7 +428,7 @@ pub async fn serve_incoming_file_fetch(
             acls: request.preserve_acls(),
             bsd_flags: false, // Ordinary fetch has no inline flags payload.
         })?;
-        Ok::<_, RemoteTransferError>((source, preservation, request))
+        Ok::<_, RemoteTransferError>((source, preservation, request, delta))
     })
     .await
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
@@ -385,6 +440,40 @@ pub async fn serve_incoming_file_fetch(
         WireFetchCompression::Auto => Some(CompressionPolicy::Auto),
         WireFetchCompression::Always => Some(CompressionPolicy::Always),
     };
+
+    let uploaded = async {
+        match &delta {
+            Some(delta) => {
+                // The serving handler already owns scheduler admission. Do not
+                // solicit signatures until the original SOURCE is captured too.
+                let ready = Frame::new(
+                    FrameKind::DeltaFetchReady,
+                    FrameFlags::empty(),
+                    stream_id,
+                    bytes::Bytes::new(),
+                )?;
+                tokio::select! {
+                    biased;
+                    early = inbox.recv() => {
+                        let early = early?.ok_or(RemoteTransferError::UnexpectedStreamEnd { stream_id: stream_id.get() })?;
+                        return Err(RemoteTransferError::PrematureFetchFrame(early.frame().kind()));
+                    }
+                    sent = sender.send(ready) => sent?,
+                }
+                crate::remote::delta_pull::receive_basis(&mut inbox, delta).await.map(Some)
+            }
+            None => Ok(None),
+        }
+    }.await;
+    // Signature upload is read-only. Revalidate the same original SOURCE after
+    // the peer-controlled phase, never recapture it as a fresh observation.
+    let (source, basis) = tokio::task::spawn_blocking(move || {
+        let basis = uploaded?;
+        source.validate_blocking()?;
+        Ok::<_, RemoteTransferError>((source, basis))
+    })
+    .await
+    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
 
     let metadata_sent: std::result::Result<(), RemoteTransferError> = async {
         if let Some(xattrs) = preservation.xattrs {
@@ -427,7 +516,7 @@ pub async fn serve_incoming_file_fetch(
 
     // Even a metadata-send failure releases the original FD/root on a joined
     // blocking worker, not by unwinding a filesystem owner on a Tokio thread.
-    let (source, mut source_file) = tokio::task::spawn_blocking(move || {
+    let (source, source_file) = tokio::task::spawn_blocking(move || {
         metadata_sent?;
         let reader = source.clone_reader_blocking()?;
         Ok::<_, RemoteTransferError>((source, reader))
@@ -441,13 +530,14 @@ pub async fn serve_incoming_file_fetch(
         mpsc::channel::<crate::remote::transfer::ProducerItem>(PRODUCER_QUEUE_DEPTH);
     let producer = tokio::task::spawn_blocking(move || {
         crate::remote::transfer::validate_source(&source_file, expected_identity, expected_size)?;
-        let summary = crate::remote::transfer::produce_whole(
-            &mut source_file,
+        let summary = crate::remote::transfer::produce_source(
+            source_file,
+            expected_identity,
             expected_size,
+            basis,
             producer_tx,
-            compression.as_ref(),
+            compression,
         )?;
-        crate::remote::transfer::validate_source(&source_file, expected_identity, expected_size)?;
         if summary.file_size != expected_size {
             return Err(RemoteTransferError::SourceChanged {
                 expected_size,
@@ -457,8 +547,14 @@ pub async fn serve_incoming_file_fetch(
         Ok(summary)
     });
 
-    let produced =
-        crate::remote::transfer::send_produced_file(sender, stream_id, producer_rx, producer).await;
+    let produced = crate::remote::transfer::send_produced_file_controlled(
+        sender,
+        stream_id,
+        producer_rx,
+        producer,
+        Some(&mut inbox),
+    )
+    .await;
     let (source, summary) = tokio::task::spawn_blocking(move || {
         let summary = produced?;
         source.validate_blocking()?;
@@ -468,15 +564,20 @@ pub async fn serve_incoming_file_fetch(
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
 
     let acknowledged: std::result::Result<(), RemoteTransferError> = async {
-        sender
-            .send(Frame::new(
-                FrameKind::FileEnd,
-                FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
-                stream_id,
-                WireFileEnd::new(summary.file_size, summary.digest).encode(),
-            )?)
-            .await
-            .map_err(RemoteTransferError::Router)?;
+        let end = Frame::new(
+            FrameKind::FileEnd,
+            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+            stream_id,
+            WireFileEnd::new(summary.file_size, summary.digest).encode(),
+        )?;
+        tokio::select! {
+            biased;
+            early = inbox.recv() => {
+                let early = early?.ok_or(RemoteTransferError::UnexpectedStreamEnd { stream_id: stream_id.get() })?;
+                return Err(RemoteTransferError::PrematureFetchFrame(early.frame().kind()));
+            }
+            sent = sender.send(end) => sent.map_err(RemoteTransferError::Router)?,
+        }
         receive_fetch_ack(&mut inbox, stream_id).await
     }
     .await;

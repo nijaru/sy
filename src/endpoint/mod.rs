@@ -65,6 +65,8 @@ pub struct Capabilities {
     pub blake3: bool,
     /// The endpoint can provide rolling block signatures for delta planning.
     pub rolling_signatures: bool,
+    /// SOURCE can generate bounded delta operations from client OLD signatures.
+    pub delta_pull: bool,
     /// The endpoint participates in multiplexed requests.
     pub multiplexing: bool,
     /// Native path bytes can be represented without lossy conversion.
@@ -92,6 +94,7 @@ impl Default for Capabilities {
             preserve_flags: false,
             blake3: false,
             rolling_signatures: false,
+            delta_pull: false,
             multiplexing: false,
             raw_paths: false,
             zstd: false,
@@ -128,6 +131,7 @@ impl Capabilities {
             preserve_flags: wire.contains(Wire::BSD_FLAGS),
             blake3,
             rolling_signatures: wire.contains(Wire::ROLLING_SIGNATURES),
+            delta_pull: wire.contains(Wire::DELTA_PULL),
             multiplexing: wire.contains(Wire::MULTIPLEXING),
             raw_paths: wire.contains(Wire::RAW_PATHS),
             zstd: wire.contains(Wire::ZSTD),
@@ -153,6 +157,7 @@ impl Capabilities {
             preserve_flags: cfg!(target_os = "macos"),
             blake3: true,
             rolling_signatures: true,
+            delta_pull: true,
             multiplexing: false,
             raw_paths: cfg!(unix),
             zstd: true,

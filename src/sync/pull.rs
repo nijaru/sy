@@ -2,7 +2,7 @@
 //!
 //! Mirrors `push` with the roles inverted. The remote session is opened with
 //! `Operation::Pull`, so the server serves scans, content hashes, and
-//! whole-file fetches, and the session router rejects every mutation request.
+//! whole/delta fetches, and the session router rejects every mutation request.
 //! The local side owns reconciliation (the shared preflight controller),
 //! transactional staging, metadata, and the delete journal.
 

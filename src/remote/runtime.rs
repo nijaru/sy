@@ -842,10 +842,33 @@ impl ServerRemoteSession {
             }),
             FrameKind::HashRequest => Ok(Some(IncomingRequest::Hash(incoming))),
             FrameKind::SignatureRequest => Ok(Some(IncomingRequest::Signatures(incoming))),
-            FrameKind::FileFetchRequest if self.opened.operation == Operation::Pull => {
-                let request =
+            FrameKind::FileFetchRequest | FrameKind::DeltaFetchRequest
+                if self.opened.operation == Operation::Pull =>
+            {
+                let request = if kind == FrameKind::DeltaFetchRequest {
+                    if !self
+                        .opened
+                        .ready
+                        .capabilities
+                        .contains(CapabilitySet::DELTA_PULL | CapabilitySet::BLAKE3)
+                    {
+                        return Err(RemoteTransferError::PreservationUnavailable {
+                            feature: "delta PULL",
+                        }
+                        .into());
+                    }
+                    crate::protocol::WireDeltaFetchRequest::decode(incoming.first.frame().payload())
+                        .map_err(crate::remote::RemoteError::from)?
+                        .source
+                } else {
                     crate::protocol::WireFileFetchRequest::decode(incoming.first.frame().payload())
-                        .map_err(crate::remote::RemoteError::from)?;
+                        .map_err(crate::remote::RemoteError::from)?
+                };
+                if request.compression() != crate::protocol::WireFetchCompression::None
+                    && !self.opened.ready.capabilities.contains(CapabilitySet::ZSTD)
+                {
+                    return Err(RemoteSessionError::PeerLacksZstd);
+                }
                 for (requested, capability, name) in [
                     (request.preserve_xattrs(), CapabilitySet::XATTR, "xattrs"),
                     (request.preserve_acls(), CapabilitySet::ACL, "ACLs"),
@@ -928,10 +951,12 @@ impl ServerRemoteSession {
                     kind: incoming.first.frame().kind(),
                 })
             }
-            FrameKind::FileFetchRequest => Err(RemoteSessionError::OperationMismatch {
-                operation: self.opened.operation,
-                kind: incoming.first.frame().kind(),
-            }),
+            FrameKind::FileFetchRequest | FrameKind::DeltaFetchRequest => {
+                Err(RemoteSessionError::OperationMismatch {
+                    operation: self.opened.operation,
+                    kind: incoming.first.frame().kind(),
+                })
+            }
             actual => Err(RemoteSessionError::UnsupportedRequest(actual)),
         }?;
         if let Some(request) = &request {

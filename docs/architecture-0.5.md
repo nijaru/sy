@@ -427,13 +427,14 @@ negotiated semantics
 
 Do not guess remote capabilities from endpoint type.
 
-The implemented exact wire contract is **3.12**, with no earlier-minor compatibility,
-including no 3.11 compatibility. The original SOURCE-reference, remote-follow,
-and terminal PULL-removal contracts below require a coherent new exact minor;
-this document does not assign new frame numbers or claim those features are
-implemented. Negotiate explicit source-follow/removal intent and capabilities;
-refuse unsupported requested semantics before scans or mutation. Do not reinterpret
-3.12 messages or add compatibility shims.
+The implemented exact wire contract is **3.13**, with no earlier-minor compatibility,
+including no 3.12 compatibility. This minor adds read-only delta PULL; the
+original SOURCE-reference, remote-follow, and terminal PULL-removal additions
+remain integration requirements, not implemented claims. Integrate those changes
+into the same new exact 3.13 contract, not an incremental minor chain. Negotiate
+explicit source-follow/removal intent and capabilities; refuse unsupported
+requested semantics before scans or mutation. Do not reinterpret 3.12 messages
+or add compatibility shims.
 Version refusal precedes operand classification or filesystem root opening.
 `SessionOpen` is `operation:u8, operand_request, path_len:u32, native_path_bytes`:
 
@@ -489,11 +490,11 @@ file-data, metadata, or mutation authority. Local destination deletion scope
 applies the remote source's ignore matching during completed no-mutation
 preflight; any RPC failure prevents all mutation. The query grants no source
 mutation/removal, directory-discard, or copy-links authority. It is mandatory
-in the exact 3.12 contract and requires no additional capability bit.
+in the exact 3.13 contract (introduced in 3.12) and requires no additional capability bit.
 
 ### Original SOURCE references
 
-In the next exact contract, server-emitted scan entries carry cheap session-bound references into the server-owned observation catalogue. Validate requested paths/members against those records; peer-supplied stat identities or a second scan cannot replace original provenance. Bind fetch, signature/delta, metadata, hardlink, and removal requests to their original observations. Source group/footer completion validates exact membership and closes readers; it remains read-only until the separately admitted terminal removal phase. Bound declaration, assertion, and replay records before allocation and authenticate disk spills.
+In the integrated exact contract, server-emitted scan entries carry cheap session-bound references into the server-owned observation catalogue. Validate requested paths/members against those records; peer-supplied stat identities or a second scan cannot replace original provenance. Bind fetch, signature/delta, metadata, hardlink, and removal requests to their original observations. Source group/footer completion validates exact membership and closes readers; it remains read-only until the separately admitted terminal removal phase. Bound declaration, assertion, and replay records before allocation and authenticate disk spills.
 
 ### Metadata phase
 
@@ -533,7 +534,61 @@ source reader
 
 The receiver applies operations directly into staging. Copy operations reference the old destination; literal operations carry bounded data chunks.
 
-Use the same safety contract in both SSH directions. For delta PULL, the client owns the original OLD reader/staging and streams bounded basis signatures to the server; the server produces operations from the referenced original SOURCE observation. Uploading signatures grants no remote filesystem mutation authority. Validate SOURCE around generation and verify the client's reconstructed stage before commit. Whole-file PULL remains the implemented strategy until this caller/protocol path is qualified.
+Use the same safety contract in both SSH directions. Delta PULL uses
+`DeltaFetchRequest` (frame kind **41**, empty flags), requiring negotiated
+`DELTA_PULL` (capability bit **15**) and BLAKE3. Its payload is
+`block_size:u32, basis_size:u64, basis_identity:[u8;32], FileFetchRequest`;
+the nested source request retains its existing compression, preservation, and
+relative-path codec. The basis identity is an opaque client OLD observation,
+not a remote path or filesystem authority. No new operation-frame kinds are
+allocated.
+
+The client owns a genuine original OLD read FD, opening-parent evidence, and
+private native staging. The server sends `DeltaFetchReady` (frame kind **42**,
+empty flags and empty payload) only after byte/CPU admission and original SOURCE
+capture. The client must await this exact readiness before generating or uploading
+signatures; an Ack is never readiness. Queued request openers stay cheap and
+bounded, with no unadmitted signature frames consuming the router-global inbound
+window needed by admitted streams' footers and ACKs. Readiness is server-to-client
+only, occurs once, and is invalid in the signature/data/completion phases.
+The client uploads unflagged `Signature` (kind 8) frames followed
+by an unflagged `SignatureEnd` (kind 9) on the request stream. Block sizes use the
+existing adaptive power-of-two policy, 4 KiB..1 MiB. Announcements are capped at
+65,536 blocks before ingestion; block indices, individual lengths, exact total
+size/count, and echoed OLD identity must agree. Truncated, duplicate, oversized,
+noncanonical, and wrong-phase uploads fail rather than restarting as whole copy.
+
+The SOURCE-only server validates its original scan catalogue when capturing
+`SourceFile` before upload, validates it after upload and around incremental
+matching, and retains it through client completion. Source bytes come only from
+its genuine read-only FD. Wire SOURCE references remain an integration requirement
+on this same owner; uploaded signatures never establish SOURCE provenance or
+grant remote mutation authority. Fetch admission separately budgets resident
+signature-index bytes and hashing/compression CPU, not just active stream count.
+The response is requested `FileXattrs`/`FileAcls`, bounded `Data`/`DeltaCopy`, then
+`FileEnd` with `FINAL|ACK_REQUIRED` and the normal source BLAKE3 digest. Any peer
+frame during generation, including an early Ack or late signature, fails before
+the footer. An empty unflagged Ack follows successful local commit and remains
+read-only, with no removal meaning.
+
+The client reconstructs COPY ranges only from the FD used to generate signatures,
+checks OLD bounds and source output size, verifies reconstructed and staged bytes,
+and validates the original OLD object, opening parent, and local operator-root
+continuity before native publication. The genuine local destination owner also
+checks configured-root continuity immediately after native publication and around
+required finalization. Losing that address after publication is a committed
+failure: no proof, ACK, or removal authority. These local checks do not make remote
+held-root relocation a failure. Native OLD metadata defaults are copied
+from that FD; explicit SOURCE preservation skips only precisely superseded OLD
+fields. Preservation frames cannot arrive after data or satisfy an unrequested
+field. Literal compression uses the existing None/Auto/Always policy and sets
+COMPRESSED only for smaller actual zstd payloads; COPY and signatures stay raw.
+
+Ordinary changed regular files with observed OLD size at least 10 MiB select delta
+when the peer supports it and the adaptive index fits the cap. New files, small
+or nonregular bases, unsupported peers, and bases exceeding the cap select whole
+copy before transfer. Sealed hardlink groups retain their existing whole-file
+SOURCE-lease lifecycle. A failed admitted delta never falls back to whole copy.
 
 ### Multiplexing
 

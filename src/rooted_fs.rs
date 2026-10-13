@@ -389,6 +389,21 @@ impl RootedSourceFile {
     }
 }
 
+/// A client-owned OLD reader is not SOURCE catalogue authority. Retain its
+/// opening parent independently; destination publication may use retirement
+/// lineage, but delta signatures/COPY may never adopt another OLD description.
+pub(crate) struct RootedOldFile {
+    #[cfg(unix)]
+    parent: OwnedFd,
+    file: File,
+}
+
+impl RootedOldFile {
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+}
+
 #[cfg(unix)]
 impl RootedCopySource<'_> {
     fn verify(&self) -> Result<()> {
@@ -2798,6 +2813,59 @@ impl RootedFs {
         _expected_source: EntryIdentity,
         _expected_destination: ExpectedDestination,
     ) -> Result<PublishedEntryProof> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn capture_old_file_blocking(
+        &self,
+        relative: &RelativePath,
+        expected: EntryIdentity,
+    ) -> Result<RootedOldFile> {
+        self.verify_root_path_blocking()?;
+        let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+        let file = open_file_at(parent.as_raw_fd(), &leaf)?;
+        let stat = stat_fd(file.as_raw_fd())?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+            || identity_from_stat(&stat) != Some(expected)
+            || stat_at_optional(parent.as_raw_fd(), &leaf)?
+                .and_then(|named| identity_from_stat(&named))
+                != Some(expected)
+        {
+            return Err(RootedFsError::DestinationChanged(
+                relative.as_path().to_path_buf(),
+            ));
+        }
+        let old = RootedOldFile { parent, file };
+        self.validate_old_file_parent_blocking(relative, &old)?;
+        Ok(old)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn capture_old_file_blocking(
+        &self,
+        _relative: &RelativePath,
+        _expected: EntryIdentity,
+    ) -> Result<RootedOldFile> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn validate_old_file_parent_blocking(
+        &self,
+        relative: &RelativePath,
+        old: &RootedOldFile,
+    ) -> Result<()> {
+        self.verify_root_path_blocking()?;
+        self.verify_parent_binding_blocking(relative.as_path(), &old.parent)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn validate_old_file_parent_blocking(
+        &self,
+        _relative: &RelativePath,
+        _old: &RootedOldFile,
+    ) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 

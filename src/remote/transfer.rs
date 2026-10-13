@@ -91,6 +91,9 @@ pub enum RemoteTransferError {
     RootedFs(#[from] RootedFsError),
 
     #[error(transparent)]
+    Local(#[from] crate::error::SyncError),
+
+    #[error(transparent)]
     Delta(#[from] DeltaMatchError),
 
     #[error(transparent)]
@@ -119,6 +122,12 @@ pub enum RemoteTransferError {
 
     #[error("delta transfer requires a regular-file basis at the destination path")]
     InvalidBasis,
+
+    #[error("invalid delta PULL signature phase: {0}")]
+    InvalidDeltaSignatures(&'static str),
+
+    #[error("file fetch received premature {0:?} before its completion footer")]
+    PrematureFetchFrame(FrameKind),
 
     #[error(
         "opened source changed since scan (expected {expected_size} bytes, observed {actual_size} bytes)"
@@ -552,12 +561,33 @@ pub async fn request_file_transfer_with_stream_policy(
 pub(super) async fn send_produced_file(
     sender: &RouterSender,
     stream_id: StreamId,
+    producer_rx: mpsc::Receiver<ProducerItem>,
+    producer: tokio::task::JoinHandle<Result<TransferSummary>>,
+) -> Result<TransferSummary> {
+    send_produced_file_controlled(sender, stream_id, producer_rx, producer, None).await
+}
+
+/// A SOURCE fetch allows no peer frames between upload and completion. Retain
+/// and join the native producer even when a phase error/cancel interrupts send.
+pub(super) async fn send_produced_file_controlled(
+    sender: &RouterSender,
+    stream_id: StreamId,
     mut producer_rx: mpsc::Receiver<ProducerItem>,
     producer: tokio::task::JoinHandle<Result<TransferSummary>>,
+    control: Option<&mut StreamInbox>,
 ) -> Result<TransferSummary> {
     let sent: Result<()> = tokio::select! {
         biased;
         error = sender.closed() => Err(RemoteTransferError::Router(error)),
+        result = async {
+            match control {
+                Some(inbox) => {
+                    let frame = inbox.recv().await?.ok_or(RemoteTransferError::UnexpectedStreamEnd { stream_id: stream_id.get() })?;
+                    Err(RemoteTransferError::PrematureFetchFrame(frame.frame().kind()))
+                }
+                None => std::future::pending::<Result<()>>().await,
+            }
+        } => result,
         result = async {
             while let Some(item) = producer_rx.recv().await {
                 let frame = match item {
@@ -677,10 +707,14 @@ pub(super) fn produce_source(
     sender: mpsc::Sender<ProducerItem>,
     compression: Option<crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
+    validate_source(&file, expected_identity, expected_size)?;
     let summary = if let Some(basis) = basis {
+        let mut encoder = LiteralEncoder::new(compression.as_ref(), expected_size);
         let delta = match_delta(&mut file, &basis, |op| {
             let item = match op {
-                DeltaOp::Literal(bytes) => ProducerItem::Data(bytes),
+                DeltaOp::Literal(bytes) => encoder
+                    .encode(bytes)
+                    .map_err(|error| Box::new(error) as BoxError)?,
                 DeltaOp::Copy { basis_offset, len } => ProducerItem::Copy(
                     WireDeltaCopy::new(basis_offset, len)
                         .map_err(|error| Box::new(error) as BoxError)?,
@@ -727,24 +761,11 @@ pub(crate) fn produce_whole(
     sender: mpsc::Sender<ProducerItem>,
     compression: Option<&crate::engine::compression::CompressionPolicy>,
 ) -> Result<TransferSummary> {
-    use crate::engine::compression::{
-        choose_for_min_elapsed, ByteRate, CompressionChoice, CompressionPolicy, CompressionSample,
-        CompressionTiming, DEFAULT_LINK_RATE_BYTES_PER_SEC,
-    };
-
     let mut buffer = vec![0_u8; MAX_TRANSFER_DATA_SIZE];
     let mut hasher = blake3::Hasher::new();
     let mut file_size = 0_u64;
 
-    // Auto samples once to choose whether later chunks are worth attempting.
-    // Even Always sends raw bytes when a particular chunk would expand.
-    let mut decision = match compression {
-        Some(CompressionPolicy::Always) | Some(CompressionPolicy::Auto) => {
-            CompressionChoice::ZstdFast
-        }
-        None => CompressionChoice::None,
-    };
-    let mut first_chunk = compression == Some(&CompressionPolicy::Auto);
+    let mut encoder = LiteralEncoder::new(compression, expected_size);
 
     loop {
         let read = loop {
@@ -763,37 +784,7 @@ pub(crate) fn produce_whole(
             .checked_add(u64::try_from(read).map_err(|_| RemoteTransferError::ByteCountOverflow)?)
             .ok_or(RemoteTransferError::ByteCountOverflow)?;
 
-        let compressed = if decision == CompressionChoice::ZstdFast {
-            Some(compress_chunk(bytes)?)
-        } else {
-            None
-        };
-        if first_chunk {
-            first_chunk = false;
-            let compressed = compressed.as_ref().expect("Auto samples the first chunk");
-            let sample = CompressionSample::new(read as u64, compressed.len() as u64)
-                .expect("chunk read is non-zero");
-            let timing = CompressionTiming::new(
-                ByteRate::new(DEFAULT_LINK_RATE_BYTES_PER_SEC).expect("constant is non-zero"),
-                // Initial codec-rate estimates, not measurements of this host.
-                // The model selects representation; it does not provide a
-                // throughput guarantee or change transfer integrity.
-                ByteRate::new(800 * 1024 * 1024).unwrap(),
-                ByteRate::new(1600 * 1024 * 1024).unwrap(),
-                std::num::NonZeroU32::new(MAX_TRANSFER_DATA_SIZE as u32)
-                    .expect("chunk size is non-zero"),
-            );
-            decision = choose_for_min_elapsed(expected_size, sample, timing);
-        }
-
-        let item = match compressed {
-            Some(compressed)
-                if decision == CompressionChoice::ZstdFast && compressed.len() < read =>
-            {
-                ProducerItem::CompressedData(compressed)
-            }
-            _ => ProducerItem::Data(Bytes::copy_from_slice(bytes)),
-        };
+        let item = encoder.encode(Bytes::copy_from_slice(bytes))?;
         sender.blocking_send(item).map_err(|_| {
             io::Error::new(io::ErrorKind::BrokenPipe, "file transfer consumer closed")
         })?;
@@ -805,6 +796,70 @@ pub(crate) fn produce_whole(
         literal_bytes: file_size,
         reused_bytes: 0,
     })
+}
+
+/// Whole-file chunks and delta literals share the same actual-payload policy.
+/// Auto samples the first literal, not a COPY or signature.
+struct LiteralEncoder {
+    decision: crate::engine::compression::CompressionChoice,
+    first_chunk: bool,
+    expected_size: u64,
+}
+
+impl LiteralEncoder {
+    fn new(
+        policy: Option<&crate::engine::compression::CompressionPolicy>,
+        expected_size: u64,
+    ) -> Self {
+        use crate::engine::compression::{CompressionChoice, CompressionPolicy};
+        Self {
+            decision: if policy.is_some() {
+                CompressionChoice::ZstdFast
+            } else {
+                CompressionChoice::None
+            },
+            first_chunk: policy == Some(&CompressionPolicy::Auto),
+            expected_size,
+        }
+    }
+
+    fn encode(&mut self, bytes: Bytes) -> Result<ProducerItem> {
+        use crate::engine::compression::{
+            choose_for_min_elapsed, ByteRate, CompressionChoice, CompressionSample,
+            CompressionTiming, DEFAULT_LINK_RATE_BYTES_PER_SEC,
+        };
+        let compressed = if self.decision == CompressionChoice::ZstdFast {
+            Some(compress_chunk(&bytes)?)
+        } else {
+            None
+        };
+        if self.first_chunk {
+            self.first_chunk = false;
+            let compressed = compressed
+                .as_ref()
+                .expect("Auto samples the first nonempty literal");
+            let sample = CompressionSample::new(bytes.len() as u64, compressed.len() as u64)
+                .expect("literal is nonempty");
+            // Initial codec-rate estimates, not host throughput measurements.
+            let timing = CompressionTiming::new(
+                ByteRate::new(DEFAULT_LINK_RATE_BYTES_PER_SEC).expect("constant is non-zero"),
+                ByteRate::new(800 * 1024 * 1024).expect("constant is non-zero"),
+                ByteRate::new(1600 * 1024 * 1024).expect("constant is non-zero"),
+                std::num::NonZeroU32::new(MAX_TRANSFER_DATA_SIZE as u32)
+                    .expect("chunk size is non-zero"),
+            );
+            self.decision = choose_for_min_elapsed(self.expected_size, sample, timing);
+        }
+        Ok(match compressed {
+            Some(compressed)
+                if self.decision == CompressionChoice::ZstdFast
+                    && compressed.len() < bytes.len() =>
+            {
+                ProducerItem::CompressedData(compressed)
+            }
+            _ => ProducerItem::Data(bytes),
+        })
+    }
 }
 
 fn checked_output_size(current: u64, added: usize, expected_size: u64) -> Result<u64> {

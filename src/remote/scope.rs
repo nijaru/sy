@@ -75,6 +75,11 @@ pub(crate) fn authorize(
         FrameKind::HashRequest => WireHashRequest::decode(payload)?.path,
         FrameKind::SignatureRequest => WireSignatureRequest::decode(payload)?.path,
         FrameKind::FileFetchRequest => WireFileFetchRequest::decode(payload)?.path,
+        FrameKind::DeltaFetchRequest => {
+            crate::protocol::WireDeltaFetchRequest::decode(payload)?
+                .source
+                .path
+        }
         FrameKind::FileBegin => WireFileBegin::decode(payload)?.path,
         FrameKind::GroupOpen => crate::protocol::WireGroupOpen::decode(payload)?.file.path,
         FrameKind::GroupMember => crate::protocol::WireGroupMember::decode(payload)?.path,

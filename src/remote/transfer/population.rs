@@ -36,6 +36,9 @@ pub(in crate::remote) struct PreparedReconstruction {
     pub(super) staged: RootedStagedFile,
     /// Opened only on the first Copy, never for an all-literal replacement.
     basis: Option<File>,
+    /// PULL signatures and COPY share the original OLD description and parent.
+    pull_basis: Option<crate::rooted_fs::RootedOldFile>,
+    retained_flags: Option<u32>,
     rooted: RootedFs,
     relative: RelativePath,
     destination: Option<WireFileBasis>,
@@ -53,6 +56,19 @@ pub(in crate::remote) struct ReadyReconstruction {
 
 impl PreparedReconstruction {
     fn validate_blocking(&self) -> Result<()> {
+        if let Some(binding) = &self.pull_basis {
+            self.rooted.verify_root_path_blocking()?;
+            self.rooted
+                .validate_old_file_parent_blocking(&self.relative, binding)?;
+            let expected = self
+                .copy_basis
+                .ok_or(RemoteTransferError::CopyWithoutBasis)?;
+            super::validate_source(
+                binding.file(),
+                EntryIdentity::from_bytes(expected.identity()),
+                expected.file_size(),
+            )?;
+        }
         validate_destination_state(&self.rooted, &self.relative, self.destination)?;
         if let Some(basis) = self.basis.as_ref() {
             validate_basis(
@@ -75,7 +91,15 @@ impl ReadyReconstruction {
     pub(in crate::remote) fn into_staged_blocking(
         self,
     ) -> Result<(RootedStagedFile, TransferSummary, Option<u32>)> {
-        self.prepared.validate_blocking()?;
+        if let Err(operation) = self.prepared.validate_blocking() {
+            return match self.abort_blocking() {
+                Ok(()) => Err(operation),
+                Err(abort) => Err(RemoteTransferError::ReconstructionAbortFailed {
+                    operation: Box::new(operation),
+                    abort: Box::new(abort),
+                }),
+            };
+        }
         Ok((self.prepared.staged, self.summary, self.final_flags))
     }
 
@@ -191,12 +215,98 @@ fn prepare_with_metadata_blocking(
     Ok(PreparedReconstruction {
         staged,
         basis: None,
+        pull_basis: None,
+        retained_flags: None,
         rooted,
         relative: relative.clone(),
         destination,
         copy_basis,
         preservation,
     })
+}
+
+/// Prepare PULL with the genuine OLD FD before signing. Never reopen COPY's
+/// basis after the signature pass or adopt a fresh OLD observation.
+pub(in crate::remote) fn prepare_pull_reconstruction_blocking(
+    rooted: RootedFs,
+    relative: &RelativePath,
+    expected: WireFileBasis,
+    overrides: crate::endpoint::io::PreservationRequest,
+    source_flags: bool,
+) -> Result<PreparedReconstruction> {
+    rooted.verify_root_path_blocking()?;
+    let binding = rooted
+        .capture_old_file_blocking(relative, EntryIdentity::from_bytes(expected.identity()))?;
+    super::validate_source(
+        binding.file(),
+        EntryIdentity::from_bytes(expected.identity()),
+        expected.file_size(),
+    )?;
+    let reader = binding.file().try_clone()?;
+    let mut prepared = prepare_reconstruction(rooted, relative, Some(expected))?;
+    prepared
+        .staged
+        .copy_retained_metadata_blocking(binding.file(), overrides)?;
+    if cfg!(target_os = "macos") && !source_flags {
+        prepared.retained_flags = Some(
+            prepared
+                .rooted
+                .read_open_file_bsd_flags_blocking(binding.file())?,
+        );
+    }
+    prepared.basis = Some(reader);
+    prepared.pull_basis = Some(binding);
+    prepared.validate_blocking()?;
+    Ok(prepared)
+}
+
+impl PreparedReconstruction {
+    pub(in crate::remote) fn produce_pull_signatures_blocking(
+        mut self,
+        block_size: crate::protocol::SignatureBlockSize,
+        sender: mpsc::Sender<crate::protocol::WireSignature>,
+    ) -> Result<(Self, crate::protocol::WireSignatureEnd)> {
+        let produced = (|| {
+            self.validate_blocking()?;
+            let basis = self
+                .basis
+                .as_mut()
+                .ok_or(RemoteTransferError::CopyWithoutBasis)?;
+            basis.rewind()?;
+            let (size, count) =
+                crate::remote::signature::produce_reader_signatures(basis, block_size, sender)
+                    .map_err(std::io::Error::other)?;
+            self.validate_blocking()?;
+            let expected = self
+                .copy_basis
+                .ok_or(RemoteTransferError::CopyWithoutBasis)?;
+            if size != expected.file_size() {
+                return Err(RemoteTransferError::BasisChanged {
+                    expected_size: expected.file_size(),
+                    actual_size: size,
+                });
+            }
+            Ok(crate::protocol::WireSignatureEnd::new(
+                size,
+                count,
+                expected.identity(),
+            )?)
+        })();
+        match produced {
+            Ok(end) => Ok((self, end)),
+            Err(operation) => match self.abort_blocking() {
+                Ok(()) => Err(operation),
+                Err(abort) => Err(RemoteTransferError::ReconstructionAbortFailed {
+                    operation: Box::new(operation),
+                    abort: Box::new(abort),
+                }),
+            },
+        }
+    }
+
+    pub(in crate::remote) fn abort_blocking(self) -> Result<()> {
+        Ok(self.staged.abort()?)
+    }
 }
 
 /// Bounded receiver and blocking-writer ownership across awaits. `receive`
@@ -212,6 +322,8 @@ pub(in crate::remote) struct ReconstructionReceiver {
     worker: Option<JoinHandle<Result<ReadyReconstruction>>>,
     cleanup: Option<JoinHandle<Result<()>>>,
     metadata_captured: bool,
+    pull_preservation: Option<crate::remote::fetch::FetchPreservationRequest>,
+    rate_limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
 }
 
 impl ReconstructionReceiver {
@@ -228,7 +340,19 @@ impl ReconstructionReceiver {
             worker: Some(worker),
             cleanup: None,
             metadata_captured,
+            pull_preservation: None,
+            rate_limiter: None,
         }
+    }
+
+    pub(in crate::remote) fn with_pull_policy(
+        mut self,
+        preservation: crate::remote::fetch::FetchPreservationRequest,
+        rate_limiter: Option<Arc<std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>>,
+    ) -> Self {
+        self.pull_preservation = Some(preservation);
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// Consume the existing file payload through FileEnd, returning private
@@ -251,7 +375,7 @@ impl ReconstructionReceiver {
         // Observe worker failure while waiting for peer input; a rejected
         // chunk must not require another frame to wake the receiver.
         let received = tokio::select! {
-            received = receive_reconstruction(inbox, &self.begin, sender, self.metadata_captured, validate_end) => received,
+            received = receive_reconstruction(inbox, &self.begin, sender, self.metadata_captured, self.pull_preservation, self.rate_limiter.as_deref(), validate_end) => received,
             reconstructed = worker => {
                 self.sender = None;
                 self.worker = None;
@@ -314,11 +438,16 @@ async fn receive_reconstruction(
     begin: &WireFileBegin,
     reconstruction_tx: &mpsc::Sender<ReconstructionOp>,
     metadata_captured: bool,
+    pull_preservation: Option<crate::remote::fetch::FetchPreservationRequest>,
+    rate_limiter: Option<&std::sync::Mutex<crate::sync::ratelimit::RateLimiter>>,
     validate_end: impl Fn(&Frame) -> Result<()>,
 ) -> Result<()> {
     let stream_id = inbox.stream_id();
     let mut seen_xattrs = metadata_captured;
     let mut seen_acls = metadata_captured;
+    // PULL sends its requested preservation before operations. PUSH captures
+    // SOURCE preservation after byte production and sends it before FileEnd.
+    let mut data_started = false;
     loop {
         let routed = inbox
             .recv()
@@ -329,8 +458,17 @@ async fn receive_reconstruction(
         let frame = routed.frame();
         require_stream(frame, stream_id)?;
         let op = match frame.kind() {
-            FrameKind::Data => ReconstructionOp::Data(DataChunk::from_frame(frame)?),
+            FrameKind::Data => {
+                data_started = true;
+                let chunk = DataChunk::from_frame(frame)?;
+                ReconstructionOp::Data(if rate_limiter.is_some() {
+                    DataChunk::Plain(chunk.decode().await?)
+                } else {
+                    chunk
+                })
+            }
             FrameKind::DeltaCopy => {
+                data_started = true;
                 require_empty_flags(frame)?;
                 if begin.basis().is_none() {
                     return Err(RemoteTransferError::CopyWithoutBasis);
@@ -339,7 +477,10 @@ async fn receive_reconstruction(
             }
             FrameKind::FileXattrs => {
                 require_empty_flags(frame)?;
-                if seen_xattrs {
+                if seen_xattrs
+                    || (data_started && pull_preservation.is_some())
+                    || pull_preservation.is_some_and(|request| !request.xattrs)
+                {
                     return Err(RemoteTransferError::UnexpectedFrame {
                         expected: FrameKind::FileEnd,
                         actual: FrameKind::FileXattrs,
@@ -361,7 +502,10 @@ async fn receive_reconstruction(
             }
             FrameKind::FileAcls => {
                 require_empty_flags(frame)?;
-                if seen_acls {
+                if seen_acls
+                    || (data_started && pull_preservation.is_some())
+                    || pull_preservation.is_some_and(|request| !request.acls)
+                {
                     return Err(RemoteTransferError::UnexpectedFrame {
                         expected: FrameKind::FileEnd,
                         actual: FrameKind::FileAcls,
@@ -375,6 +519,14 @@ async fn receive_reconstruction(
                 )
             }
             FrameKind::FileEnd => {
+                if let Some(request) = pull_preservation {
+                    if request.xattrs && !seen_xattrs {
+                        return Err(RemoteTransferError::MissingFetchPreservation("xattrs"));
+                    }
+                    if request.acls && !seen_acls {
+                        return Err(RemoteTransferError::MissingFetchPreservation("ACLs"));
+                    }
+                }
                 validate_end(frame)?;
                 ReconstructionOp::End(WireFileEnd::decode(frame.payload())?)
             }
@@ -385,6 +537,19 @@ async fn receive_reconstruction(
                 })
             }
         };
+        if let Some(limiter) = rate_limiter {
+            let bytes = match &op {
+                ReconstructionOp::Data(DataChunk::Plain(bytes)) => bytes.len() as u64,
+                _ => 0,
+            };
+            let sleep = limiter
+                .lock()
+                .map_err(|_| std::io::Error::other("rate limiter poisoned"))?
+                .consume(bytes);
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
+        }
         let is_end = matches!(op, ReconstructionOp::End(_));
         reconstruction_tx
             .send(op)
@@ -488,6 +653,7 @@ pub(super) fn populate_reconstruction(
                     return Err(RemoteTransferError::DigestMismatch);
                 }
                 prepared.validate_blocking()?;
+                let final_flags = begin.bsd_flags().or(prepared.retained_flags);
                 return Ok(ReadyReconstruction {
                     prepared,
                     summary: TransferSummary {
@@ -496,7 +662,7 @@ pub(super) fn populate_reconstruction(
                         literal_bytes,
                         reused_bytes,
                     },
-                    final_flags: begin.bsd_flags(),
+                    final_flags,
                 });
             }
         }
