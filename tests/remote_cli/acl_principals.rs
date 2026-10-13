@@ -83,8 +83,10 @@ fn native(path: &Path) -> Vec<u8> {
         .unwrap()
         .unwrap();
     assert_eq!(&raw[..4], &2_u32.to_le_bytes());
+    let (entries, remainder) = raw[4..].as_chunks::<8>();
+    assert!(remainder.is_empty(), "truncated native ACL entry");
     for tag in [2_u16, 8] {
-        assert!(raw[4..].chunks_exact(8).any(|entry| {
+        assert!(entries.iter().any(|entry| {
             u16::from_le_bytes(entry[..2].try_into().unwrap()) == tag
                 && u32::from_le_bytes(entry[4..].try_into().unwrap()) == 0
         }));

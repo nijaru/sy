@@ -332,7 +332,7 @@ mod tests {
             identity,
             None,
             None,
-            &crate::endpoint::io::DirectoryPreservation {
+            &crate::rooted_fs::DirectoryPreservation {
                 acl: Some(wire.text().to_owned()),
                 ..Default::default()
             },
@@ -373,7 +373,7 @@ mod tests {
             identity,
             None,
             None,
-            &crate::endpoint::io::DirectoryPreservation {
+            &crate::rooted_fs::DirectoryPreservation {
                 acl: Some(String::new()),
                 ..Default::default()
             },
