@@ -115,6 +115,77 @@ async fn metadata_completion_rechecks_source_after_admitted_native_work() {
     );
 }
 
+// Closing a completed run rejects its native effects but leaves SOURCE RPCs
+// and the next controller usable. Transport cutoff independently rejects even
+// native work belonging to a still-open run, including inherited endpoints.
+#[tokio::test]
+async fn run_and_session_native_cutoffs_are_independent() {
+    use crate::engine::controller::SyncPlanExecutor;
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("file"), b"source").unwrap();
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(server);
+    let server = tokio::spawn(crate::remote::serve::serve_transport(
+        reader,
+        writer,
+        Default::default(),
+    ));
+    let (reader, writer) = tokio::io::split(client);
+    let client = ClientRemoteSession::connect(
+        reader,
+        writer,
+        Operation::Pull,
+        source.path(),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    let make_executor = || {
+        RemotePullExecutor::new(
+            destination.path().to_path_buf(),
+            client.request_handle(),
+            client.sender(),
+            Scheduler::new(ResourceBudget::default()).unwrap(),
+        )
+    };
+    let first = make_executor();
+    let endpoint = LocalEndpoint::new(destination.path().to_path_buf())
+        .with_rooted_authority(first.metadata_authority().await.unwrap().clone());
+    first.close_mutation_admission();
+    assert!(!client.sender().publication_admission().is_closed());
+    assert!(endpoint
+        .create_dir_all(Path::new("closed-run"))
+        .await
+        .is_err());
+    let entries: Vec<_> = client
+        .scan(Default::default())
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let second = make_executor();
+    let endpoint = LocalEndpoint::new(destination.path().to_path_buf())
+        .with_rooted_authority(second.metadata_authority().await.unwrap().clone());
+    endpoint
+        .create_dir_all(Path::new("open-run"))
+        .await
+        .unwrap();
+    client.sender().publication_admission().close();
+    assert!(!second.run_admission.is_closed());
+    assert!(endpoint
+        .create_dir_all(Path::new("closed-session"))
+        .await
+        .is_err());
+    assert!(destination.path().join("open-run").is_dir());
+    assert!(!destination.path().join("closed-run").exists());
+    assert!(!destination.path().join("closed-session").exists());
+    drop(client);
+    server.await.unwrap().unwrap();
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Mutation {
     Directory,

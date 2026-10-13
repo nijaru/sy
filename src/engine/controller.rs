@@ -15,6 +15,7 @@ use crate::engine::work::WorkItem;
 use crate::engine::work::{TransferSummary, WorkResult};
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
@@ -48,8 +49,23 @@ pub enum ControllerError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[error("{operation}; source-removal drain also failed: {source}")]
-    SourceRemovalDrain {
+    #[error("sync cancelled after {removed_sources} confirmed SOURCE unlinks; admitted native effects may have committed")]
+    Cancelled { removed_sources: u64 },
+
+    #[error(
+        "interrupt listener failed after {removed_sources} confirmed SOURCE unlinks: {source}"
+    )]
+    InterruptListener {
+        removed_sources: u64,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("sync controller is single-use")]
+    AlreadyStarted,
+
+    #[error("{operation}; owned work drain/cleanup also failed: {source}")]
+    OwnedDrain {
         operation: Box<ControllerError>,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -643,6 +659,7 @@ pub struct SyncSummary {
     pub delete_candidates: u64,
     pub deleted_entries: u64,
     pub finalized_metadata: u64,
+    pub removed_sources: u64,
     pub files_transferred: u64,
     pub files_created: u64,
     pub files_updated: u64,
@@ -657,13 +674,23 @@ pub struct SyncSummary {
 /// Executor interface shared by every v3 direction. The controller owns the
 /// safety ordering — preorder directories, bounded concurrent leaves,
 /// reverse-order deletes, reverse-order finalize — and executors own
-/// per-item admission and the concrete mutation/fetch. `remove_verified_-
-/// parity_source` is push-only (`--remove-source-files` removes the local
-/// source after commit); pulls have no local source to remove, so the
-/// default is a no-op.
+/// per-item admission and the concrete mutation/fetch. LOCAL/PUSH executors
+/// own one deferred SOURCE journal; PULL has no local SOURCE removal phase.
 pub trait SyncPlanExecutor: Send + Sync + 'static {
     type Action: Send + 'static;
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Nonblocking run-only cutoff for normal completion. Close run-owned native
+    /// admission and deferred local SOURCE unlink without revoking read authority
+    /// or closing a reusable transport session.
+    fn close_mutation_admission(&self) {}
+
+    /// Failure/cancellation cutoff also closes endpoint/session admission and
+    /// wakes protocol waits. This does not mark the controller as cancelled.
+    /// Native work remains owned and joined, never arbitrarily aborted.
+    fn cancel_mutations(&self) {
+        self.close_mutation_admission();
+    }
 
     fn lower(
         &self,
@@ -671,6 +698,15 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
         policy: ExecutionPolicy,
     ) -> std::result::Result<Option<WorkItem<Self::Action>>, Self::Error>;
     fn is_directory_action(&self, action: &Self::Action) -> bool;
+
+    /// Completed preflight selected the first Create. Initial permanent root
+    /// acquisition belongs to the retained execution owner, not its caller.
+    fn prepare_destination_for_create(
+        &self,
+        _create: &RelativePath,
+    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
+        async { Ok(()) }
+    }
 
     fn supports_whole_hardlink_groups(&self) -> bool {
         false
@@ -699,12 +735,11 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
     fn finish_deferred_source_removals(
         &self,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send;
-    /// Close eligibility and join native work retained by a cancelled removal.
+    /// Close eligibility, join retained native work and return the journal's
+    /// run-wide confirmed unlink count, including successful replay.
     fn close_source_removals(
         &self,
-    ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send {
-        async { Ok(()) }
-    }
+    ) -> impl Future<Output = std::result::Result<u64, Self::Error>> + Send;
     fn remove_unchanged_source(
         &self,
         source: &Entry,
@@ -725,6 +760,38 @@ pub trait SyncPlanExecutor: Send + Sync + 'static {
 pub struct SyncController<E: SyncPlanExecutor> {
     executor: Arc<E>,
     max_in_flight: NonZeroUsize,
+    cancelled: Arc<AtomicBool>,
+    run: tokio::sync::Mutex<ControllerRun>,
+}
+
+#[derive(Default)]
+struct ControllerRun {
+    started: bool,
+    worker: Option<tokio::task::JoinHandle<Result<SyncSummary>>>,
+}
+
+struct ExecutionCancellation<'a, E: SyncPlanExecutor> {
+    controller: &'a SyncController<E>,
+    armed: bool,
+}
+
+impl<E: SyncPlanExecutor> Drop for ExecutionCancellation<'_, E> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.controller.cancel();
+        }
+    }
+}
+
+impl<E: SyncPlanExecutor> Drop for SyncController<E> {
+    fn drop(&mut self) {
+        // Drop cannot join. The retained execution task still owns its bounded
+        // workers and journals and drains them; retain this controller and call
+        // close() to observe that completion and its errors.
+        if self.run.get_mut().worker.is_some() {
+            self.cancel();
+        }
+    }
 }
 
 impl<E: SyncPlanExecutor> SyncController<E> {
@@ -732,33 +799,171 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         Self {
             executor: Arc::new(executor),
             max_in_flight,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            run: tokio::sync::Mutex::new(ControllerRun::default()),
         }
     }
 
     pub async fn execute(&self, plan: SyncPlan) -> Result<SyncSummary> {
-        let operation = self.execute_inner(plan).await;
-        match self.close().await {
-            Ok(()) => operation,
-            Err(source) => match operation {
-                Ok(_) => Err(source),
-                Err(operation) => Err(ControllerError::SourceRemovalDrain {
-                    operation: Box::new(operation),
-                    source: Box::new(source),
-                }),
-            },
+        let mut run = self.run.lock().await;
+        if run.started {
+            return Err(ControllerError::AlreadyStarted);
+        }
+        run.started = true;
+        let mut cancellation = ExecutionCancellation {
+            controller: self,
+            armed: true,
+        };
+        let execution = ControllerExecution {
+            executor: Arc::clone(&self.executor),
+            max_in_flight: self.max_in_flight,
+            cancelled: Arc::clone(&self.cancelled),
+        };
+        // The whole async phase is retained, not just leaf workers. Cancelling
+        // its waiter cannot drop a directory/group/finalize/removal future while
+        // that future owns a queued blocking operation or required cleanup.
+        run.worker = Some(tokio::spawn(async move {
+            let operation = execution.execute_inner(plan).await;
+            if operation.is_err() {
+                // Inline-phase failures need the same session cutoff as worker
+                // failures, before draining retained native/journal work.
+                execution.executor.cancel_mutations();
+            } else {
+                execution.executor.close_mutation_admission();
+            }
+            let drain = execution
+                .executor
+                .close_source_removals()
+                .await
+                .map_err(|error| ControllerError::backend("source-removal drain", error));
+            match drain {
+                Ok(removed_sources) => {
+                    if execution.cancelled.load(Ordering::Acquire) {
+                        let cancelled = ControllerError::Cancelled { removed_sources };
+                        match operation {
+                            Err(ControllerError::Cancelled { .. }) => Err(cancelled),
+                            other => combine_owned_result(Err(cancelled), other.map(|_| ())),
+                        }
+                    } else {
+                        operation.map(|mut summary| {
+                            summary.removed_sources = removed_sources;
+                            summary
+                        })
+                    }
+                }
+                Err(drain) => {
+                    execution.executor.cancel_mutations();
+                    combine_owned_result(operation, Err(drain))
+                }
+            }
+        }));
+        let result = join_execution(&mut run).await;
+        cancellation.armed = false;
+        result
+    }
+
+    /// Real entrypoints retain the controller across an interrupt, close
+    /// admission immediately, then await the original execution owner.
+    pub async fn execute_until(
+        &self,
+        plan: SyncPlan,
+        stop: impl Future<Output = std::io::Result<()>> + Send,
+    ) -> Result<SyncSummary> {
+        let interrupted = {
+            let execution = self.execute(plan);
+            tokio::pin!(execution);
+            tokio::select! {
+                biased;
+                stopped = stop => stopped,
+                result = &mut execution => return result,
+            }
+        };
+        self.cancel();
+        let drain = self.close().await;
+        match (interrupted, drain) {
+            (Ok(()), Ok(summary)) => Err(ControllerError::Cancelled {
+                removed_sources: summary.map_or(0, |summary| summary.removed_sources),
+            }),
+            (Ok(()), Err(error @ ControllerError::Cancelled { .. })) => Err(error),
+            // A completed failure already retains its authenticated partial
+            // outcome. Do not attach a fictitious zero-count cancellation.
+            (Ok(()), Err(source)) => Err(source),
+            (Err(source), Ok(summary)) => Err(ControllerError::InterruptListener {
+                removed_sources: summary.map_or(0, |summary| summary.removed_sources),
+                source,
+            }),
+            (Err(source), Err(ControllerError::Cancelled { removed_sources })) => {
+                Err(ControllerError::InterruptListener {
+                    removed_sources,
+                    source,
+                })
+            }
+            (Err(error), Err(drain)) => combine_owned_result(
+                Err(ControllerError::backend("interrupt listener", error)),
+                Err(drain),
+            ),
         }
     }
 
-    /// A cancellation owner must retain the controller and await this after
-    /// dropping execution. Already-admitted native work cannot be rolled back.
-    pub async fn close(&self) -> Result<()> {
-        self.executor
-            .close_source_removals()
-            .await
-            .map_err(|error| ControllerError::backend("source-removal drain", error))
+    /// Nonblocking cutoff. Admitted native work may finish; there is no rollback.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.executor.cancel_mutations();
+    }
+
+    /// Retain this owner after dropping execution and await it here. This also
+    /// joins a retained close() waiter if the first close future was cancelled.
+    /// Return the joined success summary, or its typed cancellation/failure;
+    /// None means no execution is outstanding (never started or already joined).
+    pub async fn close(&self) -> Result<Option<SyncSummary>> {
+        self.cancel();
+        let mut run = self.run.lock().await;
+        if run.worker.is_some() {
+            join_execution(&mut run).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+async fn join_execution(run: &mut ControllerRun) -> Result<SyncSummary> {
+    let result = run
+        .worker
+        .as_mut()
+        .ok_or(ControllerError::AlreadyStarted)?
+        .await;
+    run.worker.take();
+    result.map_err(|error| ControllerError::Worker(error.to_string()))?
+}
+
+fn combine_owned_result<T>(operation: Result<T>, drain: Result<()>) -> Result<T> {
+    match (operation, drain) {
+        (operation, Ok(())) => operation,
+        (Ok(_), Err(drain)) => Err(drain),
+        (Err(operation), Err(source)) => Err(ControllerError::OwnedDrain {
+            operation: Box::new(operation),
+            source: Box::new(source),
+        }),
+    }
+}
+
+struct ControllerExecution<E: SyncPlanExecutor> {
+    executor: Arc<E>,
+    max_in_flight: NonZeroUsize,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<E: SyncPlanExecutor> ControllerExecution<E> {
+    fn check_active(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(ControllerError::Cancelled { removed_sources: 0 })
+        } else {
+            Ok(())
+        }
     }
 
     async fn execute_inner(&self, plan: SyncPlan) -> Result<SyncSummary> {
+        self.check_active()?;
         let SyncPlan {
             mut reader,
             mut hardlinks,
@@ -783,6 +988,7 @@ impl<E: SyncPlanExecutor> SyncController<E> {
 
         let main_result: Result<()> = async {
             while let Some(record) = reader.next_record().await? {
+                self.check_active()?;
                 let operation = record.operation;
                 if operation.source().is_directory() {
                     continue;
@@ -926,7 +1132,10 @@ impl<E: SyncPlanExecutor> SyncController<E> {
             Ok(())
         }
         .await;
-        if let Err(error) = main_result {
+        if let Err(mut error) = main_result {
+            self.executor.cancel_mutations();
+            // Close endpoint/session admission before joining queued workers.
+            // Do not set the cancellation flag or replace the original failure.
             // Stop admitting work, but do not cancel an admitted transaction:
             // it may be crossing its publication point or awaiting blocking
             // filesystem work. Finish every worker before releasing session
@@ -935,10 +1144,16 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                 match result {
                     Ok(Ok(_)) => {}
                     Ok(Err(secondary)) => {
-                        tracing::warn!(error = %secondary, "additional sync worker failure")
+                        error = ControllerError::OwnedDrain {
+                            operation: Box::new(error),
+                            source: Box::new(secondary),
+                        };
                     }
                     Err(secondary) => {
-                        tracing::warn!(error = %secondary, "sync worker join failed while draining")
+                        error = ControllerError::OwnedDrain {
+                            operation: Box::new(error),
+                            source: Box::new(secondary),
+                        };
                     }
                 }
             }
@@ -950,6 +1165,7 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         if let Some(delete) = delete {
             let mut replay = delete.into_replay();
             while let Some(action) = replay.next_action().await? {
+                self.check_active()?;
                 self.executor
                     .execute_delete(action)
                     .await
@@ -959,6 +1175,7 @@ impl<E: SyncPlanExecutor> SyncController<E> {
         }
 
         while let Some(metadata) = finalize.next().await? {
+            self.check_active()?;
             let path = metadata.path.clone();
             self.executor
                 .execute_finalize(metadata)
@@ -971,10 +1188,12 @@ impl<E: SyncPlanExecutor> SyncController<E> {
                 checked_add(summary.finalized_metadata, 1, "finalized metadata")?;
         }
 
+        self.check_active()?;
         self.executor
             .finish_deferred_source_removals()
             .await
             .map_err(|error| ControllerError::backend("execution", error))?;
+        self.check_active()?;
 
         Ok(summary)
     }
@@ -988,7 +1207,16 @@ impl<E: SyncPlanExecutor> SyncController<E> {
     ) -> Result<FinalizeJournalReader> {
         let mut runtime_finalize = FinalizeJournal::new().await?;
         let mut next_directory = finalize.next_forward().await?;
+        let mut destination_prepared = false;
         while let Some(operation) = reader.next().await? {
+            self.check_active()?;
+            if !destination_prepared && matches!(operation, SyncOp::Create { .. }) {
+                self.executor
+                    .prepare_destination_for_create(operation.path())
+                    .await
+                    .map_err(|error| ControllerError::backend("destination acquisition", error))?;
+                destination_prepared = true;
+            }
             // Count the original semantic operations, not execution strategy
             // decisions or the second replay of the same authenticated records.
             record_semantic_operation(summary, &operation)?;
@@ -1245,6 +1473,14 @@ fn checked_add(value: u64, increment: u64, counter: &'static str) -> Result<u64>
         .ok_or(ControllerError::CounterOverflow(counter))
 }
 
+#[cfg(all(test, unix))]
+#[path = "controller/lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(all(test, unix))]
+#[path = "controller/removal_lifecycle_tests.rs"]
+mod removal_lifecycle_tests;
+
 #[cfg(test)]
 mod tests {
     use crate::remote::push::RemotePushExecutor;
@@ -1497,6 +1733,10 @@ mod tests {
 
         async fn finish_deferred_source_removals(&self) -> std::io::Result<()> {
             Ok(())
+        }
+
+        async fn close_source_removals(&self) -> std::io::Result<u64> {
+            Ok(0)
         }
 
         async fn remove_unchanged_source(

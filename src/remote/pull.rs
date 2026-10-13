@@ -181,6 +181,7 @@ pub struct RemotePullExecutor {
     destination_binding: tokio::sync::OnceCell<crate::rooted_fs::operand::BoundDestination>,
     remote: ClientRemoteHandle,
     sender: RouterSender,
+    run_admission: Arc<crate::endpoint::publication::PublicationAdmission>,
     scheduler: Scheduler,
     /// --backup: enabled flag, the destination-anchored backup directory
     /// (None = beside-the-file suffix backups), and the suffix.
@@ -222,6 +223,7 @@ impl RemotePullExecutor {
             destination_binding: tokio::sync::OnceCell::new(),
             remote,
             sender,
+            run_admission: Arc::new(crate::endpoint::publication::PublicationAdmission::default()),
             scheduler,
             backup: false,
             backup_dir: None,
@@ -278,6 +280,7 @@ impl RemotePullExecutor {
         }
         let mut root = binding.root.clone();
         root.bind_mutations(self.sender.publication_admission(), false);
+        root.bind_run_mutations(Arc::clone(&self.run_admission));
         let rooted = root.acquire_local().await?;
         let held = rooted.clone();
         tokio::task::spawn_blocking(move || held.verify_root_path_blocking())
@@ -370,6 +373,7 @@ impl RemotePullExecutor {
                 };
                 let mut rooted = rooted.clone();
                 rooted.bind_session_mutations(self.sender.publication_admission(), false);
+                rooted.bind_run_mutations(Arc::clone(&self.run_admission));
                 Ok::<_, RemotePullError>(rooted)
             })
             .await?;
@@ -1012,6 +1016,20 @@ fn staged_file_metadata(
 }
 
 impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
+    async fn prepare_destination_for_create(&self, create: &RelativePath) -> Result<()> {
+        self.acquire_destination_for_create(create).await
+    }
+
+    fn close_mutation_admission(&self) {
+        self.run_admission.close();
+    }
+
+    fn cancel_mutations(&self) {
+        self.close_mutation_admission();
+        self.sender
+            .fail(Arc::new(crate::remote::router::RouterError::ShuttingDown));
+    }
+
     type Action = RemotePullAction;
     type Error = RemotePullError;
 
@@ -1081,6 +1099,11 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePullExecutor {
             self.metadata_authority().await?;
         }
         Ok(())
+    }
+
+    async fn close_source_removals(&self) -> std::result::Result<u64, RemotePullError> {
+        // This protocol direction does not admit server SOURCE removal.
+        Ok(0)
     }
 
     /// Pulls have no local source to remove; parity skips are just skips.

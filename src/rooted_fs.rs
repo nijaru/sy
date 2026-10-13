@@ -239,6 +239,7 @@ pub type Result<T> = std::result::Result<T, RootedFsError>;
 #[derive(Clone)]
 pub struct RootedFs {
     mutation_admission: RootedMutationAdmission,
+    run_admission: Option<Arc<PublicationAdmission>>,
     // Local source runs reject a divergent configured name as well as retaining
     // the FD. Negotiated remote roots instead intentionally survive relocation.
     source_path_continuity: bool,
@@ -835,6 +836,7 @@ impl RootedNamespaceTransaction {
             RootedMutationAdmission::Session(admission) => Some(Arc::clone(admission)),
             _ => None,
         };
+        let run_admission = self.rooted.run_admission.clone();
         let retirement = Arc::clone(&self.rooted.retirement);
         // Only blocking workers acquire this lock; cancellation closes its
         // independent atomic admission state without waiting for native I/O.
@@ -849,6 +851,7 @@ impl RootedNamespaceTransaction {
         };
         let _permits = self.publish_blocking(
             session_admission.as_deref(),
+            run_admission.as_deref(),
             admission,
             lineage.as_deref_mut(),
             validate_source,
@@ -860,10 +863,11 @@ impl RootedNamespaceTransaction {
     fn publish_blocking<'a>(
         &mut self,
         session_admission: Option<&'a PublicationAdmission>,
+        run_admission: Option<&'a PublicationAdmission>,
         transaction_admission: Option<&'a PublicationAdmission>,
         mut lineage: Option<&mut RetirementLineage>,
         validate_source: impl Fn() -> Result<()>,
-    ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
+    ) -> Result<[Option<PublicationPermit<'a>>; 3]> {
         self.verify_parent_binding()?;
         self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
         #[cfg(test)]
@@ -939,7 +943,7 @@ impl RootedNamespaceTransaction {
         // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
         staging_check?;
-        let permits = admit_publication(session_admission, transaction_admission)?;
+        let permits = admit_publication(session_admission, run_admission, transaction_admission)?;
         #[cfg(test)]
         self.rooted
             .pause_mutation(PublicationPausePoint::AfterAdmission);
@@ -1194,14 +1198,20 @@ impl RootedNamespaceTransaction {
 #[cfg(unix)]
 fn admit_publication<'a>(
     session: Option<&'a PublicationAdmission>,
+    run: Option<&'a PublicationAdmission>,
     transaction: Option<&'a PublicationAdmission>,
-) -> Result<[Option<PublicationPermit<'a>>; 2]> {
-    // Each distinct authority must admit before any native effect. These are
-    // separate atomic admissions, not a combined CAS: closure cannot revoke an
-    // acquired permit, and failure of the second releases the first. A writer's
-    // cancellation must not close the session or be masked by its open state.
-    let transaction = transaction
-        .filter(|transaction| !session.is_some_and(|session| std::ptr::eq(session, *transaction)));
+) -> Result<[Option<PublicationPermit<'a>>; 3]> {
+    // Session, run and writer authorities each admit before any native effect.
+    // These are separate atomic admissions, not a combined CAS: closure cannot
+    // revoke an acquired permit; a failed later admission releases prior ones.
+    // Closing a run/writer must not close or be masked by a reusable session.
+    let run = run.filter(|run| !session.is_some_and(|session| std::ptr::eq(session, *run)));
+    let transaction = transaction.filter(|transaction| {
+        ![session, run]
+            .into_iter()
+            .flatten()
+            .any(|other| std::ptr::eq(other, *transaction))
+    });
     let admit = |admission: Option<&'a PublicationAdmission>| {
         admission
             .map(PublicationAdmission::admit)
@@ -1211,7 +1221,7 @@ fn admit_publication<'a>(
                 AdmissionError::Exhausted => RootedFsError::CommitAdmissionExhausted,
             })
     };
-    Ok([admit(session)?, admit(transaction)?])
+    Ok([admit(session)?, admit(run)?, admit(transaction)?])
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1260,11 +1270,41 @@ impl RootedFs {
         admission: Arc<PublicationAdmission>,
         read_only: bool,
     ) {
-        self.mutation_admission = if read_only {
-            RootedMutationAdmission::ReadOnly
-        } else {
-            RootedMutationAdmission::Session(admission)
-        };
+        // Binding a destination owner must never upgrade an existing read-only
+        // SOURCE authority into mutation permission.
+        self.mutation_admission =
+            if read_only || matches!(self.mutation_admission, RootedMutationAdmission::ReadOnly) {
+                RootedMutationAdmission::ReadOnly
+            } else {
+                RootedMutationAdmission::Session(admission)
+            };
+    }
+
+    /// A controller cutoff must not poison a reusable transport session.
+    pub(crate) fn bind_run_mutations(&mut self, admission: Arc<PublicationAdmission>) {
+        self.run_admission = Some(admission);
+    }
+
+    pub(crate) fn mutation_admission(&self) -> Option<Arc<PublicationAdmission>> {
+        match &self.mutation_admission {
+            RootedMutationAdmission::Session(admission) => Some(Arc::clone(admission)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn mutation_admission_closed(&self) -> bool {
+        if self
+            .run_admission
+            .as_ref()
+            .is_some_and(|run| run.is_closed())
+        {
+            return true;
+        }
+        match &self.mutation_admission {
+            RootedMutationAdmission::Session(admission) => admission.is_closed(),
+            RootedMutationAdmission::ReadOnly => true,
+            RootedMutationAdmission::Unrestricted => false,
+        }
     }
 
     fn require_writable(&self) -> Result<()> {
@@ -1275,7 +1315,7 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn admit_mutation_blocking(&self) -> Result<[Option<PublicationPermit<'_>>; 2]> {
+    fn admit_mutation_blocking(&self) -> Result<[Option<PublicationPermit<'_>>; 3]> {
         self.admit_mutation_with_transaction_blocking(None)
     }
 
@@ -1283,7 +1323,7 @@ impl RootedFs {
     fn admit_mutation_with_transaction_blocking<'a>(
         &'a self,
         transaction: Option<&'a PublicationAdmission>,
-    ) -> Result<[Option<PublicationPermit<'a>>; 2]> {
+    ) -> Result<[Option<PublicationPermit<'a>>; 3]> {
         self.require_writable()?;
         let session = match &self.mutation_admission {
             RootedMutationAdmission::Session(admission) => Some(admission.as_ref()),
@@ -1291,7 +1331,7 @@ impl RootedFs {
         };
         #[cfg(test)]
         self.pause_mutation(PublicationPausePoint::BeforeAdmission);
-        let permits = admit_publication(session, transaction)?;
+        let permits = admit_publication(session, self.run_admission.as_deref(), transaction)?;
         #[cfg(test)]
         self.pause_mutation(PublicationPausePoint::AfterAdmission);
         Ok(permits)
@@ -2010,6 +2050,7 @@ impl RootedFs {
             // An operator-selected external backup directory is another root,
             // not an exemption from the owning session's cancellation cutoff.
             backup_root.mutation_admission = self.mutation_admission.clone();
+            backup_root.run_admission = self.run_admission.clone();
             // An external backup can retire an inode with aliases beneath the
             // destination root too; namespace confinement differs, run ownership
             // of those exact native transitions does not.
@@ -2480,6 +2521,7 @@ impl RootedFs {
     fn from_operand_fd(root: PathBuf, root_fd: OwnedFd) -> Self {
         Self {
             mutation_admission: RootedMutationAdmission::Unrestricted,
+            run_admission: None,
             source_path_continuity: false,
             source_observations: Arc::new(std::sync::Mutex::new(Default::default())),
             #[cfg(test)]
@@ -5497,7 +5539,7 @@ mod tests {
             staged.seal_staging().unwrap();
             let mut lineage = rooted.retirement.lock().unwrap();
             staged
-                .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
+                .publish_blocking(None, None, None, Some(&mut lineage), || Ok(()))
                 .unwrap();
             // A writer can keep using its old directory FD after exchange.
             let mut child =

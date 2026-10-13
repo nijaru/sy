@@ -618,7 +618,7 @@ fn exchanged_old_cleanup_requires_ownership_for_directories_and_single_link_file
         namespace.seal_staging().unwrap();
         let mut lineage = rooted.retirement.lock().unwrap();
         namespace
-            .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
+            .publish_blocking(None, None, None, Some(&mut lineage), || Ok(()))
             .unwrap();
         std::fs::rename(private.join("contents"), root.path().join("old")).unwrap();
         std::fs::write(private.join("contents"), b"foreign").unwrap();
@@ -655,7 +655,7 @@ fn displaced_exchange_retirement_cannot_report_complete_cleanup() {
     let mut lineage = rooted.retirement.lock().unwrap();
     let _permits = staged
         .namespace
-        .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
+        .publish_blocking(None, None, None, Some(&mut lineage), || Ok(()))
         .unwrap();
     std::fs::rename(private.join("contents"), root.path().join("retained-old")).unwrap();
     assert!(matches!(
@@ -708,7 +708,7 @@ fn pending_publication_retains_sealed_fields_after_native_effect() {
     } = staged;
     let mut lineage = rooted.retirement.lock().unwrap();
     namespace
-        .publish_blocking(None, None, Some(&mut lineage), || Ok(()))
+        .publish_blocking(None, None, None, Some(&mut lineage), || Ok(()))
         .unwrap();
     // A same-inode edit after publication cannot be adopted by from_committed.
     // ctime may advance only around our own namespace effects, never here.

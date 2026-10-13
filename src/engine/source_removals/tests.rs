@@ -631,11 +631,11 @@ fn continuation_state_corruption_is_terminal_even_for_other_and_missing_keys() {
 
 #[cfg(unix)]
 #[test]
-fn non_h_aliases_replay_under_low_fd_limit_with_one_continuation_per_identity() {
-    const CHILD: &str = "SY_STANDALONE_REMOVAL_RESOURCE_CHILD";
+fn aliases_replay_under_low_fd_limit_with_one_continuation_per_identity() {
+    const CHILD: &str = "SY_REMOVAL_RESOURCE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let result = std::process::Command::new("sh").args([
-            "-c", "ulimit -n 32; exec \"$1\" --exact engine::source_removals::tests::non_h_aliases_replay_under_low_fd_limit_with_one_continuation_per_identity --nocapture", "source-removal-resource-test",
+            "-c", "ulimit -n 32; exec \"$1\" --exact engine::source_removals::tests::aliases_replay_under_low_fd_limit_with_one_continuation_per_identity --nocapture", "source-removal-resource-test",
         ]).arg(std::env::current_exe().unwrap()).env(CHILD, "1").output().unwrap();
         assert!(
             result.status.success(),
@@ -650,64 +650,80 @@ fn non_h_aliases_replay_under_low_fd_limit_with_one_continuation_per_identity() 
         .build()
         .unwrap()
         .block_on(async {
-            const ALIASES: usize = 256;
-            let source = tempfile::tempdir().unwrap();
-            std::fs::write(source.path().join("member-0"), b"same").unwrap();
-            for n in 1..ALIASES {
-                std::fs::hard_link(
-                    source.path().join("member-0"),
-                    source.path().join(format!("member-{n}")),
-                )
-                .unwrap();
-            }
-            let root = SourceRoot::open(source.path().into()).await.unwrap();
-            let destination = tempfile::tempdir().unwrap();
-            let dest = RootedFs::open(destination.path().into()).await.unwrap();
-            let journal = SourceRemovalJournal::default();
-            for n in 0..ALIASES {
-                let name = format!("member-{n}");
-                let entry = observed(&root, &name);
-                assert!(entry.hardlink_group.is_none());
-                journal
-                    .append_published(&entry, &published(&dest, &entry, &name))
+            use futures::TryStreamExt;
+            for grouped in [false, true] {
+                let aliases = if grouped { 2_048 } else { 256 };
+                let source = tempfile::tempdir().unwrap();
+                std::fs::write(source.path().join("member-0"), b"same").unwrap();
+                for n in 1..aliases {
+                    std::fs::hard_link(
+                        source.path().join("member-0"),
+                        source.path().join(format!("member-{n}")),
+                    )
+                    .unwrap();
+                }
+                let root = SourceRoot::open(source.path().into()).await.unwrap();
+                let destination = tempfile::tempdir().unwrap();
+                let dest = RootedFs::open(destination.path().into()).await.unwrap();
+                let journal = SourceRemovalJournal::default();
+                // Complete the scan before journal work: this fixture permits
+                // one blocking worker, also owned by the bounded scan producer.
+                let entries: Vec<_> = root
+                    .entries(crate::engine::scan::ScanRequest {
+                        metadata: crate::engine::scan::EntryMetadataRequest {
+                            hardlink_group: grouped,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                    .try_collect()
                     .await
                     .unwrap();
-            }
-            // Exercise the full authenticated gates and actual standalone public API.
-            assert_eq!(
-                journal
-                    .replay(root, |proof| std::future::ready(validate(proof, &dest)))
-                    .await
-                    .unwrap(),
-                ALIASES as u64
-            );
-            assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 0);
-            assert_eq!(
-                std::fs::read_dir(destination.path()).unwrap().count(),
-                ALIASES
-            );
-
-            // The native state file grows by identities, not by alias removals.
-            std::fs::write(source.path().join("member-0"), b"same").unwrap();
-            for n in 1..ALIASES {
-                std::fs::hard_link(
-                    source.path().join("member-0"),
-                    source.path().join(format!("member-{n}")),
-                )
-                .unwrap();
-            }
-            let root = SourceRoot::open(source.path().into()).await.unwrap();
-            crate::rooted_fs::test_source::scan(&root.rooted()).await;
-            let original = observed(&root, "member-0");
-            let mut native = NativeState::new(root).unwrap();
-            for n in 0..ALIASES {
-                let mut entry = original.clone();
-                entry.path = rel(&format!("member-{n}"));
-                native = native.remove(&entry).unwrap();
+                for entry in &entries {
+                    let name = entry.path.as_path().to_str().unwrap();
+                    assert_eq!(entry.hardlink_group.is_some(), grouped);
+                    journal
+                        .append_published(entry, &published(&dest, entry, name))
+                        .await
+                        .unwrap();
+                }
+                drop(entries);
+                // Both selection modes exercise the same authenticated gates and owner.
                 assert_eq!(
-                    native.states.file.metadata().unwrap().len(),
-                    STATE_RECORD_BYTES as u64
+                    journal
+                        .replay(root, |proof| std::future::ready(validate(proof, &dest)))
+                        .await
+                        .unwrap(),
+                    aliases as u64
                 );
+                assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 0);
+                assert_eq!(
+                    std::fs::read_dir(destination.path()).unwrap().count(),
+                    aliases
+                );
+
+                // The native state file grows by identities, not by alias removals.
+                std::fs::write(source.path().join("member-0"), b"same").unwrap();
+                for n in 1..aliases {
+                    std::fs::hard_link(
+                        source.path().join("member-0"),
+                        source.path().join(format!("member-{n}")),
+                    )
+                    .unwrap();
+                }
+                let root = SourceRoot::open(source.path().into()).await.unwrap();
+                crate::rooted_fs::test_source::scan(&root.rooted()).await;
+                let original = observed(&root, "member-0");
+                let mut native = NativeState::new(root).unwrap();
+                for n in 0..aliases {
+                    let mut entry = original.clone();
+                    entry.path = rel(&format!("member-{n}"));
+                    native = native.remove(&entry).unwrap();
+                    assert_eq!(
+                        native.states.file.metadata().unwrap().len(),
+                        STATE_RECORD_BYTES as u64
+                    );
+                }
             }
         });
 }

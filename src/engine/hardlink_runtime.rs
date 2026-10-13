@@ -57,10 +57,6 @@ impl<'a> HardlinkGroupPlan<'a> {
         })
     }
 
-    pub(crate) const fn key(&self) -> [u8; 32] {
-        self.group
-    }
-
     pub(crate) async fn members(&self) -> Result<GroupCursor<'a>, GroupError> {
         Ok(GroupCursor {
             cursor: self.catalogue.members(self.group).await?,

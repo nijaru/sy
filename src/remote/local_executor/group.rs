@@ -154,7 +154,6 @@ impl LocalSyncExecutor {
                     group.confirm_member(&member, &proof).await?;
                     if let Some((source_fingerprint, destination_fingerprint)) = fingerprints {
                         self.defer_verified_noop(
-                            group.key(),
                             member.source(),
                             old,
                             source_fingerprint,
@@ -388,7 +387,6 @@ impl LocalSyncExecutor {
         }
         let mut members = group.members().await?;
         let finalized = Arc::new(finalized);
-        let mut publication = None;
         while let Some(member) = members.next().await? {
             self.check_source_identity(member.source()).await?;
             let proof = joined({
@@ -410,7 +408,6 @@ impl LocalSyncExecutor {
             })
             .await?;
             group.confirm_member(&member, &proof).await?;
-            publication.get_or_insert(proof.clone());
             if parity && self.remove_source_files {
                 let receipt = PublishedDestinationReceipt::for_file(
                     member.source().path.clone(),
@@ -419,7 +416,7 @@ impl LocalSyncExecutor {
                     &crate::endpoint::io::VerificationStatus::Verified,
                     proof,
                 );
-                self.defer_grouped_source_removal(group.key(), &receipt, member.source())
+                self.remove_committed_source(&receipt, member.source())
                     .await?;
             }
         }
@@ -434,28 +431,11 @@ impl LocalSyncExecutor {
             }
         })
         .await?;
-        if self.remove_source_files && parity {
-            let proof = publication.ok_or(GroupError::Invalid("group has no final publication"))?;
-            self.hardlink_groups
-                .lock()
-                .await
-                .insert(
-                    group.key(),
-                    HardlinkRepresentative {
-                        path: proof.path,
-                        publication: proof.identity,
-                        unix_mode: Some(mode),
-                        modified,
-                    },
-                )
-                .await?;
-        }
         Ok(())
     }
 
     async fn defer_verified_noop(
         &self,
-        group: [u8; 32],
         source: &Entry,
         destination: &Entry,
         mut source_proof: existing::ExistingFingerprint,
@@ -486,9 +466,15 @@ impl LocalSyncExecutor {
         destination_proof.binding = destination_binding;
         match existing::receipt(source, destination, source_proof, destination_proof) {
             Ok(receipt) => {
-                self.hardlink_removals
-                    .append_existing(group, source, &receipt)
-                    .await?;
+                self.source_removals
+                    .append_existing(source, &receipt)
+                    .await
+                    .map_err(|error| {
+                        LocalSyncError::Source(
+                            self.source_path(&source.path),
+                            std::io::Error::other(error),
+                        )
+                    })?;
                 Ok(())
             }
             Err(ExistingDestinationError::ContentMismatch(_)) => Ok(()),

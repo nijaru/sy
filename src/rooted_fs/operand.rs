@@ -47,6 +47,13 @@ impl PendingRoot {
 }
 
 impl DestinationRoot {
+    pub(crate) fn bind_run_mutations(&mut self, admission: Arc<PublicationAdmission>) {
+        match self {
+            Self::Present(rooted) => rooted.bind_run_mutations(admission),
+            Self::Pending(pending) => pending.ancestor.bind_run_mutations(admission),
+        }
+    }
+
     pub(crate) fn bind_mutations(&mut self, admission: Arc<PublicationAdmission>, read_only: bool) {
         match self {
             Self::Present(rooted) => rooted.bind_session_mutations(admission, read_only),
@@ -413,6 +420,7 @@ impl PendingRoot {
         }
         let mut rooted = RootedFs::from_operand_fd(self.path, fd);
         rooted.mutation_admission = self.ancestor.mutation_admission;
+        rooted.run_admission = self.ancestor.run_admission;
         Ok(rooted)
     }
 }

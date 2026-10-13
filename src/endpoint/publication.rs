@@ -22,6 +22,12 @@ impl PublicationAdmission {
         self.state.fetch_or(CLOSED, Ordering::AcqRel);
     }
 
+    /// Control-flow hint only. Native effects still require admit() after their
+    /// mandatory late checks; an open snapshot never grants mutation authority.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state.load(Ordering::Acquire) & CLOSED != 0
+    }
+
     pub(crate) fn admit(&self) -> Result<PublicationPermit<'_>, AdmissionError> {
         // Both operations modify this same atomic word. A successful increment
         // precedes closure or observes it and fails; separate snapshot checks

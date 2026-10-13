@@ -100,7 +100,7 @@ pub enum RemotePushError {
     MissingDestinationIdentity(PathBuf),
 
     #[error("failed to remove committed source {0}: {1}")]
-    SourceRemoval(PathBuf, std::io::Error),
+    SourceRemoval(PathBuf, #[source] std::io::Error),
 
     #[error("--backup location for {0} is not representable beneath the destination root")]
     InvalidBackupPath(PathBuf),
@@ -421,8 +421,8 @@ pub struct RemotePushExecutor {
     /// -z/--compress: chunk compression policy for file transfers.
     compression: Option<CompressionPolicy>,
     hardlinks: bool,
-    hardlink_removals: group::DeferredSourceRemovals,
     source_removals: crate::engine::source_removals::SourceRemovalJournal,
+    run_admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
     /// -X/--preserve-xattrs: mirror the local source's extended attributes
     /// onto the remote destination for every entry the executor creates or
     /// updates. Symlinks are skipped (their attributes are not portable).
@@ -506,17 +506,29 @@ impl crate::engine::controller::SyncPlanExecutor for RemotePushExecutor {
         RemotePushExecutor::finish_deferred_source_removals(self).await
     }
 
-    async fn close_source_removals(&self) -> std::result::Result<(), RemotePushError> {
-        self.source_removals
-            .close()
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                RemotePushError::SourceRemoval(
-                    self.source_root.path().to_path_buf(),
-                    std::io::Error::other(error),
-                )
-            })
+    async fn prepare_destination_for_create(&self, create: &RelativePath) -> Result<()> {
+        self.remote.acquire_root_for_create(create).await?;
+        Ok(())
+    }
+
+    fn close_mutation_admission(&self) {
+        self.run_admission.close();
+    }
+
+    fn cancel_mutations(&self) {
+        self.close_mutation_admission();
+        self.remote.sender().fail(std::sync::Arc::new(
+            crate::remote::router::RouterError::ShuttingDown,
+        ));
+    }
+
+    async fn close_source_removals(&self) -> std::result::Result<u64, RemotePushError> {
+        self.source_removals.close().await.map_err(|error| {
+            RemotePushError::SourceRemoval(
+                self.source_root.path().to_path_buf(),
+                std::io::Error::other(error),
+            )
+        })
     }
 
     async fn remove_unchanged_source(
@@ -546,8 +558,10 @@ impl RemotePushExecutor {
             backup: None,
             compression: None,
             hardlinks: false,
-            hardlink_removals: group::DeferredSourceRemovals::default(),
             source_removals: crate::engine::source_removals::SourceRemovalJournal::default(),
+            run_admission: std::sync::Arc::new(
+                crate::endpoint::publication::PublicationAdmission::default(),
+            ),
             xattrs: false,
             acls: false,
             bsd_flags: false,
@@ -854,29 +868,35 @@ impl RemotePushExecutor {
     }
 
     async fn finish_deferred_source_removals(&self) -> Result<()> {
-        self.hardlink_removals.replay(self).await?;
         self.source_removals
-            .replay(self.source_root.clone(), |proof| async move {
-                match proof {
-                    crate::engine::source_removals::SourceDestinationProof::Published(proof) => {
-                        self.remote
-                            .revalidate_publication(&proof)
-                            .await
-                            .map_err(std::io::Error::other)?;
+            .replay(
+                self.source_root
+                    .for_removal(self.remote.sender().publication_admission())
+                    .with_run_admission(std::sync::Arc::clone(&self.run_admission)),
+                |proof| async move {
+                    match proof {
+                        crate::engine::source_removals::SourceDestinationProof::Published(
+                            proof,
+                        ) => {
+                            self.remote
+                                .revalidate_publication(&proof)
+                                .await
+                                .map_err(std::io::Error::other)?;
+                        }
+                        crate::engine::source_removals::SourceDestinationProof::Existing {
+                            path,
+                            identity,
+                            ..
+                        } => {
+                            self.remote
+                                .revalidate_existing_destination(&path, identity)
+                                .await
+                                .map_err(std::io::Error::other)?;
+                        }
                     }
-                    crate::engine::source_removals::SourceDestinationProof::Existing {
-                        path,
-                        identity,
-                        ..
-                    } => {
-                        self.remote
-                            .revalidate_existing_destination(&path, identity)
-                            .await
-                            .map_err(std::io::Error::other)?;
-                    }
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
             .await
             .map(|_| ())
             .map_err(|error| {

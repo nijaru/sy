@@ -342,25 +342,11 @@ async fn execute_bound(
         return Ok(stats);
     }
 
-    let mut create = None;
-    plan.validate_operations(|operation| {
-        if create.is_none() && matches!(operation, sy::engine::domain::SyncOp::Create { .. }) {
-            create = Some(operation.path().clone());
-        }
-        futures::future::ready(Ok(()))
-    })
-    .await
-    .map_err(map_controller_error)?;
-    if let Some(create) = create {
-        executor
-            .acquire_destination_for_create(&create)
-            .await
-            .map_err(map_io)?;
-    }
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
-    let summary: SyncSummary = SyncController::new(executor, max_in_flight)
-        .execute(plan)
+    let controller = SyncController::new(executor, max_in_flight);
+    let summary: SyncSummary = controller
+        .execute_until(plan, tokio::signal::ctrl_c())
         .await
         .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;

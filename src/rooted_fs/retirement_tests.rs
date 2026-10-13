@@ -111,11 +111,7 @@ fn observed_metadata_uses_exact_retirements_without_adopting_foreign_changes() {
         if foreign_edit {
             held.set_xattr("user.sy-foreign", b"foreign").unwrap();
         }
-        let proof = crate::engine::hardlink_removals::GroupDestinationProof::Existing {
-            path: b.clone(),
-            identity: scanned,
-        };
-        let parity = proof.revalidate_blocking(&rooted);
+        let parity = rooted.verify_retired_destination_blocking(&b, EntryKind::File, scanned);
         let attrs = rooted.read_observed_xattrs_blocking(&b, EntryKind::File, scanned);
         #[cfg(target_os = "macos")]
         let flags = rooted.read_observed_bsd_flags_blocking(&b, EntryKind::File, scanned);
@@ -161,7 +157,7 @@ fn observed_metadata_uses_exact_retirements_without_adopting_foreign_changes() {
             // A later metadata edit is not an old-inode retirement and cannot
             // be adopted by replaying the original scanned parity proof.
             assert!(matches!(
-                proof.revalidate_blocking(&rooted),
+                rooted.verify_retired_destination_blocking(&b, EntryKind::File, scanned),
                 Err(RootedFsError::DestinationChanged(_))
             ));
         }

@@ -2,7 +2,6 @@
 use super::*;
 use crate::engine::hardlink_runtime::intent::{destination, GroupIntent};
 use crate::engine::hardlink_runtime::HardlinkGroupPlan;
-use crate::engine::plan_journal::{PlanJournal, PlanJournalReader};
 use crate::engine::work::{TransferSummary, WorkResult};
 use crate::protocol::{
     WireEntryKind, WireFetchCompression, WireFileBegin, WireGroupMember, WireGroupOpen,
@@ -379,9 +378,25 @@ impl RemotePushExecutor {
             if parity && Some(final_identity) != first.source().identity {
                 let mut members = group.members().await.map_err(failure)?;
                 while let Some(member) = members.next().await.map_err(failure)? {
-                    self.hardlink_removals
-                        .append(&member, final_identity, ready.size)
-                        .await?;
+                    let receipt = crate::endpoint::PublishedDestinationReceipt::for_file(
+                        member.source().path.clone(),
+                        member.path().clone(),
+                        member.source().identity,
+                        &crate::endpoint::io::VerificationStatus::Verified,
+                        PublishedFileProof {
+                            path: member.path().clone(),
+                            identity: final_identity,
+                        },
+                    );
+                    self.source_removals
+                        .append_published(member.source(), &receipt)
+                        .await
+                        .map_err(|error| {
+                            RemotePushError::SourceRemoval(
+                                self.source_root.path().to_path_buf(),
+                                std::io::Error::other(error),
+                            )
+                        })?;
                 }
             }
             Ok(())
@@ -389,123 +404,6 @@ impl RemotePushExecutor {
         .await;
         completion.map_err(|error| RemotePushError::SourceCompletionUncertain(Box::new(error)))
     }
-}
-
-/// Authenticated exact final bindings, never a representative/count approval.
-/// The controller calls replay only after all work and finalization succeed.
-#[derive(Default)]
-pub(super) struct DeferredSourceRemovals(tokio::sync::Mutex<Option<PlanJournal>>);
-
-impl DeferredSourceRemovals {
-    async fn append(&self, member: &SyncOp, identity: EntryIdentity, size: u64) -> Result<()> {
-        let mut state = self.0.lock().await;
-        if state.is_none() {
-            *state = Some(PlanJournal::new().await.map_err(failure)?);
-        }
-        let mut destination = Entry::file(member.path().clone(), size, member.source().modified);
-        destination.identity = Some(identity);
-        state
-            .as_mut()
-            .ok_or_else(|| invalid("missing removal journal"))?
-            .append(&SyncOp::Update {
-                source: member.source().clone(),
-                destination,
-            })
-            .await
-            .map_err(failure)?;
-        Ok(())
-    }
-
-    pub(super) async fn replay(&self, executor: &RemotePushExecutor) -> Result<()> {
-        let Some(journal) = self.0.lock().await.take() else {
-            return Ok(());
-        };
-        let mut reader = journal.seal().await.map_err(failure)?;
-        // Every selected destination and every original source must pass before
-        // ANY unlink. Late changes or failed ACKs cannot grant partial approval.
-        while let Some(member) = reader.next().await.map_err(failure)? {
-            let old = destination(&member).ok_or_else(|| invalid("missing final binding"))?;
-            executor
-                .remote
-                .revalidate_existing_destination(
-                    &old.path,
-                    old.identity
-                        .ok_or_else(|| invalid("missing final identity"))?,
-                )
-                .await?;
-            executor.check_source_identity(member.source()).await?;
-        }
-        reader.rewind().map_err(failure)?;
-        native({
-            let root = executor.source_root.clone();
-            move || remove_all(root, reader)
-        })
-        .await
-    }
-}
-
-fn remove_all(
-    root: crate::endpoint::source_root::SourceRoot,
-    mut reader: PlanJournalReader,
-) -> Result<()> {
-    // The reader's async native I/O is driven from this dedicated blocking
-    // worker; no syscall or unlink runs on a Tokio worker thread.
-    tokio::runtime::Handle::current().block_on(async move {
-        let rooted = root.rooted();
-        // Recheck the entire original selection at the last local barrier,
-        // rather than discovering a stale later member after earlier unlinks.
-        root.validate_blocking()?;
-        while let Some(member) = reader.next().await.map_err(failure)? {
-            let source = member.source();
-            rooted.validate_hardlink_source_member_blocking(
-                &source.path,
-                source
-                    .identity
-                    .ok_or_else(|| invalid("missing source identity"))?,
-            )?;
-        }
-        root.validate_blocking()?;
-        reader.rewind().map_err(failure)?;
-        let mut index = crate::engine::disk_radix::DiskRadix::new()?;
-        let mut states = tempfile::tempfile()?;
-        use std::io::{Read, Write};
-        while let Some(member) = reader.next().await.map_err(failure)? {
-            root.validate_blocking()?;
-            let source = member.source();
-            let key = *source
-                .hardlink_group
-                .ok_or_else(|| invalid("missing selected group"))?
-                .as_bytes();
-            let offset = index.get(key)?;
-            let expected = if let Some(offset) = offset {
-                states.seek(SeekFrom::Start(offset))?;
-                let mut bytes = [0; crate::rooted_fs::HardlinkSourceState::ENCODED_BYTES];
-                states.read_exact(&mut bytes)?;
-                Some(crate::rooted_fs::HardlinkSourceState::decode(&bytes)?)
-            } else {
-                None
-            };
-            let updated = rooted.remove_hardlink_source_member_blocking(
-                &source.path,
-                source
-                    .identity
-                    .ok_or_else(|| invalid("missing source identity"))?,
-                expected.as_ref(),
-            )?;
-            // Only the state returned AFTER this owned unlink advances lineage.
-            let offset = match offset {
-                Some(offset) => offset,
-                None => states.seek(SeekFrom::End(0))?,
-            };
-            states.seek(SeekFrom::Start(offset))?;
-            states.write_all(&updated.encode())?;
-            if index.get(key)?.is_none() {
-                index.insert(key, offset)?;
-            }
-            root.validate_blocking()?;
-        }
-        Ok(())
-    })
 }
 
 #[cfg(all(test, unix))]

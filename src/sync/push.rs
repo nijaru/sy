@@ -297,23 +297,6 @@ async fn execute_bound(
     } else {
         None
     };
-    if remote.binding().pending {
-        let mut create = None;
-        plan.validate_operations(|operation| {
-            if create.is_none() && matches!(operation, sy::engine::domain::SyncOp::Create { .. }) {
-                create = Some(operation.path().clone());
-            }
-            futures::future::ready(Ok(()))
-        })
-        .await
-        .map_err(map_controller_error)?;
-        if let Some(create) = create {
-            remote
-                .acquire_root_for_create(&create)
-                .await
-                .map_err(map_io)?;
-        }
-    }
     let executor = RemotePushExecutor::new(
         source_authority,
         remote,
@@ -330,8 +313,9 @@ async fn execute_bound(
     .with_reporter(Some(reporter.clone()));
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = std::time::Instant::now();
-    let summary = SyncController::new(executor, max_in_flight)
-        .execute(plan)
+    let controller = SyncController::new(executor, max_in_flight);
+    let summary = controller
+        .execute_until(plan, tokio::signal::ctrl_c())
         .await
         .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;

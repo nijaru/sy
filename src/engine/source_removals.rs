@@ -1,4 +1,5 @@
-//! Deferred standalone source removal, after the caller's main-work finalization.
+//! Deferred source removal for standalone and hardlink-group members, after
+//! the caller's main-work finalization.
 //!
 //! Eligibility is authenticated by the original PlanJournal append seals. No
 //! destination proof is minted from a fresh scan or a replay scratch checksum.
@@ -122,7 +123,7 @@ pub(crate) enum RemovalCause {
     Receipt(#[from] crate::error::SyncError),
     #[error(transparent)]
     Existing(#[from] ExistingDestinationError),
-    #[error(transparent)]
+    #[error("{0}")]
     Rooted(#[from] RootedFsError),
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -352,6 +353,8 @@ impl SourceRemovalJournal {
     }
 
     /// Call only after ALL required controller/main-work finalization succeeds.
+    /// Standalone and finalized group receipts share this exact gate, native
+    /// continuation state, and run-wide confirmed-unlink count.
     /// All recorded destination and original source names pass before any unlink.
     /// Late native checks still detect races; failure can leave partial removal.
     /// If this future is cancelled, call close() to join all admitted work.
@@ -414,6 +417,12 @@ impl SourceRemovalJournal {
                     native.remove(&source).map(|native| (native, None))
                 })
                 .await?;
+        }
+        // A last admitted unlink can complete after cutoff. Keep its confirmed
+        // count visible rather than reporting a cancelled removal as retention
+        // or discarding its outcome just because no later candidate exists.
+        if native.root.rooted().mutation_admission_closed() {
+            return Err(native.error(RemovalCause::Terminal, false));
         }
         Ok(native.removed)
     }
@@ -587,15 +596,23 @@ impl NativeState {
                 .map_err(|e| self.error(e, false))?;
             let updated = rooted
                 .remove_hardlink_source_member_blocking(&source.path, identity, expected.as_ref())
-                .map_err(|e| self.error(e, true))?;
+                .map_err(|e| {
+                    let uncertain = !matches!(e, RootedFsError::CommitCancelled);
+                    self.error(e, uncertain)
+                })?;
             // Count the native effect BEFORE any fallible continuation-state I/O.
             self.removed = next;
             self.states
                 .set(*identity.as_bytes(), updated)
                 .map_err(|e| self.error(e, false))?;
         } else {
-            existing::remove_observed_source_blocking(&rooted, source)
-                .map_err(|e| self.error(e, true))?;
+            existing::remove_observed_source_blocking(&rooted, source).map_err(|e| {
+                let uncertain = !matches!(
+                    e,
+                    ExistingDestinationError::Rooted(RootedFsError::CommitCancelled)
+                );
+                self.error(e, uncertain)
+            })?;
             self.removed = next;
         }
         Ok(self)

@@ -21,8 +21,10 @@ use std::os::unix::fs::MetadataExt;
 pub struct LocalEndpoint {
     root: PathBuf,
     capabilities: Capabilities,
-    publication: Option<std::sync::Arc<crate::endpoint::publication::PublicationAdmission>>,
+    publication: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
+    run_admission: Option<std::sync::Arc<crate::endpoint::publication::PublicationAdmission>>,
     rooted: std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<sy::rooted_fs::RootedFs>>>,
+    binding: std::sync::Arc<tokio::sync::OnceCell<sy::rooted_fs::operand::DestinationRoot>>,
 }
 
 impl LocalEndpoint {
@@ -35,8 +37,12 @@ impl LocalEndpoint {
         Self {
             root,
             capabilities: Capabilities::local(),
-            publication: None,
+            publication: std::sync::Arc::new(
+                crate::endpoint::publication::PublicationAdmission::default(),
+            ),
+            run_admission: None,
             rooted: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            binding: std::sync::Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -44,14 +50,85 @@ impl LocalEndpoint {
         mut self,
         admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
     ) -> Self {
-        self.publication = Some(admission);
+        self.publication = admission;
+        if let Some(binding) = self.binding.get() {
+            let mut binding = binding.clone();
+            binding.bind_mutations(self.publication_admission(), false);
+            self.binding = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(binding)));
+        }
+        if let Some(rooted) = self.rooted.get() {
+            let mut rooted = (**rooted).clone();
+            rooted.bind_session_mutations(
+                self.publication_admission(),
+                rooted.is_local_source_authority(),
+            );
+            self.rooted = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
+                std::sync::Arc::new(rooted),
+            )));
+        }
         self
     }
 
-    pub(crate) fn with_rooted_authority(mut self, rooted: sy::rooted_fs::RootedFs) -> Self {
+    pub(crate) fn with_run_admission(
+        mut self,
+        admission: std::sync::Arc<crate::endpoint::publication::PublicationAdmission>,
+    ) -> Self {
+        if let Some(binding) = self.binding.get() {
+            let mut binding = binding.clone();
+            binding.bind_run_mutations(std::sync::Arc::clone(&admission));
+            self.binding = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(binding)));
+        }
+        if let Some(rooted) = self.rooted.get() {
+            let mut rooted = (**rooted).clone();
+            rooted.bind_run_mutations(std::sync::Arc::clone(&admission));
+            self.rooted = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
+                std::sync::Arc::new(rooted),
+            )));
+        }
+        self.run_admission = Some(admission);
+        self
+    }
+
+    pub(crate) fn publication_admission(
+        &self,
+    ) -> std::sync::Arc<crate::endpoint::publication::PublicationAdmission> {
+        std::sync::Arc::clone(&self.publication)
+    }
+
+    pub(crate) fn with_rooted_authority(mut self, mut rooted: sy::rooted_fs::RootedFs) -> Self {
+        // A supplied native owner is authoritative (not a reason to create a
+        // fresh open gate). The explicit builder above can bind a run/router.
+        if let Some(admission) = rooted.mutation_admission() {
+            self.publication = admission;
+        }
+        rooted.bind_session_mutations(
+            self.publication_admission(),
+            rooted.is_local_source_authority(),
+        );
+        if let Some(admission) = &self.run_admission {
+            rooted.bind_run_mutations(std::sync::Arc::clone(admission));
+        }
+        self.binding = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
+            sy::rooted_fs::operand::DestinationRoot::Present(rooted.clone()),
+        )));
         self.rooted = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(
             std::sync::Arc::new(rooted),
         )));
+        self
+    }
+
+    pub(crate) fn with_destination_authority(
+        mut self,
+        mut authority: sy::rooted_fs::operand::DestinationRoot,
+    ) -> Self {
+        if let sy::rooted_fs::operand::DestinationRoot::Present(rooted) = authority {
+            return self.with_rooted_authority(rooted);
+        }
+        authority.bind_mutations(self.publication_admission(), false);
+        if let Some(admission) = &self.run_admission {
+            authority.bind_run_mutations(std::sync::Arc::clone(admission));
+        }
+        self.binding = std::sync::Arc::new(tokio::sync::OnceCell::new_with(Some(authority)));
         self
     }
 
@@ -64,16 +141,43 @@ impl LocalEndpoint {
         &self,
         create_root: bool,
     ) -> Result<std::sync::Arc<sy::rooted_fs::RootedFs>> {
+        // Cache initial absence through its held ancestor too. A later Create
+        // must acquire that original pending authority, never classify a fresh
+        // replacement of an ancestor after preflight.
+        let binding = self
+            .binding
+            .get_or_try_init(|| async {
+                let mut authority = sy::rooted_fs::operand::BoundDestination::open(
+                    self.root.clone(),
+                    sy::rooted_fs::operand::SourceShape::Directory { basename: None },
+                )
+                .await
+                .map_err(map_rooted_fs_error)?
+                .root;
+                authority.bind_mutations(self.publication_admission(), false);
+                if let Some(admission) = &self.run_admission {
+                    authority.bind_run_mutations(std::sync::Arc::clone(admission));
+                }
+                Ok::<_, SyncError>(authority)
+            })
+            .await?;
         let rooted = self
             .rooted
-            .get_or_try_init(|| async move {
-                let root = self.root.clone();
-                if create_root {
-                    tokio::fs::create_dir_all(&root).await?;
-                }
-                let rooted = sy::rooted_fs::RootedFs::open(root)
-                    .await
-                    .map_err(map_rooted_fs_error)?;
+            .get_or_try_init(|| async {
+                let rooted = if create_root {
+                    binding
+                        .clone()
+                        .acquire_local()
+                        .await
+                        .map_err(map_rooted_fs_error)?
+                } else {
+                    match binding {
+                        sy::rooted_fs::operand::DestinationRoot::Present(rooted) => rooted.clone(),
+                        sy::rooted_fs::operand::DestinationRoot::Pending(_) => {
+                            return Err(SyncError::Io(std::io::ErrorKind::NotFound.into()));
+                        }
+                    }
+                };
                 Ok::<_, SyncError>(std::sync::Arc::new(rooted))
             })
             .await?;
@@ -91,7 +195,7 @@ impl LocalEndpoint {
             .map_err(|error| SyncError::Config(error.to_string()))
     }
 
-    async fn read_preservation_metadata<T: Send + 'static>(
+    async fn with_observed_entry<T: Send + 'static>(
         &self,
         path: &Path,
         read: impl FnOnce(
@@ -1082,10 +1186,7 @@ impl Endpoint for LocalEndpoint {
         #[cfg(unix)]
         {
             return self
-                .read_preservation_metadata(
-                    path,
-                    sy::rooted_fs::RootedFs::read_observed_xattrs_blocking,
-                )
+                .with_observed_entry(path, sy::rooted_fs::RootedFs::read_observed_xattrs_blocking)
                 .await;
         }
 
@@ -1101,11 +1202,27 @@ impl Endpoint for LocalEndpoint {
     async fn write_xattrs(&self, path: &Path, xattrs: &[(OsString, Vec<u8>)]) -> Result<()> {
         #[cfg(unix)]
         {
-            let full_path = self.resolve(path);
             let xattrs = xattrs.to_vec();
-            return tokio::task::spawn_blocking(move || write_xattrs_blocking(&full_path, &xattrs))
-                .await
-                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return self
+                .with_observed_entry(path, move |rooted, path, kind, identity| {
+                    if kind == sy::engine::domain::EntryKind::Directory {
+                        return Err(sy::rooted_fs::RootedFsError::UnobservedDirectoryMutation);
+                    }
+                    rooted
+                        .apply_observed_preservation_blocking(
+                            path,
+                            kind,
+                            identity,
+                            None,
+                            None,
+                            &sy::rooted_fs::MetadataPreservation {
+                                xattrs: Some(&xattrs),
+                                ..Default::default()
+                            },
+                        )
+                        .map(|_| ())
+                })
+                .await;
         }
 
         #[cfg(not(unix))]
@@ -1121,10 +1238,7 @@ impl Endpoint for LocalEndpoint {
         #[cfg(all(unix, feature = "acl"))]
         {
             return self
-                .read_preservation_metadata(
-                    path,
-                    sy::rooted_fs::RootedFs::read_observed_acl_blocking,
-                )
+                .with_observed_entry(path, sy::rooted_fs::RootedFs::read_observed_acl_blocking)
                 .await;
         }
 
@@ -1140,23 +1254,27 @@ impl Endpoint for LocalEndpoint {
     async fn write_acl(&self, path: &Path, acl: &str) -> Result<()> {
         #[cfg(all(unix, feature = "acl"))]
         {
-            let relative = self.relative_path(path)?;
-            let rooted = self.rooted_fs(false).await?;
-            let acl = acl.to_owned();
-            return tokio::task::spawn_blocking(move || {
-                rooted
-                    .verify_root_path_blocking()
-                    .map_err(map_rooted_fs_error)?;
-                let (kind, _) = rooted
-                    .path_identity_blocking(&relative)
-                    .map_err(map_rooted_fs_error)?
-                    .ok_or_else(|| SyncError::Io(std::io::ErrorKind::NotFound.into()))?;
-                rooted
-                    .write_acl_blocking(&relative, kind, &acl)
-                    .map_err(map_rooted_fs_error)
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            let acl = acl.to_string();
+            return self
+                .with_observed_entry(path, move |rooted, path, kind, identity| {
+                    if kind == sy::engine::domain::EntryKind::Directory {
+                        return Err(sy::rooted_fs::RootedFsError::UnobservedDirectoryMutation);
+                    }
+                    rooted
+                        .apply_observed_preservation_blocking(
+                            path,
+                            kind,
+                            identity,
+                            None,
+                            None,
+                            &sy::rooted_fs::MetadataPreservation {
+                                acl: Some(&acl),
+                                ..Default::default()
+                            },
+                        )
+                        .map(|_| ())
+                })
+                .await;
         }
 
         #[cfg(not(all(unix, feature = "acl")))]
@@ -1172,7 +1290,7 @@ impl Endpoint for LocalEndpoint {
         #[cfg(target_os = "macos")]
         {
             return self
-                .read_preservation_metadata(
+                .with_observed_entry(
                     path,
                     sy::rooted_fs::RootedFs::read_observed_bsd_flags_blocking,
                 )
@@ -1192,30 +1310,26 @@ impl Endpoint for LocalEndpoint {
     async fn write_bsd_flags(&self, path: &Path, flags: u32) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
-            use std::os::unix::ffi::OsStrExt;
-
-            let full_path = self.resolve(path);
-            return tokio::task::spawn_blocking(move || -> Result<()> {
-                let path =
-                    std::ffi::CString::new(full_path.as_os_str().as_bytes()).map_err(|_| {
-                        SyncError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "NUL in path",
-                        ))
-                    })?;
-
-                // SAFETY: `path` is a live, NUL-terminated CString for the full
-                // local destination path. `chflags` only borrows the pointer for
-                // the duration of this call.
-                let result = unsafe { libc::chflags(path.as_ptr(), flags as _) };
-                if result == 0 {
-                    Ok(())
-                } else {
-                    Err(SyncError::Io(std::io::Error::last_os_error()))
-                }
-            })
-            .await
-            .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+            return self
+                .with_observed_entry(path, move |rooted, path, kind, identity| {
+                    if kind == sy::engine::domain::EntryKind::Directory {
+                        return Err(sy::rooted_fs::RootedFsError::UnobservedDirectoryMutation);
+                    }
+                    rooted
+                        .apply_observed_preservation_blocking(
+                            path,
+                            kind,
+                            identity,
+                            None,
+                            None,
+                            &sy::rooted_fs::MetadataPreservation {
+                                bsd_flags: Some(flags),
+                                ..Default::default()
+                            },
+                        )
+                        .map(|_| ())
+                })
+                .await;
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1400,33 +1514,44 @@ impl Endpoint for LocalEndpoint {
             .map_err(|error| SyncError::Config(error.to_string()))?;
         let rooted = self.rooted_fs(true).await?;
         let destination_path = self.root.join(relative.as_path());
-        let mut writer =
+        let writer =
             LocalStagedWriter::new(rooted, relative, expected_destination, destination_path)
                 .await?;
-        if let Some(admission) = &self.publication {
-            writer.admission = std::sync::Arc::clone(admission);
-        }
         Ok(Box::new(writer))
     }
 
     async fn remove(&self, path: &Path, recursive: bool) -> Result<()> {
-        let full_path = self.resolve(path);
-        let meta = tokio::fs::symlink_metadata(&full_path).await?;
-        if meta.is_dir() {
-            if recursive {
-                tokio::fs::remove_dir_all(&full_path).await?;
-            } else {
-                tokio::fs::remove_dir(&full_path).await?;
-            }
-        } else {
-            tokio::fs::remove_file(&full_path).await?;
+        if recursive {
+            return Err(SyncError::Config(
+                "recursive removal requires exact controller deletion authority".to_string(),
+            ));
         }
-        Ok(())
+        self.with_observed_entry(path, |rooted, path, kind, identity| {
+            let outcome = rooted.remove_destination_blocking(
+                path,
+                kind == sy::engine::domain::EntryKind::Directory,
+                Some(identity),
+            )?;
+            outcome.verify_local_root(rooted, path)?;
+            if matches!(outcome, sy::rooted_fs::RemovalOutcome::RetainedNonempty) {
+                return Err(std::io::Error::from(std::io::ErrorKind::DirectoryNotEmpty).into());
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn create_dir_all(&self, path: &Path) -> Result<()> {
-        tokio::fs::create_dir_all(self.resolve(path)).await?;
-        Ok(())
+        let relative = self.relative_path(path)?;
+        let rooted = self.rooted_fs(true).await?;
+        tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
+            rooted.create_directories_blocking(&relative)?;
+            rooted.verify_root_path_blocking()
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+        .map_err(map_rooted_fs_error)
     }
 
     async fn replace_symlink(
@@ -1471,18 +1596,22 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn create_hardlink(&self, source: &Path, dest: &Path) -> Result<()> {
-        let full_source = self.resolve(source);
-        let full_dest = self.resolve(dest);
-        if let Some(parent) = full_dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        let temp = crate::temp_file::TempFileGuard::temp_path_for(&full_dest);
-        let guard = crate::temp_file::TempFileGuard::new(&temp);
-        tokio::fs::hard_link(&full_source, &temp).await?;
-        tokio::fs::rename(&temp, &full_dest).await?;
-        guard.defuse();
-        Ok(())
+        let source = self.relative_path(source)?;
+        let dest = self.relative_path(dest)?;
+        let rooted = self.rooted_fs(true).await?;
+        tokio::task::spawn_blocking(move || {
+            rooted.verify_root_path_blocking()?;
+            rooted.create_hardlink_blocking(&source, &dest)?;
+            verify_committed_root(&rooted, dest.as_path()).map_err(|error| {
+                sy::rooted_fs::RootedFsError::CommittedFinalizationFailed {
+                    path: dest.as_path().to_path_buf(),
+                    reason: error.to_string(),
+                }
+            })
+        })
+        .await
+        .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
+        .map_err(map_rooted_fs_error)
     }
 }
 
@@ -1766,6 +1895,136 @@ mod tests {
                 b"independent"
             );
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_acquisition_keeps_original_ancestor_and_admission() {
+        for replace_ancestor in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let ancestor = dir.path().join("ancestor");
+            fs::create_dir(&ancestor).unwrap();
+            let endpoint = LocalEndpoint::new(ancestor.join("missing/root"));
+            assert!(
+                matches!(endpoint.rooted_fs(false).await, Err(SyncError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
+            );
+            if replace_ancestor {
+                fs::rename(&ancestor, dir.path().join("held")).unwrap();
+                fs::create_dir(&ancestor).unwrap();
+            } else {
+                // Explicit rebinding must cover the captured pending ancestor
+                // as well as an already acquired root and staged writer.
+                let admission = std::sync::Arc::new(
+                    crate::endpoint::publication::PublicationAdmission::default(),
+                );
+                let endpoint =
+                    endpoint.with_publication_admission(std::sync::Arc::clone(&admission));
+                admission.close();
+                assert!(endpoint.rooted_fs(true).await.is_err());
+                assert!(!ancestor.join("missing").exists());
+                continue;
+            }
+            assert!(endpoint.rooted_fs(true).await.is_err());
+            assert!(!ancestor.join("missing").exists());
+            assert!(!dir.path().join("held/missing").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_and_router_cutoffs_cover_acquired_endpoint_effects() {
+        use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
+        for supplied in [false, true] {
+            let dir = TempDir::new().unwrap();
+            fs::write(dir.path().join("file"), b"old").unwrap();
+            let endpoint = LocalEndpoint::new(dir.path().to_path_buf());
+            // Rebinding must reach an ALREADY acquired root, not just writers
+            // or roots opened by a later get_or_init.
+            endpoint.rooted_fs(false).await.unwrap();
+            let (io, _peer) = tokio::io::duplex(4096);
+            let (reader, writer) = tokio::io::split(io);
+            let mut router =
+                FrameRouter::start(reader, writer, RouterRole::Client, RouterConfig::default())
+                    .unwrap();
+            let endpoint = if supplied {
+                endpoint.with_publication_admission(router.sender().publication_admission())
+            } else {
+                endpoint
+            };
+            let admission = endpoint.publication_admission();
+            let inherited = LocalEndpoint::new(dir.path().to_path_buf())
+                .with_rooted_authority(endpoint.acquired_rooted_fs().unwrap().clone());
+            assert!(std::sync::Arc::ptr_eq(
+                &inherited.publication_admission(),
+                &admission
+            ));
+            admission.close();
+            assert!(endpoint.create_dir_all(Path::new("newdir")).await.is_err());
+            assert!(endpoint
+                .replace_symlink(
+                    Path::new("target"),
+                    Path::new("link"),
+                    ExpectedDestination::Absent,
+                    None
+                )
+                .await
+                .is_err());
+            assert!(endpoint
+                .create_hardlink(Path::new("file"), Path::new("alias"))
+                .await
+                .is_err());
+            assert!(endpoint.remove(Path::new("file"), false).await.is_err());
+            assert!(endpoint
+                .write_xattrs(
+                    Path::new("file"),
+                    &[(OsString::from("user.sy-lifecycle"), b"new".to_vec())]
+                )
+                .await
+                .is_err());
+            let mut staged = endpoint
+                .begin_write(Path::new("file"), ExpectedDestination::SnapshotAtOpen)
+                .await
+                .unwrap();
+            staged.write(b"new").await.unwrap();
+            assert!(staged.commit().await.is_err());
+            assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"old");
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+            assert!(!endpoint
+                .read_xattrs(Path::new("file"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == "user.sy-lifecycle"));
+            router.shutdown().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn binding_endpoint_admission_never_upgrades_readonly_source() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("file"), b"source").unwrap();
+        let source = crate::endpoint::source_root::SourceRoot::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        // SOURCE reads require the original catalogue record, not a fresh
+        // observation after binding/cutoff.
+        use futures::TryStreamExt;
+        let _: Vec<_> = source
+            .entries(Default::default())
+            .try_collect()
+            .await
+            .unwrap();
+        let admission =
+            std::sync::Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+        let endpoint = source
+            .endpoint()
+            .with_publication_admission(std::sync::Arc::clone(&admission));
+        assert!(endpoint.create_dir_all(Path::new("foreign")).await.is_err());
+        admission.close();
+        assert_eq!(endpoint.metadata(Path::new("file")).await.unwrap().size, 6);
+        assert!(endpoint.remove(Path::new("file"), false).await.is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

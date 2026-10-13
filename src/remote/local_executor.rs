@@ -17,7 +17,6 @@ use crate::endpoint::existing::{self, ExistingDestinationError, FingerprintOptio
 use crate::endpoint::receipt::PublishedDestinationReceipt;
 use crate::endpoint::transfer::{TransferOptions, TransferResult};
 use crate::engine::domain::{Entry, EntryKind, RelativePath, Timestamp};
-use crate::engine::hardlink_groups::{HardlinkGroups, HardlinkRepresentative};
 use crate::engine::planner::ExecutionPolicy;
 use crate::engine::scheduler::{ResourceRequest, Scheduler};
 use crate::engine::work::WorkItem;
@@ -120,6 +119,7 @@ pub struct LocalSyncExecutor {
     source_root: crate::endpoint::source_root::SourceRoot,
     source_endpoint: crate::endpoint::local::LocalEndpoint,
     destination_endpoint: crate::endpoint::local::LocalEndpoint,
+    run_admission: Arc<crate::endpoint::publication::PublicationAdmission>,
     scheduler: Scheduler,
     /// --backup: enabled marker, backup directory (None = beside the file),
     /// and suffix, mirroring the other executors.
@@ -134,12 +134,9 @@ pub struct LocalSyncExecutor {
     /// --remove-source-files: remove a committed or parity-verified source
     /// entry after the destination commit is acknowledged.
     remove_source_files: bool,
-    /// -H/--preserve-hardlinks: group -> first committed destination path.
-    /// The mutex is held across a grouped transfer so members serialize
-    /// (ungrouped files stay concurrent), mirroring the remote executors.
+    /// -H/--preserve-hardlinks: execute sealed selections as whole groups.
     hardlinks: bool,
-    hardlink_groups: tokio::sync::Mutex<HardlinkGroups>,
-    hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal,
+    /// One authenticated removal owner for standalone and finalized group names.
     source_removals: crate::engine::source_removals::SourceRemovalJournal,
     /// -X/--preserve-xattrs: mirror the source's extended attributes onto the
     /// destination for every entry this executor creates or updates. Symlinks
@@ -165,10 +162,14 @@ impl LocalSyncExecutor {
         scheduler: Scheduler,
     ) -> Self {
         let source_endpoint = source_root.endpoint();
+        let run_admission = Arc::new(crate::endpoint::publication::PublicationAdmission::default());
+        let destination_endpoint =
+            destination_endpoint.with_run_admission(Arc::clone(&run_admission));
         Self {
             source_root,
             source_endpoint,
             destination_endpoint,
+            run_admission,
             scheduler,
             backup: false,
             backup_dir: None,
@@ -178,8 +179,6 @@ impl LocalSyncExecutor {
             remove_source_files: false,
             verify_on_write: false,
             hardlinks: false,
-            hardlink_groups: tokio::sync::Mutex::new(HardlinkGroups::default()),
-            hardlink_removals: crate::engine::hardlink_removals::HardlinkRemovalJournal::default(),
             source_removals: crate::engine::source_removals::SourceRemovalJournal::default(),
             xattrs: false,
             acls: false,
@@ -600,56 +599,13 @@ impl LocalSyncExecutor {
         }
     }
 
-    async fn defer_grouped_source_removal(
-        &self,
-        group: [u8; 32],
-        receipt: &PublishedDestinationReceipt,
-        source: &Entry,
-    ) -> Result<()> {
-        if !self.remove_source_files {
-            return Ok(());
-        }
-        receipt.validate_source_removal(source).map_err(|error| {
-            LocalSyncError::Source(
-                self.source_path(&source.path),
-                std::io::Error::other(error.to_string()),
-            )
-        })?;
-        self.check_source_identity(source).await?;
-        self.hardlink_removals
-            .append(
-                group,
-                source,
-                receipt.publication().map_err(std::io::Error::other)?,
-            )
-            .await?;
-        Ok(())
-    }
-
     async fn finish_deferred_source_removals(&self) -> Result<()> {
-        if self.remove_source_files && self.hardlinks {
-            let groups = self.hardlink_groups.lock().await;
-            self.hardlink_removals
-                .replay(self.source_root.clone(), &groups, |proof| async move {
-                    // Empty/skipped selected work may have no destination
-                    // root. Acquire only when a recorded proof needs it.
-                    let rooted = self
-                        .metadata_authority()
-                        .await
-                        .map_err(std::io::Error::other)?;
-                    tokio::task::spawn_blocking(move || {
-                        rooted.verify_root_path_blocking()?;
-                        proof.revalidate_blocking(&rooted)?;
-                        rooted.verify_root_path_blocking()
-                    })
-                    .await
-                    .map_err(std::io::Error::other)?
-                    .map_err(std::io::Error::other)
-                })
-                .await?;
-        }
+        let removal_root = self
+            .source_root
+            .for_removal(self.destination_endpoint.publication_admission())
+            .with_run_admission(Arc::clone(&self.run_admission));
         self.source_removals
-            .replay(self.source_root.clone(), |proof| async move {
+            .replay(removal_root, |proof| async move {
                 let destination = self
                     .metadata_authority()
                     .await
@@ -1039,15 +995,6 @@ impl LocalSyncExecutor {
             source_fingerprint,
             destination_fingerprint,
         )?;
-        if self.hardlinks {
-            if let Some(group) = source.hardlink_group {
-                self.check_source_identity(source).await?;
-                self.hardlink_removals
-                    .append_existing(*group.as_bytes(), source, &receipt)
-                    .await?;
-                return Ok(());
-            }
-        }
         self.source_removals
             .append_existing(source, &receipt)
             .await
@@ -1079,6 +1026,14 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
 
     fn is_directory_action(&self, action: &LocalSyncAction) -> bool {
         matches!(action, LocalSyncAction::CreateDirectory { .. })
+    }
+
+    async fn prepare_destination_for_create(&self, _create: &RelativePath) -> Result<()> {
+        let rooted = self.destination_endpoint.rooted_fs(true).await?;
+        // Missing-root preflight used unknown semantics. Qualification uses the
+        // acquired directory, never its held ancestor or an operator pathname.
+        rooted.namespace_semantics().await?;
+        Ok(())
     }
 
     fn supports_whole_hardlink_groups(&self) -> bool {
@@ -1119,17 +1074,22 @@ impl crate::engine::controller::SyncPlanExecutor for LocalSyncExecutor {
         LocalSyncExecutor::finish_deferred_source_removals(self).await
     }
 
-    async fn close_source_removals(&self) -> std::result::Result<(), LocalSyncError> {
-        self.source_removals
-            .close()
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                LocalSyncError::Source(
-                    self.source_root.path().to_path_buf(),
-                    std::io::Error::other(error),
-                )
-            })
+    fn close_mutation_admission(&self) {
+        self.run_admission.close();
+    }
+
+    fn cancel_mutations(&self) {
+        self.close_mutation_admission();
+        self.destination_endpoint.publication_admission().close();
+    }
+
+    async fn close_source_removals(&self) -> std::result::Result<u64, LocalSyncError> {
+        self.source_removals.close().await.map_err(|error| {
+            LocalSyncError::Source(
+                self.source_root.path().to_path_buf(),
+                std::io::Error::other(error),
+            )
+        })
     }
 
     async fn remove_unchanged_source(

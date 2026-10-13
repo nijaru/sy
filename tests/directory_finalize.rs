@@ -46,6 +46,18 @@ struct BeforeFinalize<E> {
 impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     type Action = E::Action;
     type Error = E::Error;
+    fn close_mutation_admission(&self) {
+        self.inner.close_mutation_admission();
+    }
+    fn cancel_mutations(&self) {
+        self.inner.cancel_mutations();
+    }
+    async fn prepare_destination_for_create(
+        &self,
+        create: &sy::engine::domain::RelativePath,
+    ) -> Result<(), E::Error> {
+        self.inner.prepare_destination_for_create(create).await
+    }
     fn lower(
         &self,
         op: SyncOp,
@@ -112,7 +124,7 @@ impl<E: SyncPlanExecutor> SyncPlanExecutor for BeforeFinalize<E> {
     async fn finish_deferred_source_removals(&self) -> Result<(), E::Error> {
         self.inner.finish_deferred_source_removals().await
     }
-    async fn close_source_removals(&self) -> Result<(), E::Error> {
+    async fn close_source_removals(&self) -> Result<u64, E::Error> {
         self.inner.close_source_removals().await
     }
     async fn remove_unchanged_source(

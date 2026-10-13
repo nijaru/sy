@@ -41,6 +41,25 @@ impl SourceRoot {
         self.rooted.clone()
     }
 
+    /// A narrow clone for deferred unlink. Reads retain the original authority
+    /// and remain valid after cutoff; no destination lineage is imported.
+    pub(crate) fn for_removal(
+        &self,
+        admission: std::sync::Arc<super::publication::PublicationAdmission>,
+    ) -> Self {
+        let mut rooted = self.rooted();
+        rooted.bind_session_mutations(admission, false);
+        Self { rooted }
+    }
+
+    pub(crate) fn with_run_admission(
+        mut self,
+        admission: std::sync::Arc<super::publication::PublicationAdmission>,
+    ) -> Self {
+        self.rooted.bind_run_mutations(admission);
+        self
+    }
+
     pub fn validate_blocking(&self) -> rooted_fs::Result<()> {
         self.rooted.verify_root_path_blocking()
     }

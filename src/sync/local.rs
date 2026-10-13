@@ -75,13 +75,17 @@ pub(super) async fn run(
 /// later creation.
 async fn run_with_authorities(
     source_authority: sy::endpoint::source_root::SourceRoot,
-    mut destination_endpoint: sy::endpoint::local::LocalEndpoint,
+    destination_endpoint: sy::endpoint::local::LocalEndpoint,
     pending: Option<sy::rooted_fs::operand::DestinationRoot>,
     config: &SyncConfig,
     scan_options: ScanOptions,
     scope: SyncScope,
 ) -> Result<SyncStats> {
     use sy::endpoint::Endpoint;
+    let destination_endpoint = match pending {
+        Some(authority) => destination_endpoint.with_destination_authority(authority),
+        None => destination_endpoint,
+    };
     let source_root = source_authority.path();
     // The retained FD owns native destination authority. This operator address
     // must still name that root at local execution/completion boundaries.
@@ -241,29 +245,6 @@ async fn run_with_authorities(
         return Ok(stats);
     }
 
-    if destination_authority.is_none() {
-        let mut requires_root = false;
-        plan.validate_operations(|operation| {
-            requires_root |= matches!(operation, sy::engine::domain::SyncOp::Create { .. });
-            futures::future::ready(Ok(()))
-        })
-        .await
-        .map_err(map_controller_error)?;
-        if requires_root {
-            let pending = pending.ok_or_else(|| {
-                SyncError::Config("missing destination has no held ancestor authority".into())
-            })?;
-            let rooted = pending
-                .acquire_local()
-                .await
-                .map_err(sy::endpoint::local::map_rooted_fs_error)?;
-            // Preflight used conservative unknown semantics. Qualify the actual
-            // acquired root, never the ancestor's filesystem or the pathname.
-            rooted.namespace_semantics().await.map_err(map_io)?;
-            destination_endpoint = destination_endpoint.with_rooted_authority(rooted);
-        }
-    }
-
     let max_in_flight = NonZeroUsize::new(config.max_concurrent).ok_or_else(|| {
         SyncError::Config("parallel transfer count must be greater than zero".to_string())
     })?;
@@ -298,8 +279,9 @@ async fn run_with_authorities(
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
-    let summary: SyncSummary = SyncController::new(executor, max_in_flight)
-        .execute(plan)
+    let controller = SyncController::new(executor, max_in_flight);
+    let summary: SyncSummary = controller
+        .execute_until(plan, tokio::signal::ctrl_c())
         .await
         .map_err(map_controller_error)?;
     let mut stats = summary_stats(summary)?;

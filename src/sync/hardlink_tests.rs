@@ -198,6 +198,22 @@ impl<E: crate::engine::controller::SyncPlanExecutor> crate::engine::controller::
     type Action = E::Action;
     type Error = E::Error;
 
+    fn close_mutation_admission(&self) {
+        self.inner.close_mutation_admission();
+    }
+    fn cancel_mutations(&self) {
+        self.inner.cancel_mutations();
+    }
+    async fn prepare_destination_for_create(
+        &self,
+        create: &crate::engine::domain::RelativePath,
+    ) -> std::result::Result<(), Self::Error> {
+        self.inner.prepare_destination_for_create(create).await
+    }
+    async fn close_source_removals(&self) -> std::result::Result<u64, Self::Error> {
+        self.inner.close_source_removals().await
+    }
+
     fn lower(
         &self,
         op: crate::engine::domain::SyncOp,
