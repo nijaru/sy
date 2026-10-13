@@ -11,13 +11,13 @@ use crate::protocol::{
 };
 use crate::remote::path::decode_relative_path;
 use crate::remote::router::{IncomingStream, RouterSender};
-use crate::remote::source_file::{SourceFile, SourceMetadataRequest};
+use crate::remote::source_file::{GroupSource, SourceMetadataRequest};
 use crate::rooted_fs::RootedFs;
 use bytes::Bytes;
 
 struct Lease {
     declarations: Declarations,
-    source: SourceFile,
+    source: GroupSource,
     completion: Option<Cursor>,
     seal: WireGroupSeal,
 }
@@ -46,7 +46,7 @@ impl Lease {
     }
 }
 
-/// The handler task owns the original source FD through the client's exact
+/// The handler task owns original source authority through the client's exact
 /// completion request. It never mutates the source or reopens its root path.
 pub(super) async fn serve(
     rooted: RootedFs,
@@ -113,11 +113,17 @@ pub(super) async fn serve(
                 "source opener differs from first declaration",
             ));
         }
-        let source = SourceFile::capture_blocking(
+        let source = GroupSource::capture_blocking(
             rooted,
             decode_relative_path(first.path, peer)?,
             EntryIdentity::from_bytes(basis.identity()),
             basis.file_size(),
+            open_for_worker.source_bytes,
+            SourceMetadataRequest {
+                xattrs: open_for_worker.xattrs,
+                acls: open_for_worker.acls,
+                bsd_flags: open_for_worker.source_flags,
+            },
         )?;
         let mut lease = Lease {
             declarations,

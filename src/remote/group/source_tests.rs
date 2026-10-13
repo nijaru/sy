@@ -25,6 +25,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
         "complete",
         "changed-parent",
         "original-parent-alias",
+        "original-parent-at-finish",
         "premature-completion",
     ] {
         let change_second_parent = outcome == "changed-parent";
@@ -38,7 +39,7 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
             root.path().join("dir/second"),
         )
         .unwrap();
-        if replace_original_parent {
+        if replace_original_parent || outcome == "original-parent-at-finish" {
             std::fs::create_dir(root.path().join("alternate")).unwrap();
             std::fs::hard_link(
                 root.path().join("owner/first"),
@@ -197,6 +198,10 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
         } else {
             assert_eq!(reply(&mut inbox).await, WireGroupResult::Validated(1));
             assert!(!server.is_finished());
+            if outcome == "original-parent-at-finish" {
+                std::fs::rename(root.path().join("owner"), root.path().join("held-owner")).unwrap();
+                std::fs::rename(root.path().join("alternate"), root.path().join("owner")).unwrap();
+            }
             send(
                 &sender,
                 &inbox,
@@ -204,11 +209,15 @@ async fn lease_keeps_source_authority_through_each_member_and_exact_completion()
                 WireGroupStep::Finish(seal).encode(),
             )
             .await;
-            assert_eq!(
-                reply(&mut inbox).await,
-                WireGroupResult::SourceComplete(seal)
-            );
-            server.await.unwrap().unwrap();
+            if outcome == "original-parent-at-finish" {
+                assert!(matches!(server.await.unwrap(), Err(GroupError::Source(_))));
+            } else {
+                assert_eq!(
+                    reply(&mut inbox).await,
+                    WireGroupResult::SourceComplete(seal)
+                );
+                server.await.unwrap().unwrap();
+            }
         }
         assert_eq!(
             std::fs::read(root.path().join("owner/first")).unwrap(),

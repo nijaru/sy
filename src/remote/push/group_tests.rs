@@ -110,6 +110,123 @@ fn quick_old(source: &Path, destination: &Path) {
     filetime::set_file_mtime(destination, time).unwrap();
 }
 
+fn observation(path: &Path) -> (u64, u64, u32, i64, i64, u64, u64, i64, i64) {
+    let stat = std::fs::metadata(path).unwrap();
+    (
+        stat.dev(),
+        stat.ino(),
+        stat.mode(),
+        stat.ctime(),
+        stat.ctime_nsec(),
+        stat.nlink(),
+        stat.len(),
+        stat.mtime(),
+        stat.mtime_nsec(),
+    )
+}
+
+#[tokio::test]
+async fn unreadable_source_group_is_observation_only_unless_data_is_required() {
+    for requirement in ["basic", "xattrs", "removal", "bytes", "setter"] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for (root, bytes) in [(source.path(), b"SOURCE"), (destination.path(), b"OLDOLD")] {
+            std::fs::write(root.join("a"), bytes).unwrap();
+            std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+            filetime::set_file_mtime(
+                root.join("a"),
+                filetime::FileTime::from_unix_time(1_600_000_000, 123),
+            )
+            .unwrap();
+            std::fs::set_permissions(root.join("a"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        if requirement == "setter" {
+            std::fs::set_permissions(
+                destination.path().join("a"),
+                std::fs::Permissions::from_mode(0o200),
+            )
+            .unwrap();
+        }
+        if requirement == "bytes" {
+            // Topology repair must consume SOURCE even for quick-equal files.
+            std::fs::remove_file(destination.path().join("b")).unwrap();
+        }
+        assert_eq!(
+            std::fs::File::open(source.path().join("a"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let paths = [
+            source.path().join("a"),
+            source.path().join("b"),
+            destination.path().join("a"),
+        ];
+        let before = paths.each_ref().map(|path| observation(path));
+        let root = crate::endpoint::source_root::SourceRoot::open(source.path().to_path_buf())
+            .await
+            .unwrap();
+        let (client, server) = session(destination.path()).await;
+        let selected = plan(&root, &client.request_handle(), true).await;
+        let result = SyncController::new(
+            executor(
+                root,
+                client.request_handle(),
+                requirement == "removal",
+                requirement == "xattrs",
+            ),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .execute(selected)
+        .await;
+        if requirement == "basic" {
+            close(client, server).await;
+        } else {
+            assert!(result.is_err(), "{requirement} must retain mandatory reads");
+            drop(client);
+            let served = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+                .await
+                .unwrap()
+                .unwrap();
+            // A local SOURCE-open failure may precede every remote request.
+            // The peer then has no failed handler and can close successfully.
+            if requirement == "setter" {
+                assert!(
+                    matches!(&served, Err(crate::remote::serve::ServeError::Request(message)) if message.contains("Permission denied")),
+                    "{served:?}"
+                );
+            }
+            if let Err(error) = served {
+                assert!(
+                    matches!(
+                        error,
+                        crate::remote::serve::ServeError::Request(_)
+                            | crate::remote::serve::ServeError::Session(_)
+                    ),
+                    "{error:?}"
+                );
+            }
+        }
+        if requirement == "basic" {
+            let summary = result.unwrap();
+            assert_eq!(summary.main_operations, 0);
+            assert_eq!(summary.files_skipped, 2);
+            assert_eq!(summary.literal_bytes, 0);
+            assert_eq!(observation(&destination.path().join("b")), before[2]);
+        } else {
+            let error = result.unwrap_err();
+            if requirement != "setter" {
+                assert!(
+                    error.to_string().contains("Permission denied"),
+                    "{requirement}: {error:?}"
+                );
+            }
+        }
+        assert_eq!(paths.each_ref().map(|path| observation(path)), before);
+    }
+}
+
 #[tokio::test]
 async fn selected_first_not_scheduled_member_owns_mode_and_topology_repair_bytes() {
     for (missing, preserve, expected_mode) in

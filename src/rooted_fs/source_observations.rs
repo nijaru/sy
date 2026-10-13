@@ -469,6 +469,23 @@ impl RootedFs {
         drop(owner);
         self.validate_source_observation_blocking(path)
     }
+    /// Observation-only consumers must reference an existing original scan,
+    /// even when this root has not otherwise been classified as SOURCE.
+    pub(crate) fn validate_catalogued_source_blocking(&self, path: &RelativePath) -> Result<()> {
+        if matches!(
+            *self
+                .source_observations
+                .lock()
+                .map_err(|_| RootedFsError::SourceCatalogueTerminal)?,
+            CatalogueState::Unstarted
+        ) {
+            return Err(RootedFsError::SourceUnobserved(
+                path.as_path().to_path_buf(),
+            ));
+        }
+        self.validate_source_observation_blocking(path)
+    }
+
     /// Validate every original ancestor and parent/name, with at most two
     /// active directory descriptors. SOURCE never consults retirement lineage.
     pub(crate) fn validate_source_observation_blocking(&self, path: &RelativePath) -> Result<()> {

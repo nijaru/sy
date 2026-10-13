@@ -8,7 +8,7 @@ use crate::protocol::{
     WireGroupRole,
 };
 use crate::remote::group::destination_client::DestinationGroup;
-use crate::remote::source_file::{SourceFile, SourceMetadataRequest};
+use crate::remote::source_file::{GroupSource, SourceMetadataRequest};
 use crate::rooted_fs::PublishedFileProof;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
@@ -51,21 +51,39 @@ impl RemotePushExecutor {
         let identity = source
             .identity
             .ok_or_else(|| invalid("missing source scan identity"))?;
+        // Resolve byte intent from the original sealed selection before opening
+        // SOURCE. First-selected ordinary metadata policy remains unchanged.
+        let mut intent = GroupIntent::new(&first, policy);
+        while let Some(member) = members.next().await.map_err(failure)? {
+            intent.include(&member);
+        }
         let original = native({
             let root = self.source_root.clone();
             let source = source.clone();
+            let require_data = intent.canonical_source || self.remove_source_files;
+            let request = SourceMetadataRequest {
+                xattrs: self.xattrs,
+                acls: self.acls,
+                bsd_flags: self.bsd_flags,
+            };
             move || {
                 root.validate_blocking()?;
-                let file =
-                    SourceFile::capture_blocking(root.rooted(), source.path, identity, source.size)
-                        .map_err(failure)?;
+                let file = GroupSource::capture_blocking(
+                    root.rooted(),
+                    source.path,
+                    identity,
+                    source.size,
+                    require_data,
+                    request,
+                )
+                .map_err(failure)?;
                 root.validate_blocking()?;
                 Ok(Arc::new(file))
             }
         })
         .await?;
         let result = self
-            .run_group(group, policy, first, Arc::clone(&original))
+            .run_group(group, intent, first, Arc::clone(&original))
             .await;
         // Native handle destruction, like acquisition and all syscalls, belongs
         // on a blocking worker. The original survives the final ACK and proofs.
@@ -77,7 +95,11 @@ impl RemotePushExecutor {
         result
     }
 
-    async fn validate_group_member(&self, original: Arc<SourceFile>, source: &Entry) -> Result<()> {
+    async fn validate_group_member(
+        &self,
+        original: Arc<GroupSource>,
+        source: &Entry,
+    ) -> Result<()> {
         let source = source.clone();
         let root = self.source_root.clone();
         native(move || {
@@ -99,7 +121,7 @@ impl RemotePushExecutor {
     async fn validate_group(
         &self,
         group: &HardlinkGroupPlan<'_>,
-        original: &Arc<SourceFile>,
+        original: &Arc<GroupSource>,
     ) -> Result<()> {
         let mut members = group.members().await.map_err(failure)?;
         while let Some(member) = members.next().await.map_err(failure)? {
@@ -112,14 +134,12 @@ impl RemotePushExecutor {
     async fn run_group(
         &self,
         group: &mut HardlinkGroupPlan<'_>,
-        policy: ExecutionPolicy,
+        intent: GroupIntent,
         first: SyncOp,
-        original: Arc<SourceFile>,
+        original: Arc<GroupSource>,
     ) -> Result<()> {
-        let mut intent = GroupIntent::new(&first, policy);
         let mut members = group.members().await.map_err(failure)?;
         while let Some(member) = members.next().await.map_err(failure)? {
-            intent.include(&member);
             self.validate_group_member(Arc::clone(&original), member.source())
                 .await?;
         }

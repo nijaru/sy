@@ -115,6 +115,79 @@ fn observation(path: &Path) -> (u64, u64, u32, i64, i64, u64, u64, i64, i64) {
 }
 
 #[tokio::test]
+async fn unreadable_source_group_is_observation_only_unless_data_is_required() {
+    for requirement in ["basic", "xattrs", "bytes", "setter"] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        for (root, bytes) in [(source.path(), b"source"), (destination.path(), b"target")] {
+            std::fs::write(root.join("a"), bytes).unwrap();
+            std::fs::hard_link(root.join("a"), root.join("b")).unwrap();
+            stamp(&root.join("a"), 0);
+        }
+        if requirement == "setter" {
+            std::fs::set_permissions(
+                destination.path().join("a"),
+                std::fs::Permissions::from_mode(0o200),
+            )
+            .unwrap();
+        }
+        if requirement == "bytes" {
+            std::fs::remove_file(destination.path().join("b")).unwrap();
+        }
+        assert_eq!(
+            std::fs::File::open(source.path().join("a"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let paths = [
+            source.path().join("a"),
+            source.path().join("b"),
+            destination.path().join("a"),
+        ];
+        let before = paths.each_ref().map(|path| observation(path));
+        let (executor, plan, client, server) = setup(
+            source.path(),
+            destination.path(),
+            ComparisonPolicy {
+                preserve_permissions: true,
+                preserve_times: true,
+                ..Default::default()
+            },
+            requirement == "xattrs",
+        )
+        .await;
+        let result = SyncController::new(executor, NonZeroUsize::new(1).unwrap())
+            .execute(plan)
+            .await;
+        if requirement == "basic" {
+            close(client, server).await;
+        } else {
+            assert!(result.is_err(), "{requirement} must retain mandatory reads");
+            drop(client);
+            let served = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                served.is_err(),
+                "failed stream must not report session completion"
+            );
+        }
+        if requirement == "basic" {
+            let summary = result.unwrap();
+            assert_eq!(summary.main_operations, 0);
+            assert_eq!(summary.files_skipped, 2);
+            assert_eq!(summary.literal_bytes, 0);
+            assert_eq!(observation(&destination.path().join("b")), before[2]);
+        } else {
+            assert!(result.is_err(), "{requirement} must retain mandatory reads");
+        }
+        assert_eq!(paths.each_ref().map(|path| observation(path)), before);
+    }
+}
+
+#[tokio::test]
 async fn catalogue_order_owns_mode_and_canonical_bytes_across_parents() {
     for (first_exists, preserve_permissions) in
         [(false, false), (false, true), (true, false), (true, true)]
@@ -276,8 +349,8 @@ async fn retained_bytes_isolate_outside_alias_then_matching_group_is_effect_free
         }
     }
 
-    // Default policy retains OLD mode/time. A readable SOURCE lease is still
-    // mandatory, but matching basic preservation must not open TARGET data.
+    // Default policy retains OLD mode/time. Matching basic preservation needs
+    // only original SOURCE/TARGET observations, not readable data descriptors.
     stamp(&source.path().join("a"), 0o600);
     stamp(&destination.path().join("a"), 0o000);
     assert_eq!(

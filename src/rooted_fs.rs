@@ -1423,6 +1423,11 @@ impl RootedFs {
     }
 
     #[cfg(not(unix))]
+    pub(crate) fn validate_catalogued_source_blocking(&self, _path: &RelativePath) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
     pub(crate) fn validate_source_observation_blocking(&self, _path: &RelativePath) -> Result<()> {
         Err(RootedFsError::UnsupportedPlatform)
     }
@@ -2875,17 +2880,7 @@ impl RootedFs {
         relative: &RelativePath,
         scanned: EntryIdentity,
     ) -> Result<RootedSourceFile> {
-        if matches!(
-            *self
-                .source_observations
-                .lock()
-                .map_err(|_| RootedFsError::SourceCatalogueTerminal)?,
-            source_observations::CatalogueState::Unstarted
-        ) {
-            return Err(RootedFsError::SourceUnobserved(
-                relative.as_path().to_path_buf(),
-            ));
-        }
+        self.validate_catalogued_source_blocking(relative)?;
         let (source, _) = self.open_source_member_blocking(relative.as_path(), scanned, None)?;
         self.validate_source_file_parent_blocking(relative, &source)?;
         Ok(source)
