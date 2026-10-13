@@ -180,6 +180,18 @@ fn mutate(rooted: &RootedFs, mutation: Mutation) -> Result<()> {
                 exacl::Perm::READ,
                 exacl::Flag::empty(),
             ));
+            // A named POSIX principal requires an explicit mask. The native
+            // setter preserves SOURCE policy; it does not invent a mask.
+            #[cfg(target_os = "linux")]
+            if !entries
+                .iter()
+                .any(|entry| entry.kind == exacl::AclEntryKind::Mask)
+            {
+                entries.push(exacl::AclEntry::allow_mask(
+                    exacl::Perm::READ | exacl::Perm::EXECUTE,
+                    exacl::Flag::empty(),
+                ));
+            }
             // The operation under test uses the same raw identity codec as -A.
             rooted.write_acl_blocking(&target, EntryKind::File, &exacl::to_string(&entries)?)
         }

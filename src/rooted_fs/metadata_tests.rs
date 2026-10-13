@@ -20,6 +20,10 @@ async fn native_preservation_is_effect_free_only_when_entire_request_matches() {
         let requested_acl = acl(&file);
         #[cfg(feature = "acl")]
         apply_acl_fd(&file, requested_acl.as_deref().unwrap()).unwrap();
+        // The request models captured SOURCE state, not the fixture builder's
+        // order before the POSIX kernel canonicalizes its entries.
+        #[cfg(feature = "acl")]
+        let requested_acl = Some(exacl::to_string(&read_acl_entries_fd(&file).unwrap()).unwrap());
         let flags = requested_flags();
         #[cfg(target_os = "macos")]
         apply_bsd_flags_fd(&file, flags.unwrap()).unwrap();
