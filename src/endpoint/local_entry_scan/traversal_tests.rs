@@ -121,10 +121,23 @@ fn reopening_validates_every_ancestor_even_when_leaf_inode_is_unchanged() {
     )
     .unwrap();
     assert!(matches!(
-        reopen(root.path(), Path::new("parent/child"), false, &mut stack),
+        reopen(
+            root.path(),
+            Path::new("parent/child"),
+            false,
+            &mut stack,
+            None
+        ),
         Err(LocalScanError::DirectoryChanged(_))
     ));
     std::fs::remove_dir_all(root.path().join("parent")).unwrap();
     std::os::unix::fs::symlink(root.path().join("old"), root.path().join("parent")).unwrap();
-    assert!(reopen(root.path(), Path::new("parent/child"), false, &mut stack).is_err());
+    assert!(reopen(
+        root.path(),
+        Path::new("parent/child"),
+        false,
+        &mut stack,
+        None
+    )
+    .is_err());
 }

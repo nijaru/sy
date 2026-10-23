@@ -447,7 +447,8 @@ async fn source_unreadability_is_mandatory_and_never_repaired() {
         .unwrap()
         .unwrap();
     assert!(
-        matches!(result, Err(RemoteTransferError::Io(ref error)) if matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<crate::remote::source_file::SourceFileError>()), Some(crate::remote::source_file::SourceFileError::Rooted(crate::rooted_fs::RootedFsError::Io(error))) if error.kind() == std::io::ErrorKind::PermissionDenied)),
+        matches!(result, Err(RemoteTransferError::RootedFs(crate::rooted_fs::RootedFsError::Io(ref error)))
+            if error.kind() == std::io::ErrorKind::PermissionDenied),
         "{result:?}"
     );
     assert_eq!(request_source_identity(root.path()), before);
@@ -557,9 +558,8 @@ async fn original_scan_binding_is_required_before_delta_reads_and_old_survives()
         assert!(result.is_err(), "SOURCE race cannot publish: {parent}");
         let error = server.await.unwrap().unwrap_err();
         assert!(
-            matches!(error, RemoteTransferError::Io(ref cause)
-            if matches!(cause.get_ref().and_then(|cause| cause.downcast_ref::<crate::remote::source_file::SourceFileError>()),
-                Some(crate::remote::source_file::SourceFileError::Changed { .. }))),
+            matches!(error, RemoteTransferError::RootedFs(crate::rooted_fs::RootedFsError::SourceBindingChanged(ref path))
+                if path == std::path::Path::new("dir/file")),
             "{error:?}"
         );
         assert_eq!(

@@ -21,7 +21,7 @@ use crate::protocol::{
 use crate::remote::data::DataChunk;
 use crate::remote::path::{decode_relative_path, ensure_compatible_path_encoding};
 use crate::remote::router::{IncomingStream, RouterSender, StreamInbox};
-use crate::remote::source_file::{SourceFile, SourceFileError, SourceMetadataRequest};
+use crate::remote::source_file::{SourceCompletionError, SourceFile, SourceMetadataRequest};
 use crate::rooted_fs::RootedFs;
 
 use crate::remote::transfer::{RemoteTransferError, PRODUCER_QUEUE_DEPTH};
@@ -586,19 +586,12 @@ pub(crate) async fn serve_decoded_file_fetch(
     tokio::task::spawn_blocking(move || {
         acknowledged?;
         source.validate_blocking().map_err(|source| {
-            RemoteTransferError::Io(std::io::Error::other(FetchCompletionError { source }))
+            RemoteTransferError::Io(std::io::Error::other(SourceCompletionError { source }))
         })?;
         Ok(summary)
     })
     .await
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))?
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("destination publication acknowledged, but source completion validation failed; destination is committed and source completion is uncertain: {source}")]
-struct FetchCompletionError {
-    #[source]
-    source: SourceFileError,
 }
 
 async fn receive_fetch_ack(
@@ -646,6 +639,7 @@ mod tests {
         read_frame, write_frame, Platform, MAX_FRAME_PAYLOAD, MAX_TRANSFER_DATA_SIZE,
     };
     use crate::remote::router::{FrameRouter, RouterConfig, RouterRole};
+    use crate::remote::source_file::SourceFileError;
     use futures::TryStreamExt;
     use std::path::Path;
 
@@ -908,7 +902,7 @@ mod tests {
             let completion = error
                 .get_ref()
                 .unwrap()
-                .downcast_ref::<FetchCompletionError>()
+                .downcast_ref::<SourceCompletionError>()
                 .unwrap();
             assert!(matches!(completion.source, SourceFileError::Changed { .. }));
             assert_eq!(
@@ -993,12 +987,10 @@ mod tests {
                 }
             }
         }).await.unwrap();
-        let RemoteTransferError::Io(error) = outcome.unwrap_err() else {
-            panic!("expected source lease failure");
-        };
         assert!(matches!(
-            error.get_ref().unwrap().downcast_ref::<SourceFileError>(),
-            Some(SourceFileError::Changed { .. })
+            outcome.unwrap_err(),
+            RemoteTransferError::RootedFs(crate::rooted_fs::RootedFsError::SourceBindingChanged(path))
+                if path == Path::new("dir/file")
         ));
     }
 

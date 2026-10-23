@@ -12,25 +12,96 @@ pub struct SourceRoot {
     rooted: RootedFs,
 }
 
-impl SourceRoot {
-    /// Retain the authority already captured during operand classification.
-    pub fn from_rooted(rooted: RootedFs) -> Self {
-        Self {
-            rooted: rooted.into_local_source_authority(),
+/// Cancellation/panic cutoff is nonblocking even while native SOURCE replay
+/// holds the catalogue lock. It never substitutes for an owned work join.
+pub(crate) struct SourceRunAttempt {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+impl SourceRunAttempt {
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+    }
+}
+impl Drop for SourceRunAttempt {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+}
+
+impl SourceRoot {
+    pub(crate) fn attempt(&self) -> rooted_fs::Result<SourceRunAttempt> {
+        Ok(SourceRunAttempt {
+            cancelled: self.rooted.source_run_cancellation(false)?,
+            finished: false,
+        })
+    }
+
+    /// Arm only a cancellation cutoff for a retained failed owner. This does
+    /// not make its DATA observations usable or authorize retry by itself.
+    pub(crate) fn retry_attempt(&self) -> rooted_fs::Result<SourceRunAttempt> {
+        Ok(SourceRunAttempt {
+            cancelled: self.rooted.source_run_cancellation(true)?,
+            finished: false,
+        })
+    }
+
+    /// Retain the authority already captured during operand classification.
+    pub fn from_rooted(rooted: RootedFs) -> rooted_fs::Result<Self> {
+        if !rooted.is_local_source_authority() {
+            return Err(rooted_fs::RootedFsError::SourceOperatorUncaptured);
+        }
+        Ok(Self { rooted })
     }
 
     pub async fn open(path: PathBuf) -> rooted_fs::Result<Self> {
-        Ok(Self {
-            rooted: RootedFs::open(path).await?.into_local_source_authority(),
-        })
+        tokio::task::spawn_blocking(move || Self::open_blocking(path))
+            .await
+            .map_err(|error| rooted_fs::RootedFsError::Worker(error.to_string()))?
     }
 
     /// Blocking root acquisition for native workers and synchronous callers.
     pub fn open_blocking(path: PathBuf) -> rooted_fs::Result<Self> {
-        Ok(Self {
-            rooted: RootedFs::open_blocking_for_worker(path)?.into_local_source_authority(),
+        Self::from_rooted(RootedFs::open_local_source_blocking(path)?)
+    }
+
+    /// Start a new observation run through the original acquired operator
+    /// authority. An unscanned classification is consumed unchanged; completed
+    /// runs get fresh child observations, never fresh operator provenance.
+    pub async fn begin_run(&self) -> rooted_fs::Result<Self> {
+        let root = self.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::from_rooted(root.rooted.next_source_run_blocking()?)
         })
+        .await
+        .map_err(|error| rooted_fs::RootedFsError::Worker(error.to_string()))?
+    }
+
+    /// Explicit new observation attempt after a classified source race. This
+    /// never revives the failed owner or reacquires the operator operand.
+    pub async fn retry_after_source_change(&self) -> rooted_fs::Result<Self> {
+        let root = self.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::from_rooted(root.rooted.retry_source_run_blocking()?)
+        })
+        .await
+        .map_err(|error| rooted_fs::RootedFsError::Worker(error.to_string()))?
+    }
+
+    pub(crate) fn same_run(&self, other: &Self) -> bool {
+        self.rooted.same_source_run(&other.rooted)
+    }
+
+    pub(crate) async fn retire_failed_run(&self, source_race: bool) -> rooted_fs::Result<()> {
+        let root = self.clone();
+        tokio::task::spawn_blocking(move || {
+            root.rooted.retire_failed_source_run_blocking(source_race)
+        })
+        .await
+        .map_err(|error| rooted_fs::RootedFsError::Worker(error.to_string()))?
     }
 
     pub fn path(&self) -> &Path {
@@ -100,6 +171,46 @@ mod tests {
     use crate::endpoint::{existing, Endpoint};
     use crate::rooted_fs::RootedFsError;
     use futures::StreamExt;
+
+    #[tokio::test]
+    async fn unchanged_source_root_under_foreign_operator_ancestor_is_not_original_binding() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let ancestor = fixture.path().join("ancestor");
+        let parent = ancestor.join("parent");
+        let path = parent.join("source");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("file"), b"original SOURCE").unwrap();
+        let root = SourceRoot::open(path.clone()).await.unwrap();
+        let entries: Vec<_> = root
+            .entries(Default::default())
+            .map(|entry| entry.unwrap())
+            .collect()
+            .await;
+        assert_eq!(entries.len(), 1);
+        let original = std::fs::metadata(&path).unwrap();
+        let original_parent = std::fs::metadata(&parent).unwrap();
+        let parked = fixture.path().join("original-ancestor");
+        std::fs::rename(&ancestor, &parked).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::rename(parked.join("parent"), &parent).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().ino(),
+            original_parent.ino()
+        );
+        assert!(matches!(root.validate().await,
+            Err(RootedFsError::RootChanged(changed)) if changed == path));
+        assert!(root
+            .endpoint()
+            .open_native_file(Path::new("file"))
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(path.join("file")).unwrap(),
+            b"original SOURCE"
+        );
+    }
 
     #[tokio::test]
     async fn persistent_root_replacement_preserves_original_authority_despite_identical_leaves() {

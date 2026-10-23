@@ -1182,8 +1182,10 @@ mod tests {
                     .await
                     .unwrap_err();
                     assert!(
-                        error.to_string().contains("changed since scan"),
-                        "expected SourceChanged, got: {error}"
+                        matches!(&error, sy::remote::transfer::RemoteTransferError::RootedFs(
+                            sy::rooted_fs::RootedFsError::SourceBindingChanged(path)
+                        ) if path == Path::new("raced")),
+                        "expected typed original SOURCE change, got: {error}"
                     );
                 }
                 _other => panic!("unexpected v3 pull request variant"),

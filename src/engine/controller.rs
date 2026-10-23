@@ -72,6 +72,15 @@ pub enum ControllerError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// Both operations have returned after their endpoint-owned cleanup. This
+    /// is not evidence that cleanup failed; each typed result retains that fact.
+    #[error("{operation}; joined sibling operation also failed: {sibling}")]
+    JoinedOperations {
+        #[source]
+        operation: Box<ControllerError>,
+        sibling: Box<ControllerError>,
+    },
+
     #[error("metadata preservation requires Unix mode metadata for {0}")]
     MissingPreservedMode(RelativePath),
 
@@ -203,6 +212,32 @@ impl SyncPlan {
         }
         self.reader.rewind()?;
         Ok(())
+    }
+
+    /// Reject unsupported original SOURCE binding/removal combinations before
+    /// any destination work, including parent acquisition, backup and setters.
+    /// Replaying this plan is read-only; late completion and unlink gates remain.
+    pub async fn validate_source_removal_support(
+        &mut self,
+        source: &crate::endpoint::source_root::SourceRoot,
+    ) -> Result<()> {
+        let rooted = source.rooted();
+        self.validate_operations(|operation| {
+            let rooted = rooted.clone();
+            async move {
+                if matches!(operation, SyncOp::Skip { .. }) || operation.source().is_directory() {
+                    return Ok(());
+                }
+                let path = operation.source().path.clone();
+                tokio::task::spawn_blocking(move || {
+                    rooted.check_source_removal_support_blocking(&path)
+                })
+                .await
+                .map_err(|error| ControllerError::Worker(error.to_string()))?
+                .map_err(|error| ControllerError::backend("SOURCE removal preflight", error))
+            }
+        })
+        .await
     }
 
     /// Record complete selection for whole-group execution. Byte disposition is
@@ -372,6 +407,8 @@ where
 }
 
 mod backup_preflight;
+#[cfg(unix)]
+mod local_source_effects;
 
 async fn collect_preflight_plan<F, Fut, D, DFut>(
     reconciler: &mut OrderedReconciler,
@@ -1024,6 +1061,9 @@ impl<E: SyncPlanExecutor> ControllerExecution<E> {
         let runtime_finalize = self
             .prepare_directories(&mut reader, &mut finalize, execution_policy, &mut summary)
             .await?;
+        // Preparation has consumed the planned requests; only the runtime
+        // receipts authorize finalization after file work.
+        drop(finalize);
         reader.rewind()?;
         let mut workers = JoinSet::<std::result::Result<WorkResult, E::Error>>::new();
         let completed_groups = crate::engine::hardlink_runtime::CompletedGroups::default();
@@ -1174,7 +1214,7 @@ impl<E: SyncPlanExecutor> ControllerExecution<E> {
             Ok(())
         }
         .await;
-        if let Err(mut error) = main_result {
+        if let Err(error) = main_result {
             self.executor.cancel_mutations();
             // Close endpoint/session admission before joining queued workers.
             // Do not set the cancellation flag or replace the original failure.
@@ -1182,24 +1222,7 @@ impl<E: SyncPlanExecutor> ControllerExecution<E> {
             // it may be crossing its publication point or awaiting blocking
             // filesystem work. Finish every worker before releasing session
             // ownership; failed main work never authorizes delete/finalize.
-            while let Some(result) = workers.join_next().await {
-                match result {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(secondary)) => {
-                        error = ControllerError::OwnedDrain {
-                            operation: Box::new(error),
-                            source: Box::new(secondary),
-                        };
-                    }
-                    Err(secondary) => {
-                        error = ControllerError::OwnedDrain {
-                            operation: Box::new(error),
-                            source: Box::new(secondary),
-                        };
-                    }
-                }
-            }
-            return Err(error);
+            return Err(join_failed_workers(&mut workers, error).await);
         }
 
         let mut finalize = runtime_finalize;
@@ -1390,6 +1413,30 @@ fn directory_finalize_metadata(
         modified,
     }))
 }
+async fn join_failed_workers<E: std::error::Error + Send + Sync + 'static>(
+    workers: &mut JoinSet<std::result::Result<WorkResult, E>>,
+    mut error: ControllerError,
+) -> ControllerError {
+    while let Some(result) = workers.join_next().await {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(secondary)) => {
+                error = ControllerError::JoinedOperations {
+                    operation: Box::new(error),
+                    sibling: Box::new(ControllerError::backend("execution", secondary)),
+                };
+            }
+            Err(secondary) => {
+                error = ControllerError::OwnedDrain {
+                    operation: Box::new(error),
+                    source: Box::new(secondary),
+                };
+            }
+        }
+    }
+    error
+}
+
 async fn collect_one<E: SyncPlanExecutor>(
     workers: &mut JoinSet<std::result::Result<WorkResult, E::Error>>,
     summary: &mut SyncSummary,
@@ -1566,6 +1613,245 @@ mod tests {
 
     fn entries(values: Vec<Entry>) -> EntryStream {
         EntryStream::new(stream::iter(values.into_iter().map(Ok::<Entry, BoxError>)))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn native_source_race_joins_cutoff_sibling_before_fresh_retry() {
+        use crate::endpoint::source_root::SourceRoot;
+        use crate::endpoint::transfer::{
+            transfer_file, transfer_file_with_hook, SourceExpectation, TransferIdentity,
+            TransferOptions,
+        };
+        use crate::error::SyncError;
+        use crate::remote::local_executor::LocalSyncError;
+        use crate::rooted_fs::RootedFsError;
+        use futures::TryStreamExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(source_dir.path().join(name), b"SOURCE").unwrap();
+            std::fs::write(destination_dir.path().join(name), b"OLD").unwrap();
+        }
+        let source = SourceRoot::open(source_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let original = source
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let effects = crate::rooted_fs::local_source_effects::LocalSourceEffects::seal(&source)
+            .await
+            .unwrap();
+        let (destination, namespace) =
+            crate::endpoint::local::LocalEndpoint::new(destination_dir.path().to_path_buf())
+                .with_namespace_qualification()
+                .await
+                .unwrap();
+        namespace.seal().await.unwrap();
+        let destination = destination
+            .with_local_source_effects(effects)
+            .await
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (release, held) = std::sync::mpsc::channel();
+        let held = Arc::new(std::sync::Mutex::new(held));
+        let mut workers = JoinSet::new();
+        for entry in &original {
+            let entry = entry.clone();
+            let endpoint = source.endpoint();
+            let destination = destination.clone();
+            let barrier = barrier.clone();
+            let held = held.clone();
+            let source_path = source_dir.path().join("a");
+            let old = std::fs::symlink_metadata(destination_dir.path().join(entry.path.as_path()))
+                .unwrap();
+            let old =
+                crate::endpoint::local_identity::metadata_identity(&old, EntryKind::File).unwrap();
+            workers.spawn(async move {
+                let name = entry.path.as_path().to_path_buf();
+                let origin = name == std::path::Path::new("a");
+                transfer_file_with_hook(
+                    &endpoint,
+                    &name,
+                    &destination,
+                    &name,
+                    TransferOptions {
+                        update: true,
+                        verify: true,
+                        follow_symlinks: false,
+                        rate_limiter: None,
+                        preservation: Default::default(),
+                        preservation_request: Default::default(),
+                        final_flags: None,
+                        metadata: None,
+                        identity: TransferIdentity {
+                            source: SourceExpectation::Scanned(entry.identity.unwrap()),
+                            destination: crate::endpoint::ExpectedDestination::Unchanged(old),
+                        },
+                    },
+                    Arc::new(move || {
+                        // Both real COPY workers own populated private staging.
+                        barrier.wait();
+                        if origin {
+                            std::fs::write(&source_path, b"changed SOURCE").unwrap();
+                        } else {
+                            held.lock().unwrap().recv().unwrap();
+                        }
+                    }),
+                )
+                .await
+                .map(|_| WorkResult::Metadata)
+                .map_err(LocalSyncError::Endpoint)
+            });
+        }
+        let first = collect_one::<crate::remote::local_executor::LocalSyncExecutor>(
+            &mut workers,
+            &mut SyncSummary::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&first, ControllerError::Backend { source, .. }
+            if matches!(source.downcast_ref::<LocalSyncError>(),
+                Some(LocalSyncError::Endpoint(SyncError::SourceChanged { .. })))),
+            "{first:?}"
+        );
+        let snapshot = || {
+            ["a", "b"].map(|name| {
+                let m = std::fs::symlink_metadata(source_dir.path().join(name)).unwrap();
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.nlink(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                )
+            })
+        };
+        let before = snapshot();
+        let joined = join_failed_workers(&mut workers, first);
+        tokio::pin!(joined);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            joined.as_mut().poll(&mut context).is_pending(),
+            "retry boundary detached native sibling"
+        );
+        release.send(()).unwrap();
+        let result = joined.await;
+        let ControllerError::JoinedOperations { operation, sibling } = result else {
+            panic!("expected joined operations: {result:?}")
+        };
+        assert!(matches!(*operation, ControllerError::Backend { .. }));
+        assert!(matches!(*sibling, ControllerError::Backend { source, .. }
+            if matches!(source.downcast_ref::<LocalSyncError>(),
+                Some(LocalSyncError::Endpoint(SyncError::Io(io)))
+                    if matches!(io.get_ref().and_then(|e| e.downcast_ref::<RootedFsError>()),
+                        Some(RootedFsError::SourceRaceCutoff)))));
+        assert_eq!(
+            std::fs::read_dir(destination_dir.path()).unwrap().count(),
+            2,
+            "both private aborts must complete"
+        );
+        for name in ["a", "b"] {
+            assert_eq!(
+                std::fs::read(destination_dir.path().join(name)).unwrap(),
+                b"OLD"
+            );
+        }
+        source.retire_failed_run(true).await.unwrap();
+        assert!(matches!(
+            source
+                .rooted()
+                .validate_source_observation_blocking(&original[1].path),
+            Err(RootedFsError::SourceRaceCutoff)
+        ));
+        std::fs::write(source_dir.path().join("arrival"), b"fresh child").unwrap();
+        let next = source.retry_after_source_change().await.unwrap();
+        let fresh = next
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(fresh.len(), 3);
+        // A fresh destination run must not retain the old SOURCE-effects proof.
+        let (destination, namespace) =
+            crate::endpoint::local::LocalEndpoint::new(destination_dir.path().to_path_buf())
+                .with_namespace_qualification()
+                .await
+                .unwrap();
+        namespace.seal().await.unwrap();
+        let effects = crate::rooted_fs::local_source_effects::LocalSourceEffects::seal(&next)
+            .await
+            .unwrap();
+        let destination = destination
+            .with_local_source_effects(effects)
+            .await
+            .unwrap();
+        for entry in fresh {
+            transfer_file(
+                &next.endpoint(),
+                entry.path.as_path(),
+                &destination,
+                entry.path.as_path(),
+                TransferOptions {
+                    update: entry.path.as_path() != std::path::Path::new("arrival"),
+                    verify: true,
+                    follow_symlinks: false,
+                    rate_limiter: None,
+                    preservation: Default::default(),
+                    preservation_request: Default::default(),
+                    final_flags: None,
+                    metadata: None,
+                    identity: TransferIdentity {
+                        source: SourceExpectation::Scanned(entry.identity.unwrap()),
+                        destination: if entry.path.as_path() == std::path::Path::new("arrival") {
+                            crate::endpoint::ExpectedDestination::Absent
+                        } else {
+                            let old = std::fs::symlink_metadata(
+                                destination_dir.path().join(entry.path.as_path()),
+                            )
+                            .unwrap();
+                            crate::endpoint::ExpectedDestination::Unchanged(
+                                crate::endpoint::local_identity::metadata_identity(
+                                    &old,
+                                    EntryKind::File,
+                                )
+                                .unwrap(),
+                            )
+                        },
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read(source_dir.path().join(entry.path.as_path())).unwrap(),
+                std::fs::read(destination_dir.path().join(entry.path.as_path())).unwrap()
+            );
+        }
+        assert_eq!(
+            snapshot(),
+            before,
+            "copy/retry must not mutate SOURCE metadata"
+        );
+        assert!(matches!(
+            source
+                .rooted()
+                .validate_source_observation_blocking(&original[1].path),
+            Err(RootedFsError::SourceRaceCutoff)
+        ));
+        assert!(
+            source.begin_run().await.is_err(),
+            "failed owner cannot be revived"
+        );
     }
 
     #[tokio::test]

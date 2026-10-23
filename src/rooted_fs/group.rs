@@ -44,6 +44,12 @@ impl RootedStagedFile {
                 ));
             }
             self.namespace.sealed.get_or_insert(observed);
+            if self.namespace.rooted.local_source_effects.is_some() {
+                self.namespace.group_links = Some(Arc::new(std::sync::Mutex::new(
+                    group_links::GroupLinks::new(&self.namespace)?,
+                )));
+                self.namespace.group_private_link = Some(group_links::PrivateLink::Anchor);
+            }
             Ok(RootedStagedGroup {
                 anchor: self,
                 progress: GroupProgress::Active { members: 0 },
@@ -111,6 +117,7 @@ impl RootedStagedGroup {
             StagingOrigin::Created,
         )?;
         alias.strict_cleanup = true;
+        alias.group_links = self.anchor.namespace.group_links.clone();
         // Pin cleanup ownership before linkat, including clone failure. The
         // original creator FD, not an opened visible member, identifies alias.
         let observed = self.anchor.observe_original_file()?;
@@ -126,16 +133,41 @@ impl RootedStagedGroup {
             ));
         }
         alias.staged = Some(OwnedStagingEntry {
-            file: self.anchor.file.try_clone()?,
+            file: Arc::clone(
+                &self
+                    .anchor
+                    .namespace
+                    .staged
+                    .as_ref()
+                    .ok_or(RootedFsError::IncompleteStagedGroup)?
+                    .file,
+            ),
             created: observed.stat,
         });
         alias.cleanup_owned = Some(observed.stat);
         alias.sealed = Some(observed);
         let prepare = (|| {
-            let _permits = alias
-                .rooted
-                .admit_mutation_with_transaction_blocking(Some(admission))?;
+            let _permits = alias.rooted.admit_mutation_with_transaction_blocking(
+                Some(admission),
+                SourceEffect {
+                    kind: SourceEffectKind::LinkCountChange,
+                    parent: self.anchor.namespace.staging_dir_fd.as_raw_fd(),
+                    name: &self.anchor.namespace.temp_name,
+                    object: Some(self.anchor.file.as_raw_fd()),
+                    path: relative.as_path(),
+                },
+            )?;
             validate_source()?;
+            // SOURCE census may be long. Recheck both original private DIR
+            // bindings, destination ancestry/OLD and the creator seal after it;
+            // a held contents FD alone cannot detect private-DIR relocation.
+            self.anchor.namespace.verify_group_links_blocking()?;
+            alias.verify_parent_binding()?;
+            alias.verify_expected_destination()?;
+            alias.verify_private_cleanup_directory_blocking()?;
+            self.anchor
+                .namespace
+                .verify_private_cleanup_directory_blocking()?;
             self.anchor.observe_original_file()?;
             // Always link from the ORIGINAL protected staging namespace.
             // Cross-submount EXDEV is a safe failure, never a copy fallback.
@@ -145,6 +177,9 @@ impl RootedStagedGroup {
                 alias.staging_dir_fd.as_raw_fd(),
                 &alias.temp_name,
             )?;
+            if alias.group_links.is_some() {
+                alias.group_private_link = Some(group_links::PrivateLink::Alias);
+            }
             // Only this exact successful syscall can advance nlink/ctime.
             self.anchor.namespace.advance_staging(1)?;
             alias.sealed = self.anchor.namespace.sealed;
@@ -164,6 +199,17 @@ impl RootedStagedGroup {
         // retry an unlink after we propagate the seal: such a later own delta
         // would be invisible to the live group owner.
         alias.committed = true;
+        // A retained populated alias may have moved into SOURCE without any
+        // FILE stat change. Exact nlink alone cannot authorize anchor retirement.
+        // An empty pre-link alias or a proven own unlink does not revoke it.
+        if alias.group_private_link.is_some() {
+            if let Some(links) = &alias.group_links {
+                links
+                    .lock()
+                    .map_err(|_| RootedFsError::IncompleteStagedGroup)?
+                    .retain_uncertain_alias();
+            }
+        }
         // Both native publication and owned abort cleanup advance the alias's
         // seal through exact deltas. Propagate that evidence, never fresh stat.
         self.anchor.namespace.sealed = alias.sealed;
@@ -216,7 +262,16 @@ impl RootedStagedGroup {
         {
             let finalize = (|| {
                 let rooted = self.anchor.namespace.rooted.clone();
-                let _permits = rooted.admit_mutation_with_transaction_blocking(Some(&admission))?;
+                let _permits = rooted.admit_mutation_with_transaction_blocking(
+                    Some(&admission),
+                    SourceEffect {
+                        kind: SourceEffectKind::LinkCountChange,
+                        parent: self.anchor.namespace.staging_dir_fd.as_raw_fd(),
+                        name: &self.anchor.namespace.temp_name,
+                        object: Some(self.anchor.file.as_raw_fd()),
+                        path: representative.as_path(),
+                    },
+                )?;
                 let observed = self.anchor.observe_original_file()?;
                 // Native nlink widths differ across Unix; compare losslessly.
                 if Some(u128::from(observed.stat.st_nlink))
@@ -246,14 +301,15 @@ impl RootedStagedGroup {
                 reason: error.to_string(),
             })?;
             let RootedStagedFile { file, namespace } = self.anchor;
-            let published = RootedPublishedFile::from_committed(
+            let mut published = RootedPublishedFile::from_committed(
                 file,
                 namespace.rooted.clone(),
                 representative,
                 Some(admission),
                 finalize,
-            )?
-            .finalize_owned_blocking(flags)?;
+            )?;
+            published.group_links = namespace.group_links.clone();
+            let published = published.finalize_owned_blocking(flags)?;
             Ok(RootedFinalizedGroup { published, members })
         }
         #[cfg(not(unix))]

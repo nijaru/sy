@@ -11,11 +11,17 @@ mod metadata;
 #[cfg(all(unix, feature = "acl"))]
 use acl_state::{acl_matches_fd, apply_acl_fd, desired_acl_entries, read_acl_entries_fd};
 mod group;
+#[cfg(unix)]
+mod group_links;
 pub(crate) use group::RootedStagedGroup;
 pub mod backup;
 mod group_metadata;
 #[cfg(all(test, unix))]
 mod group_tests;
+#[cfg(unix)]
+pub mod local_source_effects;
+#[cfg(unix)]
+use local_source_effects::{SourceEffect, SourceEffectKind};
 pub mod operand;
 mod publication;
 #[cfg(unix)]
@@ -125,23 +131,46 @@ pub enum RootedFsError {
     #[error("directory mutation requires an observed finalization request")]
     UnobservedDirectoryMutation,
 
-    #[error("root directory identity changed after it was opened: {0}")]
+    #[error("original root operator binding changed after acquisition: {0}")]
     RootChanged(PathBuf),
 
     #[error("original source binding changed: {0}")]
     SourceBindingChanged(PathBuf),
 
+    #[error("source link following has no confined resolution authority: {0}")]
+    SourceFollowUnsupported(PathBuf),
+
+    #[error("--remove-source-files does not support followed SOURCE names: {0}")]
+    SourceFollowRemovalUnsupported(PathBuf),
+
     #[error("source name has no original scanner observation: {0}")]
     SourceUnobserved(PathBuf),
 
+    #[error("source work cut off by an already detected native source race")]
+    SourceRaceCutoff,
+
     #[error("source observation catalogue is terminal")]
     SourceCatalogueTerminal,
+
+    #[error("local SOURCE requires operator provenance captured at original acquisition")]
+    SourceOperatorUncaptured,
+
+    #[error("source protection inventory requires a completed scan")]
+    SourceInventoryIncomplete,
+
+    #[error("LOCAL destination effect cannot be proved independent of original SOURCE under strict root confinement: {0}")]
+    SourceEffectUnqualified(PathBuf),
+
+    #[error("source reference does not bind this original catalogue/path")]
+    SourceReferenceMismatch,
 
     #[error("destination namespace catalogue is terminal")]
     NamespaceCatalogueTerminal,
 
     #[error("destination namespace qualification is not sealed")]
     NamespaceUnsealed,
+    #[error("staged group link ownership is uncertain; retain private artifacts")]
+    GroupLinkOwnershipUncertain,
 
     #[error("destination directory has no original namespace qualification: {0}")]
     NamespaceUnqualified(PathBuf),
@@ -261,6 +290,8 @@ pub type Result<T> = std::result::Result<T, RootedFsError>;
 pub struct RootedFs {
     mutation_admission: RootedMutationAdmission,
     run_admission: Option<Arc<PublicationAdmission>>,
+    #[cfg(unix)]
+    local_source_effects: Option<local_source_effects::LocalSourceEffects>,
     // Local source runs reject a divergent configured name as well as retaining
     // the FD. Negotiated remote roots instead intentionally survive relocation.
     source_path_continuity: bool,
@@ -401,20 +432,13 @@ struct RootedCopySource<'a> {
     expected: EntryIdentity,
 }
 
-/// Original read-only file and the parent/name that opened it. This is source
-/// authority only; destination retirement cannot advance its observation.
-pub(crate) struct RootedSourceFile {
-    #[cfg(unix)]
+/// A no-follow SOURCE unlink member, separate from effective DATA readers.
+/// Only confirmed own unlinks can advance its native continuation state.
+#[cfg(unix)]
+struct SourceMember {
     parent: OwnedFd,
-    #[cfg(unix)]
     leaf: OsString,
     file: File,
-}
-
-impl RootedSourceFile {
-    pub(crate) fn file(&self) -> &File {
-        &self.file
-    }
 }
 
 /// A client-owned OLD reader is not SOURCE catalogue authority. Retain its
@@ -543,6 +567,9 @@ pub struct RootedStagedFile {
 pub(crate) enum PublicationPausePoint {
     BeforeDestinationObservation,
     AfterDestinationObservation,
+    AfterSourceBinding,
+    AfterSourceValidation,
+    AfterPrivateDirectoryCreation,
     BeforeAdmission,
     AfterAdmission,
 }
@@ -572,11 +599,13 @@ struct RootedNamespaceTransaction {
     #[cfg(unix)]
     independent_publication: bool,
     #[cfg(unix)]
-    parent_fd: OwnedFd,
+    parent_fd: Arc<OwnedFd>,
     #[cfg(unix)]
-    staging_dir_fd: OwnedFd,
+    staging_dir_fd: Arc<OwnedFd>,
     #[cfg(unix)]
     staging_dir_name: OsString,
+    #[cfg(unix)]
+    private_creation: local_source_effects::PrivateCreationAdmission,
     #[cfg(unix)]
     temp_name: OsString,
     #[cfg(unix)]
@@ -592,6 +621,10 @@ struct RootedNamespaceTransaction {
     // Group aliases/anchor may already share a visible inode. Refuse cleanup
     // after foreign metadata edits and account only our verified own unlink.
     strict_cleanup: bool,
+    #[cfg(unix)]
+    group_links: Option<Arc<std::sync::Mutex<group_links::GroupLinks>>>,
+    #[cfg(unix)]
+    group_private_link: Option<group_links::PrivateLink>,
     // Backup-only spelling proof supplements SnapshotAtOpen, including late
     // same-inode case/normalization renames that identity cannot detect.
     backup_address: bool,
@@ -691,6 +724,7 @@ impl RootedStagedFile {
     ) -> Result<()> {
         #[cfg(unix)]
         {
+            self.validate_private_source_effect_blocking()?;
             apply_fd_metadata(self.file.as_raw_fd(), unix_mode, modified)
         }
         #[cfg(not(unix))]
@@ -719,6 +753,7 @@ impl RootedStagedFile {
                 bsd_flags: None,
             };
             preservation.validate()?;
+            self.validate_private_source_effect_blocking()?;
             preservation.apply(&self.file, unix_mode, modified)
         }
         #[cfg(not(unix))]
@@ -851,12 +886,7 @@ impl RootedNamespaceTransaction {
                 Ok(())
             })
             .err();
-        let remove_dir = remove_owned_staging_dir_at(
-            self.parent_fd.as_raw_fd(),
-            self.staging_dir_fd.as_raw_fd(),
-            &self.staging_dir_name,
-        )
-        .err();
+        let remove_dir = self.remove_private_directory_blocking().err();
         if remove_file.is_none() && remove_dir.is_none() {
             self.committed = true;
             return Ok(());
@@ -865,6 +895,16 @@ impl RootedNamespaceTransaction {
             file: remove_file.map(|error| error.to_string()),
             directory: remove_dir.map(|error| error.to_string()),
         })
+    }
+
+    #[cfg(unix)]
+    fn remove_private_directory_blocking(&self) -> Result<()> {
+        self.verify_private_cleanup_parent_blocking()?;
+        remove_owned_staging_dir_at(
+            self.parent_fd.as_raw_fd(),
+            self.staging_dir_fd.as_raw_fd(),
+            &self.staging_dir_name,
+        )
     }
 
     #[cfg(not(unix))]
@@ -992,6 +1032,7 @@ impl RootedNamespaceTransaction {
         // blocking namespace/lineage checks, never by adopting a fresh identity.
         validate_source()?;
         staging_check?;
+        self.validate_publication_source_effect_blocking()?;
         let permits = admit_publication(session_admission, run_admission, transaction_admission)?;
         #[cfg(test)]
         self.rooted
@@ -1008,6 +1049,27 @@ impl RootedNamespaceTransaction {
         let staging_check = self.observe_staging();
         validate_source()?;
         staging_check?;
+        self.validate_publication_source_effect_blocking()?;
+        // Repeat selected SOURCE/data validation after census. This callback
+        // may block, so the aggregate group and DST proofs follow it.
+        if self.rooted.local_source_effects.is_some() {
+            validate_source()?;
+        }
+        self.verify_group_links_blocking()?;
+        // SOURCE census can block after the preceding OLD observations. Never
+        // retire an inode that acquired a foreign alias during that validation.
+        self.verify_parent_binding()?;
+        self.verify_expected_destination_with_lineage(lineage.as_deref_mut())?;
+        if let Some(old) = &self.retired_destination {
+            let named = stat_at_optional(self.parent_fd.as_raw_fd(), &self.destination_name)?
+                .ok_or_else(|| RootedFsError::DestinationChanged(self.destination_path.clone()))?;
+            old.verify(&named, &self.destination_path)?;
+        }
+        if self.rooted.local_source_effects.is_some() {
+            // Directory renames preserve the staged FILE seal and link count.
+            self.verify_private_cleanup_directory_blocking()?;
+        }
+        self.observe_staging()?;
         if is_type_transition {
             rename_exchange_at(
                 self.staging_dir_fd.as_raw_fd(),
@@ -1045,6 +1107,22 @@ impl RootedNamespaceTransaction {
             self.committed = true;
         }
 
+        if let Some(links) = &self.group_links {
+            links
+                .lock()
+                .map_err(|_| RootedFsError::IncompleteStagedGroup)?
+                .record_publication(&self.destination_path)
+                .map_err(|error| RootedFsError::CommittedFinalizationFailed {
+                    path: self.destination_path.clone(),
+                    reason: error.to_string(),
+                })?;
+            if !matches!(
+                self.expected_destination,
+                HeldDestinationExpectation::Absent
+            ) {
+                self.group_private_link = None;
+            }
+        }
         self.cleanup_owned = if is_type_transition {
             self.retired_destination
                 .as_ref()
@@ -1099,6 +1177,17 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(unix)]
+    fn validate_publication_source_effect_blocking(&self) -> Result<()> {
+        self.rooted.require_source_effect_blocking(SourceEffect {
+            kind: SourceEffectKind::LeafPublication,
+            parent: self.parent_fd.as_raw_fd(),
+            name: &self.destination_name,
+            object: None,
+            path: &self.destination_path,
+        })
+    }
+
+    #[cfg(unix)]
     fn finish_commit_blocking(
         &mut self,
         mut lineage: Option<&mut RetirementLineage>,
@@ -1137,11 +1226,7 @@ impl RootedNamespaceTransaction {
                 }
                 self.retired_destination = None;
             }
-            remove_owned_staging_dir_at(
-                self.parent_fd.as_raw_fd(),
-                self.staging_dir_fd.as_raw_fd(),
-                &self.staging_dir_name,
-            )
+            self.remove_private_directory_blocking()
         };
         let cleanup_result = cleanup();
         if staged_link_removed {
@@ -1380,16 +1465,35 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    fn admit_mutation_blocking(&self) -> Result<[Option<PublicationPermit<'_>>; 3]> {
-        self.admit_mutation_with_transaction_blocking(None)
+    fn admit_mutation_blocking(
+        &self,
+        effect: SourceEffect<'_>,
+    ) -> Result<[Option<PublicationPermit<'_>>; 3]> {
+        self.admit_mutation_with_transaction_blocking(None, effect)
     }
 
     #[cfg(unix)]
     fn admit_mutation_with_transaction_blocking<'a>(
         &'a self,
         transaction: Option<&'a PublicationAdmission>,
+        effect: SourceEffect<'_>,
     ) -> Result<[Option<PublicationPermit<'a>>; 3]> {
         self.require_writable()?;
+        self.require_source_effect_blocking(effect)?;
+        self.admit_validated_observation_blocking(transaction)
+    }
+
+    // Observation admission retains cancellation/session ordering but grants no
+    // setter or namespace authority. Callers must remain read-only afterward.
+    #[cfg(unix)]
+    fn admit_validated_observation_blocking<'a>(
+        &'a self,
+        transaction: Option<&'a PublicationAdmission>,
+    ) -> Result<[Option<PublicationPermit<'a>>; 3]> {
+        if matches!(self.mutation_admission, RootedMutationAdmission::ReadOnly) {
+            return Err(RootedFsError::ReadOnlyRoot);
+        }
+        self.require_namespace_sealed()?;
         let session = match &self.mutation_admission {
             RootedMutationAdmission::Session(admission) => Some(admission.as_ref()),
             _ => None,
@@ -1460,17 +1564,69 @@ impl RootedFs {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn open_blocking_for_worker(root: PathBuf) -> Result<Self> {
         Self::open_blocking(root)
     }
 
-    pub(crate) fn into_local_source_authority(mut self) -> Self {
-        self.source_path_continuity = true;
-        self
+    #[cfg(unix)]
+    pub(crate) fn open_local_source_blocking(root: PathBuf) -> Result<Self> {
+        let source = source_observations::operator::acquire(root, true, true)?;
+        match source.shape {
+            operand::SourceShape::Directory { .. } => Ok(source.rooted),
+            operand::SourceShape::Leaf { .. } => {
+                Err(std::io::Error::from_raw_os_error(libc::ENOTDIR).into())
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn next_source_run_blocking(&self) -> Result<Self> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_run_cancellation(
+        &self,
+        _source_race: bool,
+    ) -> Result<Arc<std::sync::atomic::AtomicBool>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn retry_source_run_blocking(&self) -> Result<Self> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn retire_failed_source_run_blocking(&self, _source_race: bool) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn open_local_source_blocking(_root: PathBuf) -> Result<Self> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    pub(crate) fn same_source_run(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            Arc::ptr_eq(&self.source_observations, &other.source_observations)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = other;
+            false
+        }
     }
 
     pub(crate) fn is_local_source_authority(&self) -> bool {
         self.source_path_continuity
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn check_source_removal_support_blocking(&self, _path: &RelativePath) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
     }
 
     #[cfg(not(unix))]
@@ -1489,6 +1645,40 @@ impl RootedFs {
         _path: &RelativePath,
         _file: &std::fs::File,
     ) -> Result<()> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_metadata_following_blocking(
+        &self,
+        _path: &RelativePath,
+    ) -> Result<crate::endpoint::FileMetadata> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_scan_metadata_blocking(
+        &self,
+        _path: &RelativePath,
+        _follow: bool,
+    ) -> Result<crate::endpoint::FileMetadata> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_following_identity_blocking(
+        &self,
+        _path: &RelativePath,
+    ) -> Result<Option<EntryIdentity>> {
+        Err(RootedFsError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn source_entry_metadata_blocking(
+        &self,
+        _path: &RelativePath,
+        _request: crate::engine::scan::ScanRequest,
+    ) -> Result<crate::engine::domain::Entry> {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
@@ -1645,7 +1835,8 @@ impl RootedFs {
         // Source observations are always exact. Destination retirement is not
         // permission to adopt a new source version, even on an aliasing inode.
         self.validate_source_observation_blocking(relative)?;
-        let expected = if self.is_source_authority() {
+        let source = self.is_source_authority();
+        let expected = if source {
             scanned
         } else {
             lineage.resolve(scanned)?
@@ -1655,9 +1846,11 @@ impl RootedFs {
             || crate::endpoint::local_identity::metadata_identity(&metadata, EntryKind::File)
                 != Some(expected)
         {
-            return Err(RootedFsError::DestinationChanged(
-                relative.as_path().to_path_buf(),
-            ));
+            return Err(if source {
+                RootedFsError::SourceBindingChanged(relative.as_path().to_path_buf())
+            } else {
+                RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+            });
         }
         #[cfg(all(test, unix))]
         {
@@ -1671,7 +1864,12 @@ impl RootedFs {
         }
         // Compare the name with the same required version, not a fresh FD stat:
         // a foreign edit between the checks must not be adopted as ownership.
-        if self.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
+        if source {
+            // The original SOURCE may be a selected LINK with FILE DATA.
+            // Validate its actual reader and original transcript, not the
+            // no-follow LINK identity, and never apply destination lineage.
+            self.validate_source_reader_blocking(relative, file)?;
+        } else if self.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
             return Err(RootedFsError::DestinationChanged(
                 relative.as_path().to_path_buf(),
             ));
@@ -1695,6 +1893,17 @@ impl RootedFs {
     /// This is a blocking syscall API and must run on a blocking worker.
     pub fn open_regular_blocking(&self, relative: &RelativePath) -> Result<File> {
         self.open_regular_path_blocking(relative.as_path())
+    }
+
+    /// Observation reads can use already-qualified SOURCE FILE DATA. This
+    /// changes neither the no-follow API nor original-name unlink authority.
+    pub(crate) fn open_observed_regular_blocking(&self, relative: &RelativePath) -> Result<File> {
+        #[cfg(unix)]
+        if self.is_source_authority() {
+            return self.open_source_following_blocking(relative);
+        }
+        // Non-Unix keeps open_regular's explicit unsupported-platform result.
+        self.open_regular_blocking(relative)
     }
 
     /// A scanner's active directory starts at this held authority, not a fresh
@@ -1724,6 +1933,12 @@ impl RootedFs {
         let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
         let stat = stat_at_no_follow(parent.as_raw_fd(), &leaf)?;
         self.validate_source_observation_blocking(relative)?;
+        Self::metadata_from_stat(&stat)
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_cast)] // libc integer widths differ by platform.
+    fn metadata_from_stat(stat: &libc::stat) -> Result<crate::endpoint::FileMetadata> {
         let seconds = stat.st_mtime as i64;
         let nanoseconds = u32::try_from(stat.st_mtime_nsec).map_err(std::io::Error::other)?;
         let duration = std::time::Duration::new(seconds.unsigned_abs(), nanoseconds);
@@ -1784,7 +1999,11 @@ impl RootedFs {
     /// a divergent pathname.
     #[cfg(unix)]
     pub fn verify_root_path_blocking(&self) -> Result<()> {
-        verify_root_path_identity(&self.root_path, self.root_fd.as_raw_fd())
+        if self.source_path_continuity {
+            self.validate_operator_address_blocking()
+        } else {
+            verify_root_path_identity(&self.root_path, self.root_fd.as_raw_fd())
+        }
     }
 
     #[cfg(not(unix))]
@@ -1866,66 +2085,6 @@ impl RootedFs {
         Err(RootedFsError::UnsupportedPlatform)
     }
 
-    /// Read-only local effect protection uses the held destination namespace,
-    /// including the leaf's target for conservative selected-source protection.
-    /// Following here only observes aliases; it never authorizes data access or
-    /// mutation outside the root. The caller retains source path continuity.
-    #[cfg(unix)]
-    #[allow(clippy::unnecessary_cast)] // libc device/inode integer types differ by platform.
-    pub(crate) fn effect_aliases_local_source_blocking(
-        &self,
-        relative: &RelativePath,
-        source: &Path,
-    ) -> Result<bool> {
-        use std::os::unix::fs::MetadataExt;
-        let (parent, leaf) = match self.open_parent_blocking(relative.as_path()) {
-            Ok(parent) => parent,
-            Err(RootedFsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(false)
-            }
-            Err(error) => return Err(error),
-        };
-        let source_entry = std::fs::symlink_metadata(source)?;
-        if stat_at_optional(parent.as_raw_fd(), &leaf)?.is_some_and(|stat| {
-            stat.st_dev as u64 == source_entry.dev() && stat.st_ino as u64 == source_entry.ino()
-        }) {
-            return Ok(true);
-        }
-        // Preserved symlink targets are opaque data. A missing or cyclic
-        // target has no resolved inode to compare; other lookup failures must
-        // still prevent an unproven alias decision.
-        let source_target = match std::fs::metadata(source) {
-            Ok(metadata) => metadata,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                return Ok(false)
-            }
-            Err(error) => return Err(error.into()),
-        };
-        match stat_at(parent.as_raw_fd(), &leaf, 0) {
-            Ok(stat) => Ok(stat.st_dev as u64 == source_target.dev()
-                && stat.st_ino as u64 == source_target.ino()),
-            Err(RootedFsError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::ELOOP) =>
-            {
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn effect_aliases_local_source_blocking(
-        &self,
-        _relative: &RelativePath,
-        _source: &Path,
-    ) -> Result<bool> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
     /// Validate one deferred hardlink source name against its exact scanned
     /// identity. The removal journal runs this for every published member
     /// before unlinking any of them, so a pre-deferred race preserves the whole
@@ -1989,7 +2148,13 @@ impl RootedFs {
         let (member, before) =
             self.open_source_member_blocking(relative.as_path(), scanned, expected)?;
         self.verify_parent_binding_blocking(relative.as_path(), &member.parent)?;
-        let _permit = self.admit_mutation_blocking()?;
+        let _permit = self.admit_mutation_blocking(SourceEffect {
+            kind: SourceEffectKind::NamespaceRetirement,
+            parent: member.parent.as_raw_fd(),
+            name: &member.leaf,
+            object: Some(member.file.as_raw_fd()),
+            path: relative.as_path(),
+        })?;
         // The pathname guard detects divergence; the syscall still uses the
         // original descriptor if the namespace changes after this check.
         self.verify_source_root_path_blocking()?;
@@ -2335,6 +2500,13 @@ impl RootedFs {
         expected: EntryIdentity,
         read: impl FnOnce(&File) -> Result<T>,
     ) -> Result<T> {
+        if kind == EntryKind::File && self.is_source_authority() {
+            let file = self.open_observed_regular_blocking(relative)?;
+            self.observed_regular_metadata_blocking(&file, relative, expected)?;
+            let value = read(&file)?;
+            self.observed_regular_metadata_blocking(&file, relative, expected)?;
+            return Ok(value);
+        }
         let mut lineage = self
             .retirement
             .lock()
@@ -2601,6 +2773,7 @@ impl RootedFs {
         Self {
             mutation_admission: RootedMutationAdmission::Unrestricted,
             run_admission: None,
+            local_source_effects: None,
             source_path_continuity: false,
             source_observations: Arc::new(std::sync::Mutex::new(Default::default())),
             destination_namespace: None,
@@ -2655,9 +2828,10 @@ impl RootedFs {
             Ok(file) => file,
             Err(error) => return Err(namespace.abort_after(error)),
         };
-        if let Err(error) = namespace.register_staging(&file) {
-            return Err(namespace.abort_after(error));
-        }
+        let file = match namespace.register_created_staging(file) {
+            Ok(file) => file,
+            Err(error) => return Err(namespace.abort_after(error)),
+        };
         if let Err(error) = verify_staging_file_group(namespace.parent_fd.as_raw_fd(), &file) {
             return Err(namespace.abort_after(error));
         }
@@ -2675,6 +2849,14 @@ impl RootedFs {
         // pull source. Publication itself must still obtain late admission.
         self.require_writable()?;
         let (parent_fd, destination_name) = self.open_parent_blocking(relative)?;
+        let parent_fd = if relative.parent() == Some(Path::new("")) {
+            // open_parent already checked this namespace. Its root duplicate
+            // pins the same directory as the retained root, so share that pin.
+            drop(parent_fd);
+            Arc::clone(&self.root_fd)
+        } else {
+            Arc::new(parent_fd)
+        };
         let expected_destination = if matches!(expected, ExpectedDestination::Absent) {
             verify_absent_at(parent_fd.as_raw_fd(), &destination_name, relative)?;
             HeldDestinationExpectation::Absent
@@ -2691,12 +2873,24 @@ impl RootedFs {
                 &mut lineage,
             )?
         };
+        let private_creation = self.admit_private_creation_blocking(SourceEffect {
+            kind: if matches!(origin, StagingOrigin::Created) {
+                SourceEffectKind::LeafPublication
+            } else {
+                SourceEffectKind::Unknown
+            },
+            parent: parent_fd.as_raw_fd(),
+            name: &destination_name,
+            object: None,
+            path: relative,
+        })?;
         let temp_name = OsString::from("contents");
 
         for _ in 0..TEMP_CREATE_ATTEMPTS {
             let staging_dir_name = next_temp_name();
             let staging_dir_fd =
-                match create_private_staging_dir_at(parent_fd.as_raw_fd(), &staging_dir_name) {
+                match create_private_staging_dir_at(self, parent_fd.as_raw_fd(), &staging_dir_name)
+                {
                     Ok(fd) => fd,
                     Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EEXIST) => {
                         continue;
@@ -2712,8 +2906,9 @@ impl RootedFs {
                 independent_publication: matches!(expected, ExpectedDestination::Absent)
                     && matches!(origin, StagingOrigin::Created),
                 parent_fd,
-                staging_dir_fd,
+                staging_dir_fd: Arc::new(staging_dir_fd),
                 staging_dir_name,
+                private_creation,
                 temp_name,
                 destination_name,
                 destination_path: relative.to_path_buf(),
@@ -2722,6 +2917,8 @@ impl RootedFs {
                 cleanup_owned: None,
                 sealed: None,
                 strict_cleanup: false,
+                group_links: None,
+                group_private_link: None,
                 backup_address: false,
                 committed: false,
             });
@@ -2805,7 +3002,13 @@ impl RootedFs {
             // and ctime. Admit that syscall separately; it does not authorize
             // the later destination publication after cancellation.
             {
-                let _permit = self.admit_mutation_blocking()?;
+                let _permit = self.admit_mutation_blocking(SourceEffect {
+                    kind: SourceEffectKind::LinkCountChange,
+                    parent: source_parent.as_raw_fd(),
+                    name: &source_leaf,
+                    object: Some(source_file.as_raw_fd()),
+                    path: source,
+                })?;
                 link_at(
                     source_parent.as_raw_fd(),
                     &source_leaf,
@@ -2938,52 +3141,12 @@ impl RootedFs {
     }
 
     #[cfg(unix)]
-    pub(crate) fn capture_source_file_blocking(
-        &self,
-        relative: &RelativePath,
-        scanned: EntryIdentity,
-    ) -> Result<RootedSourceFile> {
-        self.validate_catalogued_source_blocking(relative)?;
-        let (source, _) = self.open_source_member_blocking(relative.as_path(), scanned, None)?;
-        self.validate_source_file_parent_blocking(relative, &source)?;
-        Ok(source)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn capture_source_file_blocking(
-        &self,
-        _relative: &RelativePath,
-        _scanned: EntryIdentity,
-    ) -> Result<RootedSourceFile> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn validate_source_file_parent_blocking(
-        &self,
-        relative: &RelativePath,
-        source: &RootedSourceFile,
-    ) -> Result<()> {
-        self.validate_source_observation_blocking(relative)?;
-        self.verify_parent_binding_blocking(relative.as_path(), &source.parent)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn validate_source_file_parent_blocking(
-        &self,
-        _relative: &RelativePath,
-        _source: &RootedSourceFile,
-    ) -> Result<()> {
-        Err(RootedFsError::UnsupportedPlatform)
-    }
-
-    #[cfg(unix)]
     fn open_source_member_blocking(
         &self,
         relative: &Path,
         scanned: EntryIdentity,
         expected: Option<&HardlinkSourceState>,
-    ) -> Result<(RootedSourceFile, HardlinkSourceState)> {
+    ) -> Result<(SourceMember, HardlinkSourceState)> {
         self.validate_source_binding_blocking(relative, expected.is_none())?;
         let changed = || RootedFsError::DestinationChanged(relative.to_path_buf());
         let (parent, leaf) = self.open_parent_blocking(relative)?;
@@ -3005,7 +3168,7 @@ impl RootedFs {
                 }
             }
         }
-        Ok((RootedSourceFile { parent, leaf, file }, state))
+        Ok((SourceMember { parent, leaf, file }, state))
     }
 
     #[cfg(unix)]
@@ -3097,7 +3260,13 @@ impl RootedFs {
                     if let Some(address) = backup_address {
                         self.verify_backup_address_blocking(address)?;
                     }
-                    let _permit = self.admit_mutation_blocking()?;
+                    let _permit = self.admit_mutation_blocking(SourceEffect {
+                        kind: SourceEffectKind::DirectoryNamespaceChange,
+                        parent: current_fd.as_raw_fd(),
+                        name,
+                        object: None,
+                        path: &prefix,
+                    })?;
                     if let Some(address) = backup_address {
                         self.verify_backup_address_blocking(address)?;
                     }
@@ -3140,7 +3309,13 @@ impl RootedFs {
         self.require_writable()?;
         self.namespace_predicts_absent(relative, parent.as_raw_fd())?;
         self.verify_parent_binding_blocking(relative, &parent)?;
-        let _permit = self.admit_mutation_blocking()?;
+        let _permit = self.admit_mutation_blocking(SourceEffect {
+            kind: SourceEffectKind::DirectoryNamespaceChange,
+            parent: parent.as_raw_fd(),
+            name: &leaf,
+            object: None,
+            path: relative,
+        })?;
         self.verify_parent_binding_blocking(relative, &parent)?;
         let result = unsafe {
             // SAFETY: `parent` remains open and `leaf_c` is a live single
@@ -3249,7 +3424,13 @@ impl RootedFs {
                 RetirementStep::Unlink,
             )?,
         };
-        let _permit = self.admit_mutation_blocking()?;
+        let _permit = self.admit_mutation_blocking(SourceEffect {
+            kind: SourceEffectKind::NamespaceRetirement,
+            parent: parent.as_raw_fd(),
+            name: &leaf,
+            object: None,
+            path: relative,
+        })?;
         if let Some(old) = &retired {
             self.verify_parent_binding_blocking(relative, &parent)?;
             let named = stat_at_optional(parent.as_raw_fd(), &leaf)?
@@ -3458,7 +3639,11 @@ fn open_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
 }
 
 #[cfg(unix)]
-fn create_private_staging_dir_at(parent: RawFd, component: &OsStr) -> Result<OwnedFd> {
+fn create_private_staging_dir_at(
+    rooted: &RootedFs,
+    parent: RawFd,
+    component: &OsStr,
+) -> Result<OwnedFd> {
     let name = component_cstring(component)?;
     let result = unsafe {
         // SAFETY: `parent` is a held directory descriptor and `name` is a live
@@ -3468,6 +3653,8 @@ fn create_private_staging_dir_at(parent: RawFd, component: &OsStr) -> Result<Own
     if result != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
+    #[cfg(test)]
+    rooted.pause_mutation(PublicationPausePoint::AfterPrivateDirectoryCreation);
 
     let created = match stat_at_no_follow(parent, component) {
         Ok(metadata) => metadata,
@@ -3499,6 +3686,13 @@ fn create_private_staging_dir_at(parent: RawFd, component: &OsStr) -> Result<Own
     };
     let opened = match stat_fd(directory.as_raw_fd()) {
         Ok(metadata) => metadata,
+        Err(error) if rooted.local_source_effects.is_some() => {
+            return Err(RootedFsError::StagingPreparationCleanupFailed {
+                operation: error.to_string(),
+                cleanup: "acquired directory is not SOURCE-qualified; left its name untouched"
+                    .into(),
+            });
+        }
         Err(error) => {
             return Err(cleanup_staging_directory_preparation(
                 error,
@@ -3511,6 +3705,17 @@ fn create_private_staging_dir_at(parent: RawFd, component: &OsStr) -> Result<Own
     if opened.st_dev != created.st_dev || opened.st_ino != created.st_ino {
         return Err(RootedFsError::StagingDirectoryChanged);
     }
+    // mkdir does not return a creator FD. A first stat/open may have acquired a
+    // substituted SOURCE directory, so parent admission cannot authorize its
+    // ACL isolation, child creation, or failure cleanup. Failed qualification
+    // deliberately leaves the unowned name untouched.
+    rooted.require_source_effect_blocking(SourceEffect {
+        kind: SourceEffectKind::PrivateDirectoryMetadata,
+        parent,
+        name: component,
+        object: Some(directory.as_raw_fd()),
+        path: Path::new(component),
+    })?;
     if let Err(error) = make_staging_directory_private(parent, directory.as_raw_fd()) {
         return match remove_owned_staging_dir_at(parent, directory.as_raw_fd(), component) {
             Ok(()) => Err(error),
@@ -4654,6 +4859,10 @@ mod tests {
             })
         ));
         assert!(relocated.is_dir());
+        // The original parent/name no longer owns this namespace. Even its
+        // genuine creator FD must not authorize child deletion after relocation.
+        assert!(relocated.join("contents").is_file());
+        std::fs::remove_file(relocated.join("contents")).unwrap();
         std::fs::remove_dir(relocated).unwrap();
     }
 

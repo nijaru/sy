@@ -5,7 +5,7 @@
 
 use crate::endpoint::io::Preservation;
 use crate::engine::domain::{EntryIdentity, EntryKind, RelativePath};
-use crate::rooted_fs::{RootedFs, RootedFsError, RootedSourceFile};
+use crate::rooted_fs::{RootedFs, RootedFsError};
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -19,6 +19,13 @@ pub(crate) enum SourceFileError {
     Changed { path: PathBuf },
     #[error("source observation has no data authority")]
     ObservationOnly,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("destination publication acknowledged, but source completion validation failed; destination is committed and source completion is uncertain: {source}")]
+pub(crate) struct SourceCompletionError {
+    #[source]
+    pub(crate) source: SourceFileError,
 }
 
 pub(crate) type Result<T> = std::result::Result<T, SourceFileError>;
@@ -78,7 +85,17 @@ impl SourceObservation {
         self.rooted
             .validate_catalogued_source_blocking(relative)
             .map_err(|error| changed(error, relative))?;
-        if self.rooted.path_identity_blocking(relative)? != Some((EntryKind::File, expected)) {
+        let observed = self
+            .rooted
+            .source_entry_metadata_blocking(
+                relative,
+                crate::engine::scan::ScanRequest {
+                    follow_symlinks: true,
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| changed(error, relative))?;
+        if observed.kind != EntryKind::File || observed.identity != Some(expected) {
             return Err(SourceFileError::Changed {
                 path: relative.as_path().to_path_buf(),
             });
@@ -98,14 +115,14 @@ fn changed(error: RootedFsError, relative: &RelativePath) -> SourceFileError {
     }
 }
 
-/// Group bookkeeping can be readless; bytes and requested native preservation
+/// FILE observation can be readless; bytes and requested native preservation
 /// always require a genuine original reader. Neither variant authorizes removal.
-pub(crate) enum GroupSource {
+pub(crate) enum SourceFileAccess {
     Observation(SourceObservation),
     Data(SourceFile),
 }
 
-impl GroupSource {
+impl SourceFileAccess {
     pub(crate) fn capture_blocking(
         rooted: RootedFs,
         relative: RelativePath,
@@ -169,11 +186,11 @@ impl GroupSource {
     }
 }
 
-/// Owns the original regular-file FD and opening parent. Acquisition remains
-/// mandatory-read for every caller; observation-only work uses GroupSource.
+/// Owns a genuine authenticated DATA reader, not a named unlink member.
+/// Acquisition remains mandatory-read; observation-only work uses SourceFileAccess.
 pub(crate) struct SourceFile {
     observation: SourceObservation,
-    member: RootedSourceFile,
+    file: File,
 }
 
 impl SourceFile {
@@ -186,19 +203,18 @@ impl SourceFile {
         if !cfg!(unix) {
             return Err(RootedFsError::UnsupportedPlatform.into());
         }
-        // RootedFs opens O_RDONLY, no-follow, through its held root directory.
-        let member = rooted
-            .capture_source_file_blocking(&relative, identity)
-            .map_err(|error| changed(error, &relative))?;
-        let source = Self {
-            observation: SourceObservation {
-                rooted,
-                relative,
-                identity,
-                size,
-            },
-            member,
+        let observation = SourceObservation {
+            rooted,
+            relative,
+            identity,
+            size,
         };
+        observation.validate_blocking()?;
+        let file = observation
+            .rooted
+            .open_observed_regular_blocking(&observation.relative)
+            .map_err(|error| changed(error, &observation.relative))?;
+        let source = Self { observation, file };
         source.validate_blocking()?;
         Ok(source)
     }
@@ -224,7 +240,7 @@ impl SourceFile {
         if !cfg!(unix) {
             return Err(RootedFsError::UnsupportedPlatform.into());
         }
-        let metadata = self.member.file().metadata()?;
+        let metadata = self.file.metadata()?;
         let observation = &self.observation;
         if !metadata.is_file()
             || metadata.len() != observation.size
@@ -237,7 +253,7 @@ impl SourceFile {
         }
         observation
             .rooted
-            .validate_source_file_parent_blocking(&observation.relative, &self.member)
+            .validate_source_reader_blocking(&observation.relative, &self.file)
             .map_err(|error| changed(error, &observation.relative))
     }
 
@@ -245,7 +261,7 @@ impl SourceFile {
     /// ORIGINAL open-file description; the carrier only stats/reads metadata.
     pub(crate) fn clone_reader_blocking(&self) -> Result<File> {
         self.validate_blocking()?;
-        Ok(self.member.file().try_clone()?)
+        Ok(self.file.try_clone()?)
     }
 
     /// Bounded, demand-driven native metadata from the original content FD.
@@ -258,7 +274,7 @@ impl SourceFile {
             let value = self
                 .observation
                 .rooted
-                .read_open_file_xattrs_blocking(self.member.file(), &self.observation.relative)?;
+                .read_open_file_xattrs_blocking(&self.file, &self.observation.relative)?;
             self.validate_blocking()?;
             Some(value)
         } else {
@@ -268,7 +284,7 @@ impl SourceFile {
             let value = self
                 .observation
                 .rooted
-                .read_open_file_acl_blocking(self.member.file(), &self.observation.relative)?
+                .read_open_file_acl_blocking(&self.file, &self.observation.relative)?
                 .unwrap_or_default();
             self.validate_blocking()?;
             Some(value)
@@ -279,7 +295,7 @@ impl SourceFile {
             let value = self
                 .observation
                 .rooted
-                .read_open_file_bsd_flags_blocking(self.member.file())?;
+                .read_open_file_bsd_flags_blocking(&self.file)?;
             self.validate_blocking()?;
             Some(value)
         } else {
@@ -309,6 +325,146 @@ mod tests {
         SourceFile::capture_blocking(rooted, path, identity, size).unwrap()
     }
 
+    #[tokio::test]
+    async fn selected_followed_file_keeps_data_and_named_removal_authority_separate() {
+        use crate::endpoint::source_root::SourceRoot;
+        use crate::rooted_fs::operand::{BoundSource, SourceShape};
+        use futures::TryStreamExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        for require_data in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("file");
+            let link = root.path().join("selected");
+            std::fs::write(&target, b"qualified DATA").unwrap();
+            xattr::set(&target, "user.sy-source-reader", b"qualified").unwrap();
+            std::fs::set_permissions(
+                &target,
+                std::fs::Permissions::from_mode(if require_data { 0o600 } else { 0o000 }),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let named_before = std::fs::symlink_metadata(&link).unwrap();
+            let data_before = std::fs::metadata(&target).unwrap();
+            let bound = BoundSource::open_local_following(link.clone(), false)
+                .await
+                .unwrap();
+            let SourceShape::Leaf { name } = bound.shape else {
+                panic!("not selected")
+            };
+            let source = SourceRoot::from_rooted(bound.rooted).unwrap();
+            let entries = source
+                .selected_entries(
+                    name,
+                    crate::engine::scan::ScanRequest {
+                        follow_symlinks: true,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let entry = entries.into_iter().next().unwrap();
+            let rooted = source.rooted();
+            tokio::task::spawn_blocking(move || {
+                let original = SourceFileAccess::capture_blocking(
+                    rooted.clone(),
+                    entry.path.clone(),
+                    entry.identity.unwrap(),
+                    entry.size,
+                    require_data,
+                    SourceMetadataRequest::default(),
+                )
+                .unwrap();
+                original.validate_blocking().unwrap();
+                if require_data {
+                    let mut reader = original.clone_reader_blocking().unwrap();
+                    let mut bytes = Vec::new();
+                    reader.read_to_end(&mut bytes).unwrap();
+                    assert_eq!(bytes, b"qualified DATA");
+                    assert_eq!(
+                        reader
+                            .write_all(b"must not write")
+                            .unwrap_err()
+                            .raw_os_error(),
+                        Some(libc::EBADF)
+                    );
+                    let (metadata, flags) = original
+                        .read_metadata_blocking(SourceMetadataRequest {
+                            xattrs: true,
+                            acls: cfg!(feature = "acl"),
+                            bsd_flags: cfg!(target_os = "macos"),
+                        })
+                        .unwrap();
+                    assert!(metadata.xattrs.unwrap().iter().any(|(name, value)| {
+                        name == "user.sy-source-reader" && value == b"qualified"
+                    }));
+                    assert_eq!(metadata.acl.is_some(), cfg!(feature = "acl"));
+                    assert_eq!(flags.is_some(), cfg!(target_os = "macos"));
+                } else {
+                    assert!(matches!(
+                        original.clone_reader_blocking(),
+                        Err(SourceFileError::ObservationOnly)
+                    ));
+                    let (metadata, flags) = original
+                        .read_metadata_blocking(SourceMetadataRequest::default())
+                        .unwrap();
+                    assert_eq!(metadata.xattrs, None);
+                    assert_eq!(metadata.acl, None);
+                    assert_eq!(flags, None);
+                }
+                original
+                    .validate_member_blocking(&entry.path, entry.identity.unwrap())
+                    .unwrap();
+                assert!(matches!(
+                    rooted.check_source_removal_support_blocking(&entry.path),
+                    Err(RootedFsError::SourceFollowRemovalUnsupported(_))
+                ));
+                let unchanged = |before: &std::fs::Metadata, after: &std::fs::Metadata| {
+                    assert_eq!(
+                        (
+                            before.dev(),
+                            before.ino(),
+                            before.nlink(),
+                            before.ctime(),
+                            before.ctime_nsec()
+                        ),
+                        (
+                            after.dev(),
+                            after.ino(),
+                            after.nlink(),
+                            after.ctime(),
+                            after.ctime_nsec()
+                        )
+                    );
+                };
+                unchanged(&named_before, &std::fs::symlink_metadata(&link).unwrap());
+                unchanged(&data_before, &std::fs::metadata(&target).unwrap());
+                assert_eq!(std::fs::read_link(&link).unwrap(), target);
+                if require_data {
+                    std::fs::rename(&link, root.path().join("held")).unwrap();
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    assert!(matches!(
+                        original.validate_blocking(),
+                        Err(SourceFileError::Rooted(RootedFsError::RootChanged(_)))
+                    ));
+                } else {
+                    assert!(SourceFile::capture_blocking(
+                        rooted,
+                        entry.path,
+                        entry.identity.unwrap(),
+                        entry.size
+                    )
+                    .is_err());
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     #[test]
     fn readless_group_observation_has_no_reader_or_optional_metadata_authority() {
         use std::os::unix::fs::PermissionsExt;
@@ -323,7 +479,7 @@ mod tests {
         let path = relative("file");
         let (_, identity) = rooted.path_identity_blocking(&path).unwrap().unwrap();
         assert!(matches!(
-            GroupSource::capture_blocking(
+            SourceFileAccess::capture_blocking(
                 rooted.clone(),
                 path.clone(),
                 identity,
@@ -334,7 +490,7 @@ mod tests {
             Err(SourceFileError::Rooted(RootedFsError::SourceUnobserved(_)))
         ));
         crate::rooted_fs::test_source::scan_blocking(&rooted);
-        let source = GroupSource::capture_blocking(
+        let source = SourceFileAccess::capture_blocking(
             rooted.clone(),
             path.clone(),
             identity,
@@ -387,7 +543,7 @@ mod tests {
                 },
             ),
         ] {
-            assert!(GroupSource::capture_blocking(
+            assert!(SourceFileAccess::capture_blocking(
                 rooted.clone(),
                 path.clone(),
                 identity,
@@ -422,7 +578,7 @@ mod tests {
             crate::rooted_fs::test_source::scan_blocking(&rooted);
             let path = relative("selected/file");
             let (_, identity) = rooted.path_identity_blocking(&path).unwrap().unwrap();
-            let source = GroupSource::capture_blocking(
+            let source = SourceFileAccess::capture_blocking(
                 rooted,
                 path,
                 identity,
@@ -464,7 +620,7 @@ mod tests {
         reader.read_exact(&mut prefix).unwrap();
         assert_eq!(&prefix, b"ori");
         // dup, not reopen: the offset advances on the original description.
-        assert_eq!(source.member.file().stream_position().unwrap(), 3);
+        assert_eq!((&source.file).stream_position().unwrap(), 3);
         drop(reader);
         std::fs::rename(&root, &moved).unwrap();
         std::fs::create_dir(&root).unwrap();
@@ -486,7 +642,7 @@ mod tests {
         std::fs::write(root.path().join("file"), b"same bytes").unwrap();
         std::fs::write(root.path().join("other"), b"same bytes").unwrap();
         let mut source = capture(root.path(), "file");
-        source.member = capture(root.path(), "other").member;
+        source.file = capture(root.path(), "other").file;
         assert!(matches!(
             source.validate_blocking(),
             Err(SourceFileError::Changed { .. })
@@ -519,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             crate::endpoint::local_identity::metadata_identity(
-                &source.member.file().metadata().unwrap(),
+                &source.file.metadata().unwrap(),
                 EntryKind::File,
             ),
             Some(original)
@@ -577,7 +733,7 @@ mod tests {
         std::fs::write(root.path().join("old-dir/member"), b"original").unwrap();
         assert_eq!(
             crate::endpoint::local_identity::metadata_identity(
-                &nested.member.file().metadata().unwrap(),
+                &nested.file.metadata().unwrap(),
                 EntryKind::File,
             ),
             Some(nested.observation.identity)
@@ -588,9 +744,7 @@ mod tests {
         ));
         assert!(matches!(
             nested.read_metadata_blocking(SourceMetadataRequest::default()),
-            Err(SourceFileError::Rooted(
-                RootedFsError::SourceCatalogueTerminal
-            ))
+            Err(SourceFileError::Rooted(RootedFsError::SourceRaceCutoff))
         ));
     }
 
@@ -601,7 +755,7 @@ mod tests {
         std::fs::write(&path, b"original").unwrap();
         xattr::set(&path, "user.sy-source-lease", b"value").unwrap();
         let source = capture(root.path(), "file");
-        let before = source.member.file().metadata().unwrap();
+        let before = source.file.metadata().unwrap();
         let (empty, flags) = source
             .read_metadata_blocking(SourceMetadataRequest::default())
             .unwrap();
@@ -637,7 +791,7 @@ mod tests {
             ));
         }
         source.validate_blocking().unwrap();
-        let after = source.member.file().metadata().unwrap();
+        let after = source.file.metadata().unwrap();
         assert_eq!(
             (
                 before.mode(),
@@ -683,7 +837,7 @@ mod tests {
             source
                 .observation
                 .rooted
-                .read_open_file_bsd_flags_blocking(source.member.file())
+                .read_open_file_bsd_flags_blocking(&source.file)
                 .unwrap(),
             original.metadata().unwrap().st_flags()
         );
@@ -693,8 +847,15 @@ mod tests {
 
 impl From<SourceFileError> for crate::remote::transfer::RemoteTransferError {
     fn from(error: SourceFileError) -> Self {
-        // Keep the private typed cause without expanding the shared wire/transfer
-        // error vocabulary owned by the transfer layer.
-        Self::Io(std::io::Error::other(error))
+        // Preserve SOURCE/root roles at the shared transfer boundary. In
+        // particular, a catalogue race must not become an opaque I/O failure.
+        match error {
+            SourceFileError::Rooted(error) => Self::RootedFs(error),
+            SourceFileError::Io(error) => Self::Io(error),
+            SourceFileError::Changed { path } => {
+                Self::RootedFs(RootedFsError::SourceBindingChanged(path))
+            }
+            error @ SourceFileError::ObservationOnly => Self::Io(std::io::Error::other(error)),
+        }
     }
 }

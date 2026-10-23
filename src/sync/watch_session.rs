@@ -1,4 +1,4 @@
-use crate::sync::session::SyncSession;
+use crate::sync::session::{SyncSession, WatchSyncOutcome};
 use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::future::Future;
@@ -68,36 +68,71 @@ impl WatchSession {
         shutdown: impl Future<Output = std::io::Result<()>>,
     ) -> Result<()> {
         tokio::pin!(shutdown);
+        let mut retry: Option<super::session::DrainedSourceRace> = None;
         loop {
             check_change(&changes.borrow())?;
             if let std::task::Poll::Ready(stopped) = futures::poll!(&mut shutdown) {
                 stopped.context("Waiting for watch shutdown")?;
+                if let Some(race) = retry.take() {
+                    return Err(race.cause.into());
+                }
                 return Ok(());
             }
-            let sync = self.session.sync();
+            changes.has_changed().context("File watcher disconnected")?;
+            let sync = self.session.sync_for_watch(retry.take());
             tokio::pin!(sync);
-            let stats = tokio::select! {
-                biased;
-                // Poll sync before shutdown so the drain branch owns work that
-                // has actually started; an already-stopped watch starts no work.
-                result = &mut sync => result.context("Syncing watched source")?,
-                stopped = &mut shutdown => {
-                    // Drain in-flight work rather than dropping a synchronization
-                    // future with workers or staged destination state still owned.
-                    sync.await.context("Syncing watched source during shutdown")?;
-                    check_change(&changes.borrow())?;
-                    stopped.context("Waiting for watch shutdown")?;
-                    return Ok(());
+            // Start the next deadline at the first notification, even while
+            // this attempt still owns work. Completion/drain must not restart it.
+            let mut deadline = None;
+            let outcome = loop {
+                tokio::select! {
+                    biased;
+                    // An already-stopped watch starts no work; once started,
+                    // shutdown and watcher failure must join this same future.
+                    result = &mut sync => break result.context("Syncing watched source")?,
+                    stopped = &mut shutdown => {
+                        match sync.await.context("Syncing watched source during shutdown")? {
+                            WatchSyncOutcome::Complete(_) => {}
+                            WatchSyncOutcome::SourceRace(race) => return Err(race.cause.into()),
+                        }
+                        check_change(&changes.borrow())?;
+                        stopped.context("Waiting for watch shutdown")?;
+                        return Ok(());
+                    }
+                    changed = changes.changed() => {
+                        let observed = changed.context("File watcher disconnected")
+                            .and_then(|_| check_change(&changes.borrow_and_update()));
+                        if let Err(watcher) = observed {
+                            return match sync.await {
+                                Ok(WatchSyncOutcome::Complete(_)) => Err(watcher),
+                                Ok(WatchSyncOutcome::SourceRace(race)) => Err(anyhow::anyhow!(
+                                    "{watcher:#}; synchronization also failed: {}", race.cause)),
+                                Err(cause) => Err(anyhow::anyhow!(
+                                    "{watcher:#}; synchronization also failed: {cause}")),
+                            };
+                        }
+                        deadline.get_or_insert_with(|| Instant::now() + self.debounce);
+                    }
                 }
             };
             check_change(&changes.borrow())?;
-            println!(
-                "Sync complete ({} files, {} bytes)",
-                stats.files_created + stats.files_updated,
-                stats.bytes_transferred
-            );
-
-            let mut deadline = None;
+            changes.has_changed().context("File watcher disconnected")?;
+            match outcome {
+                WatchSyncOutcome::Complete(stats) => {
+                    println!(
+                        "Sync complete ({} files, {} bytes)",
+                        stats.files_created + stats.files_updated,
+                        stats.bytes_transferred
+                    );
+                }
+                WatchSyncOutcome::SourceRace(race) => {
+                    tracing::warn!(error = %race.cause,
+                        "SOURCE changed; failed LOCAL attempt drained. Earlier destination effects may remain; scheduling a fresh observation attempt");
+                    retry = Some(race);
+                    // The race itself is dirty even without another notification.
+                    deadline.get_or_insert_with(|| Instant::now() + self.debounce);
+                }
+            }
             loop {
                 let timer = async {
                     match deadline {
@@ -110,6 +145,7 @@ impl WatchSession {
                     stopped = &mut shutdown => {
                         check_change(&changes.borrow())?;
                         stopped.context("Waiting for watch shutdown")?;
+                        if let Some(race) = retry.take() { return Err(race.cause.into()); }
                         return Ok(());
                     }
                     // Timer priority and a deadline fixed by the first change
@@ -270,6 +306,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_race_is_dirty_without_a_watcher_notification() {
+        let source = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        for index in 0..16 {
+            fs::write(source.path().join(format!("file{index:02}")), b"source").unwrap();
+        }
+        let mut config = SyncConfig::test_default();
+        config.max_concurrent = 1;
+        let watch = session(
+            source.path(),
+            destination.path(),
+            config,
+            ScanOptions::default(),
+        );
+        let (_sender, receiver) = watch::channel(Ok(()));
+        let (stop, stopped) = oneshot::channel();
+        let producer = async {
+            wait_for(&destination.path().join("file00")).await;
+            // No notify signal accompanies this change. Later work must detect
+            // the race and the joined failure itself must schedule convergence.
+            fs::write(source.path().join("arrival"), b"new child").unwrap();
+            wait_for(&destination.path().join("arrival")).await;
+            // Shutdown must still join the successful retry after publication.
+            stop.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            watch.run(receiver, async { stopped.await.map_err(io::Error::other) }),
+            producer
+        );
+        result.unwrap();
+        assert_eq!(
+            fs::read(destination.path().join("arrival")).unwrap(),
+            b"new child"
+        );
+    }
+
+    #[tokio::test]
     async fn watcher_lifecycle_preserves_selection_and_shuts_down() {
         for dirs_only in [false, true] {
             let source = TempDir::new().unwrap();
@@ -308,6 +381,47 @@ mod tests {
             assert!(!destination.path().join(".git").exists());
             assert_eq!(destination.path().join("nested/deep").exists(), !dirs_only);
         }
+    }
+
+    #[tokio::test]
+    async fn watcher_failure_during_copy_joins_owned_work_before_returning() {
+        let source = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let bytes = vec![0x37; 1024 * 1024];
+        fs::write(source.path().join("file"), &bytes).unwrap();
+        let mut config = SyncConfig::test_default();
+        config.bwlimit = Some(256 * 1024);
+        let watch = session(
+            source.path(),
+            destination.path(),
+            config,
+            ScanOptions::default(),
+        );
+        let (sender, receiver) = watch::channel(Ok(()));
+        let failure = async {
+            // A private staging name establishes admitted destination work,
+            // not publication or completion. Fail the watcher while it is owned.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while fs::read_dir(destination.path()).unwrap().next().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!destination.path().join("file").exists());
+            signal_change(
+                &sender,
+                Err(notify::Error::generic("backend failed during copy")),
+            );
+        };
+        let (result, ()) = tokio::join!(watch.run(receiver, std::future::pending()), failure);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("backend failed during copy"));
+        assert_eq!(fs::read(destination.path().join("file")).unwrap(), bytes);
+        assert_eq!(fs::read(source.path().join("file")).unwrap(), bytes);
+        assert_eq!(fs::read_dir(destination.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]

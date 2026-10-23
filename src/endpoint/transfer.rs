@@ -32,9 +32,8 @@ pub enum TransferStrategy {
 pub struct TransferOptions {
     pub update: bool,
     pub verify: bool,
-    /// --copy-links: the source entry is the TARGET of a symlink; the scan
-    /// classified it by target kind. The transfer guard and size decisions
-    /// must therefore stat through the link, and plain opens follow it.
+    /// Explicit source-follow intent. Native following requires original
+    /// SOURCE qualification; guards and readers never reopen a lexical target.
     pub follow_symlinks: bool,
     /// Optional shared bandwidth pacing in bytes per second (`--bwlimit`).
     /// When set, native kernel fast paths (fs::copy, reflink) are bypassed:
@@ -350,7 +349,18 @@ impl CommitChecks {
             }
             SourceExpectation::SnapshotAtOpen => {
                 let path = require_native(source_native, "source")?;
-                match observe(&path, follow_symlinks)? {
+                let observation = if follow_symlinks {
+                    match source_rooted.as_ref() {
+                        Some(rooted) => rooted
+                            .source_following_identity_blocking(&source_relative)
+                            .map_err(super::local::map_source_rooted_fs_error)?
+                            .map_or(Observation::Unidentified, Observation::Identified),
+                        None => observe(&path, true)?,
+                    }
+                } else {
+                    observe(&path, false)?
+                };
+                match observation {
                     Observation::Identified(identity) => Some(SourceCheck {
                         path,
                         follow_symlinks,
@@ -387,8 +397,7 @@ impl CommitChecks {
                 .map_err(|error| {
                     if matches!(
                         error,
-                        crate::rooted_fs::RootedFsError::RootChanged(_)
-                            | crate::rooted_fs::RootedFsError::SourceBindingChanged(_)
+                        crate::rooted_fs::RootedFsError::SourceBindingChanged(_)
                     ) {
                         SyncError::SourceChanged {
                             path: self.source.as_ref().map_or_else(
@@ -397,20 +406,23 @@ impl CommitChecks {
                             ),
                         }
                     } else {
-                        SyncError::Io(std::io::Error::other(error))
+                        super::local::map_source_rooted_fs_error(error)
                     }
                 })?;
         }
         if let Some(expected) = &self.source {
-            let matches = if let Some(rooted) = self
-                .source_rooted
-                .as_ref()
-                .filter(|_| !expected.follow_symlinks)
-            {
-                rooted
-                    .path_identity_blocking(&self.source_relative)
-                    .map_err(std::io::Error::other)?
-                    == Some((crate::engine::domain::EntryKind::File, expected.identity))
+            let matches = if let Some(rooted) = self.source_rooted.as_ref() {
+                if expected.follow_symlinks {
+                    rooted
+                        .source_following_identity_blocking(&self.source_relative)
+                        .map_err(super::local::map_source_rooted_fs_error)?
+                        == Some(expected.identity)
+                } else {
+                    rooted
+                        .path_identity_blocking(&self.source_relative)
+                        .map_err(super::local::map_source_rooted_fs_error)?
+                        == Some((crate::engine::domain::EntryKind::File, expected.identity))
+                }
             } else {
                 observe(&expected.path, expected.follow_symlinks)?
                     == Observation::Identified(expected.identity)
@@ -1542,16 +1554,30 @@ mod tests {
             std::fs::hard_link(root.join("original/file"), root.join("foreign/file")).unwrap();
             std::os::unix::fs::symlink("original/file", root.join("link")).unwrap();
             std::fs::write(fixture.dest_file(), b"OLD!").unwrap();
-            let authority = crate::endpoint::source_root::SourceRoot::open(root.to_path_buf())
+            let authority = if follow {
+                let bound = crate::rooted_fs::operand::BoundSource::open_local_following(
+                    root.join("link"),
+                    false,
+                )
                 .await
                 .unwrap();
+                crate::endpoint::source_root::SourceRoot::from_rooted(bound.rooted).unwrap()
+            } else {
+                crate::endpoint::source_root::SourceRoot::open(root.to_path_buf())
+                    .await
+                    .unwrap()
+            };
             let request = crate::engine::scan::ScanRequest {
                 follow_symlinks: follow,
                 ..Default::default()
             };
             let path = if follow { "link" } else { "original/file" };
-            let source_entry = authority
-                .entries(request)
+            let stream = if follow {
+                authority.selected_entries(RelativePath::new("link").unwrap(), request, false)
+            } else {
+                authority.entries(request)
+            };
+            let source_entry = stream
                 .try_collect::<Vec<_>>()
                 .await
                 .unwrap()
@@ -1587,7 +1613,19 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(matches!(error, SyncError::SourceChanged { .. }), "{error}");
+            if follow {
+                let SyncError::Io(error) = error else {
+                    panic!("lost original SOURCE cause")
+                };
+                assert!(matches!(
+                    error
+                        .get_ref()
+                        .and_then(|cause| cause.downcast_ref::<crate::rooted_fs::RootedFsError>()),
+                    Some(crate::rooted_fs::RootedFsError::RootChanged(_))
+                ));
+            } else {
+                assert!(matches!(error, SyncError::SourceChanged { .. }), "{error}");
+            }
             assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
             assert_eq!(fixture.dest_entries(), 1, "abort cleans only its own stage");
         }
@@ -1870,21 +1908,64 @@ mod tests {
     #[tokio::test]
     async fn copy_links_streaming_uses_target_metadata() {
         let fixture = Fixture::new();
-        let target = fixture.source_root.path().join("target");
+        // An actual operator selection may bind a FILE outside its link's
+        // anchor through the original absolute DIR/LINK transcript.
+        let target_root = tempfile::tempdir().unwrap();
+        let target = target_root.path().join("target");
         std::fs::write(&target, b"target bytes").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
         let target_time = filetime::FileTime::from_unix_time(123, 456_000_000);
         filetime::set_file_mtime(&target, target_time).unwrap();
-        std::os::unix::fs::symlink("target", fixture.source_file()).unwrap();
+        std::os::unix::fs::symlink(&target, fixture.source_file()).unwrap();
+        xattr::set(&target, "user.sy-copy-links", b"preserved").unwrap();
         let identity = TransferIdentity {
             source: SourceExpectation::Scanned(identity_of(&target)),
             destination: ExpectedDestination::Absent,
         };
         let mut options = options(identity, false);
         options.follow_symlinks = true;
+        options.preservation_request.xattrs = true;
+        #[cfg(feature = "acl")]
+        let expected_acl = {
+            options.preservation_request.acl = true;
+            let mut acl = exacl::getfacl(&target, None).unwrap();
+            // SAFETY: getuid has no arguments or preconditions.
+            let uid = unsafe { libc::getuid() };
+            acl.push(exacl::AclEntry::allow_user(
+                &uid.to_string(),
+                exacl::Perm::READ,
+                exacl::Flag::empty(),
+            ));
+            exacl::setfacl(&[&target], &acl, None).unwrap();
+            exacl::to_string(&exacl::getfacl(&target, None).unwrap()).unwrap()
+        };
 
+        let bound = crate::rooted_fs::operand::BoundSource::open_local_following(
+            fixture.source_file(),
+            false,
+        )
+        .await
+        .unwrap();
+        let crate::rooted_fs::operand::SourceShape::Leaf { name } = bound.shape else {
+            panic!("expected selected file link")
+        };
+        let source = crate::endpoint::source_root::SourceRoot::from_rooted(bound.rooted).unwrap();
+        use futures::TryStreamExt;
+        let entries = source
+            .selected_entries(
+                name,
+                crate::engine::scan::ScanRequest {
+                    follow_symlinks: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        options.identity.source = SourceExpectation::Scanned(entries[0].identity.unwrap());
         let result = transfer_file(
-            &fixture.source_endpoint(),
+            &source.endpoint(),
             Path::new(NAME),
             &fixture.dest_endpoint(),
             Path::new(NAME),
@@ -1898,6 +1979,15 @@ mod tests {
         let metadata = std::fs::metadata(fixture.dest_file()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o7777, 0o600);
         assert_eq!(metadata.modified().unwrap(), target_time.into());
+        assert_eq!(
+            xattr::get(fixture.dest_file(), "user.sy-copy-links").unwrap(),
+            Some(b"preserved".to_vec())
+        );
+        #[cfg(feature = "acl")]
+        assert_eq!(
+            exacl::to_string(&exacl::getfacl(fixture.dest_file(), None).unwrap()).unwrap(),
+            expected_acl
+        );
     }
 
     #[tokio::test]
@@ -2230,7 +2320,13 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, SyncError::SourceChanged { .. }));
+        let SyncError::Io(error) = error else {
+            panic!("lifetime binding error lost: {error:?}")
+        };
+        assert!(
+            matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<crate::rooted_fs::RootedFsError>()),
+            Some(crate::rooted_fs::RootedFsError::RootChanged(path)) if path == fixture.source_root.path())
+        );
         assert_eq!(std::fs::read(fixture.dest_file()).unwrap(), b"OLD!");
     }
 

@@ -128,7 +128,10 @@ impl SourceRootSwap {
 
 pub(super) fn is_original_root_change(error: &(dyn std::error::Error + 'static)) -> bool {
     if let Some(error) = error.downcast_ref::<crate::error::SyncError>() {
-        return matches!(error, crate::error::SyncError::SourceChanged { .. });
+        return match error {
+            crate::error::SyncError::Io(error) => is_original_root_change(error),
+            _ => false,
+        };
     }
     if let Some(crate::remote::local_executor::LocalSyncError::Endpoint(error)) =
         error.downcast_ref::<crate::remote::local_executor::LocalSyncError>()
@@ -136,7 +139,11 @@ pub(super) fn is_original_root_change(error: &(dyn std::error::Error + 'static))
         return is_original_root_change(error);
     }
     if let Some(error) = error.downcast_ref::<crate::rooted_fs::RootedFsError>() {
-        return matches!(error, crate::rooted_fs::RootedFsError::RootChanged(_));
+        return match error {
+            crate::rooted_fs::RootedFsError::RootChanged(_) => true,
+            crate::rooted_fs::RootedFsError::Io(error) => is_original_root_change(error),
+            _ => false,
+        };
     }
     if let Some(crate::remote::local_executor::LocalSyncError::Existing(
         crate::endpoint::existing::ExistingDestinationError::Rooted(error),

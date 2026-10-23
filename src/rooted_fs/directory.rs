@@ -102,8 +102,45 @@ impl RootedFs {
             };
             preservation.validate()?;
             let file = self.observed_directory(path, expected)?;
-            let _permit = self.admit_mutation_blocking()?;
-            preservation.apply(&file, unix_mode, modified)?;
+            if preservation.basic_only() && unix_mode.is_none() && modified.is_none() {
+                // Empty basic finalization is observation work, not permission
+                // to mutate a directory or demand a full SOURCE data census.
+                let _permit = self.admit_validated_observation_blocking(None)?;
+                return Ok(());
+            }
+            let timestamp_only = preservation.basic_only() && unix_mode.is_none();
+            let (parent, leaf) = self.open_parent_blocking(path.as_path())?;
+            let _permit = self.admit_mutation_blocking(SourceEffect {
+                kind: if timestamp_only {
+                    SourceEffectKind::DirectoryTimestamp
+                } else {
+                    SourceEffectKind::InodeMetadata
+                },
+                parent: parent.as_raw_fd(),
+                name: &leaf,
+                object: Some(file.as_raw_fd()),
+                path: path.as_path(),
+            })?;
+            if self.local_source_effects.is_some() {
+                // SOURCE census is not a lease on the earlier DST opening.
+                // Recheck original ROOT/ancestors/name after its final barrier,
+                // without adopting a replacement inode as this setter's target.
+                let current = self.observed_directory(path, expected)?;
+                if !staging::same_inode(&stat_fd(file.as_raw_fd())?, &stat_fd(current.as_raw_fd())?)
+                {
+                    return Err(RootedFsError::DestinationChanged(
+                        path.as_path().to_path_buf(),
+                    ));
+                }
+            }
+            if timestamp_only {
+                // The native footprint is deliberately limited to the FD's
+                // mtime/ctime; UTIME_OMIT preserves atime. Do not route this
+                // admission through a broader preservation setter.
+                apply_fd_metadata(file.as_raw_fd(), None, modified)?;
+            } else {
+                preservation.apply(&file, unix_mode, modified)?;
+            }
             // chmod/ACL may change the mode included in directory tokens.
             // Revalidate the visible name against this held inode's new token,
             // never adopt the identity of a fresh pathname lookup.

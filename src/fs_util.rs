@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+pub(crate) mod directory_stream;
 /// Filesystem utility functions for detecting COW support, hard links, and cross-filesystem operations.
 ///
 /// This module provides platform-specific filesystem detection to enable intelligent

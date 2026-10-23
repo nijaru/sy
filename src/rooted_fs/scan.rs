@@ -4,7 +4,7 @@ use crate::engine::domain::{Entry, EntryIdentity, EntryKind, RelativePath, Times
 use crate::engine::reconcile::{BoxError, EntryStream};
 use crate::engine::scan::ScanRequest;
 use crate::engine::scan_sort::{NameSpool, SortBudget};
-use std::ffi::{CStr, CString, OsStr, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -86,7 +86,7 @@ impl RootedFs {
         EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
             let attempt = rooted.start_source_scan_blocking()?;
             let result = scan_worker(rooted, request, sender.clone(), true);
-            attempt.finish(result.is_ok() && !sender.is_closed());
+            attempt.finish(result.is_ok() && !sender.is_closed())?;
             result
         })
     }
@@ -118,7 +118,7 @@ impl RootedFs {
         let rooted = self.clone();
         EntryStream::spawn_blocking(1, move |sender| {
             let attempt = source
-                .then(|| rooted.start_source_scan_blocking())
+                .then(|| rooted.start_selected_source_scan_blocking(&path))
                 .transpose()?;
             let result = (|| {
                 if request.respect_gitignore && !source {
@@ -161,7 +161,7 @@ impl RootedFs {
                     rooted.record_source_name_blocking(
                         rooted.root_fd.as_raw_fd(),
                         path.as_path(),
-                        false,
+                        request.follow_symlinks,
                     )?;
                 }
                 if let Some(scope) = &mut scope {
@@ -174,13 +174,18 @@ impl RootedFs {
                         return Ok(());
                     }
                 }
+                if source && request.follow_symlinks {
+                    let entry = rooted.source_entry_metadata_blocking(&path, request)?;
+                    let _ = sender.blocking_send(Ok(entry));
+                    return Ok(());
+                }
                 let inspected =
                     inspect_entry(rooted.root_fd.as_raw_fd(), name, &path, request, stat)?;
                 let _ = sender.blocking_send(Ok(inspected.entry));
                 Ok(())
             })();
             if let Some(attempt) = attempt {
-                attempt.finish(result.is_ok() && !sender.is_closed());
+                attempt.finish(result.is_ok() && !sender.is_closed())?;
             }
             result
         })
@@ -290,6 +295,7 @@ fn prepare_directory(
     spool: &mut NameSpool,
     sender: &tokio::sync::mpsc::Sender<Result<Entry, BoxError>>,
     source: Option<&RootedFs>,
+    follow: bool,
 ) -> Result<Continuation, RootedScanError> {
     let (device, inode) = directory_identity(directory, path)?;
     let names = DirectoryStream::open(directory.as_raw_fd())
@@ -300,7 +306,7 @@ fn prepare_directory(
                 let relative = path.join(&name);
                 validate_path_bound(&relative).map_err(io::Error::other)?;
                 source
-                    .record_source_name_blocking(directory.as_raw_fd(), &relative, false)
+                    .record_source_name_blocking(directory.as_raw_fd(), &relative, follow)
                     .map_err(io::Error::other)?;
             }
             Ok(name)
@@ -357,6 +363,7 @@ fn walk_tree(
         &mut spool,
         sender,
         scope.as_ref().map(|_| rooted),
+        request.follow_symlinks,
     )?;
     stack
         .write(depth, frame)
@@ -366,6 +373,11 @@ fn walk_tree(
     while !sender.is_closed() {
         let Some(name) = names.next().map_err(RootedScanError::Scratch)? else {
             stack.check_top(depth).map_err(RootedScanError::Scratch)?;
+            if scope.is_some() {
+                rooted
+                    .complete_source_directory_blocking(&path)
+                    .map_err(|error| RootedScanError::SourceIgnore(io::Error::other(error)))?;
+            }
             drop(names);
             spool.remove(frame.run).map_err(RootedScanError::Scratch)?;
             if depth == 0 {
@@ -409,7 +421,22 @@ fn walk_tree(
                 continue;
             }
         }
-        let inspected = inspect_entry(directory.as_raw_fd(), &name, &relative, request, stat)?;
+        let inspected = if scope.is_some()
+            && request.follow_symlinks
+            && stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+        {
+            // Following changes semantic FILE metadata, never physical DIR
+            // traversal. The authenticated native reader resolves the terminal.
+            let entry = rooted
+                .source_entry_metadata_blocking(&relative, request)
+                .map_err(|error| RootedScanError::SourceIgnore(io::Error::other(error)))?;
+            InspectedEntry {
+                entry,
+                directory: None,
+            }
+        } else {
+            inspect_entry(directory.as_raw_fd(), &name, &relative, request, stat)?
+        };
         if sender.blocking_send(Ok(inspected.entry)).is_err() {
             return Ok(());
         }
@@ -429,6 +456,7 @@ fn walk_tree(
                     &mut spool,
                     sender,
                     scope.as_ref().map(|_| rooted),
+                    request.follow_symlinks,
                 )?;
                 stack
                     .write(depth, frame)
@@ -443,6 +471,30 @@ fn walk_tree(
 struct InspectedEntry {
     entry: Entry,
     directory: Option<OwnedFd>,
+}
+
+pub(super) fn source_metadata_entry(
+    parent: RawFd,
+    name: &OsStr,
+    relative: &RelativePath,
+    request: ScanRequest,
+    stat: libc::stat,
+) -> Result<Entry, RootedScanError> {
+    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+        // Omitted/pruned mode-000 directories need metadata, not a READ FD.
+        let (mtime, nanos, _, _) = stat_times(&stat)?;
+        let modified = Timestamp::new(mtime, nanos)
+            .map_err(|_| RootedScanError::InvalidTimestamp(relative.as_path().to_path_buf()))?;
+        let mut entry = Entry::directory(relative.clone(), modified);
+        if request.metadata.unix_mode {
+            entry.unix_mode = Some(stat_mode_u32(&stat) & 0o7777);
+        }
+        if request.metadata.identity {
+            entry.identity = stat_identity(&stat, EntryKind::Directory);
+        }
+        return Ok(entry);
+    }
+    inspect_entry(parent, name, relative, request, stat).map(|observed| observed.entry)
 }
 
 fn inspect_entry(
@@ -653,86 +705,7 @@ pub(super) fn directory_is_empty(fd: RawFd) -> Result<bool, RootedScanError> {
     }
 }
 
-pub(super) struct DirectoryStream(*mut libc::DIR);
-
-impl DirectoryStream {
-    pub(super) fn open(fd: RawFd) -> io::Result<Self> {
-        let scan_fd = unsafe {
-            // SAFETY: `fd` is a live directory descriptor and `.` is a fixed native
-            // component. Reopening it creates a distinct open file description, so
-            // concurrent scans do not share the directory offset as they would with
-            // dup(2).
-            libc::openat(
-                fd,
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if scan_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let dir = unsafe {
-            // SAFETY: `scan_fd` is a fresh directory descriptor. fdopendir takes
-            // ownership on success.
-            libc::fdopendir(scan_fd)
-        };
-        if dir.is_null() {
-            let error = io::Error::last_os_error();
-            unsafe {
-                // SAFETY: fdopendir failed, so ownership remained with us.
-                libc::close(scan_fd);
-            }
-            return Err(error);
-        }
-        Ok(Self(dir))
-    }
-
-    fn close(&mut self) {
-        if self.0.is_null() {
-            return;
-        }
-        unsafe {
-            // SAFETY: self.0 is uniquely owned by this guard.
-            libc::closedir(self.0);
-        }
-        self.0 = std::ptr::null_mut();
-    }
-}
-
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
-impl Iterator for DirectoryStream {
-    type Item = io::Result<OsString>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        while !self.0.is_null() {
-            set_errno(0);
-            let entry = unsafe {
-                // SAFETY: self owns a live DIR pointer until close below.
-                libc::readdir(self.0)
-            };
-            if entry.is_null() {
-                let errno = get_errno();
-                self.close();
-                return (errno != 0).then(|| Err(io::Error::from_raw_os_error(errno)));
-            }
-            let name = unsafe {
-                // SAFETY: successful readdir returns a NUL-terminated d_name
-                // valid until the next call; copy it before advancing.
-                CStr::from_ptr((*entry).d_name.as_ptr())
-            }
-            .to_bytes();
-            if name != b"." && name != b".." {
-                return Some(Ok(OsString::from_vec(name.to_vec())));
-            }
-        }
-        None
-    }
-}
+use crate::fs_util::directory_stream::DirectoryStream;
 
 fn lstat_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<libc::stat, RootedScanError> {
     let name = component_cstring(name)?;
@@ -827,46 +800,6 @@ fn component_cstring(name: &OsStr) -> Result<CString, RootedScanError> {
             "directory entry contains NUL",
         ))
     })
-}
-
-#[cfg(target_os = "linux")]
-fn set_errno(value: libc::c_int) {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__errno_location() = value;
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_errno() -> libc::c_int {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__errno_location()
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn set_errno(value: libc::c_int) {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__error() = value;
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn get_errno() -> libc::c_int {
-    unsafe {
-        // SAFETY: libc exposes the calling thread's errno slot.
-        *libc::__error()
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn set_errno(_value: libc::c_int) {}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn get_errno() -> libc::c_int {
-    0
 }
 
 #[cfg(all(test, unix))]

@@ -22,23 +22,38 @@ use sy::engine::reconcile::OrderedReconciler;
 use sy::engine::scheduler::{ResourceBudget, Scheduler};
 use sy::remote::local_executor::LocalSyncExecutor;
 
-pub(super) async fn run(
+#[cfg(test)]
+async fn run(
     source_root: &Path,
     destination_root: &Path,
     config: &SyncConfig,
     scan_options: ScanOptions,
     scope: SyncScope,
 ) -> Result<SyncStats> {
-    // Controller journals are created before either entry stream is polled.
-    // Refuse unsafe scratch configuration before spawning even the dest scan.
-    if scope == SyncScope::Tree {
-        sy::endpoint::local_entry_scan::validate_scratch_location(source_root.to_path_buf())
-            .await
-            .map_err(map_io)?;
-    }
     let source_authority = sy::endpoint::source_root::SourceRoot::open(source_root.to_path_buf())
         .await
-        .map_err(map_io)?;
+        .map_err(sy::endpoint::local::map_source_rooted_fs_error)?;
+    run_acquired(
+        source_authority,
+        destination_root,
+        config,
+        scan_options,
+        scope,
+    )
+    .await
+}
+
+pub(super) async fn run_acquired(
+    source_authority: sy::endpoint::source_root::SourceRoot,
+    destination_root: &Path,
+    config: &SyncConfig,
+    scan_options: ScanOptions,
+    scope: SyncScope,
+) -> Result<SyncStats> {
+    source_authority
+        .validate()
+        .await
+        .map_err(sy::endpoint::local::map_source_rooted_fs_error)?;
     // Capture either the root or its original held ancestor before scanning.
     // Tree and selected work both defer missing parents until a completed
     // preflight selects a Create; absence never permits a fresh pathname open.
@@ -224,24 +239,21 @@ async fn run_with_authorities(
         .map_err(map_controller_error)?
     };
 
-    source_authority.validate().await.map_err(map_io)?;
+    source_authority
+        .validate()
+        .await
+        .map_err(sy::endpoint::local::map_source_rooted_fs_error)?;
     if let Some(rooted) = destination_authority.cloned() {
         tokio::task::spawn_blocking(move || rooted.verify_root_path_blocking())
             .await
             .map_err(map_io)?
             .map_err(map_io)?;
     }
-    if let SyncScope::SelectedLeaf { source, .. } = &scope {
-        super::selected::validate_effects(
-            &mut plan,
-            &source_authority,
-            source,
-            &destination_endpoint,
-            config,
-        )
-        .await?;
+    if config.remove_source_files {
+        plan.validate_source_removal_support(&source_authority)
+            .await
+            .map_err(map_controller_error)?;
     }
-
     if config.preserve.hardlinks {
         plan.seal_hardlink_membership()
             .await
@@ -283,13 +295,25 @@ async fn run_with_authorities(
             sy::sync::ratelimit::RateLimiter::new(limit),
         ))
     });
+    #[cfg(unix)]
+    let source_effects =
+        sy::rooted_fs::local_source_effects::LocalSourceEffects::seal(&source_authority)
+            .await
+            .map_err(map_io)?;
+    #[cfg(unix)]
+    let destination_endpoint = destination_endpoint
+        .with_local_source_effects(source_effects.clone())
+        .await?;
+
+    #[cfg(unix)]
+    let effect_destination = destination_endpoint.destination_authority().await?.clone();
     let executor = LocalSyncExecutor::new(source_authority, destination_endpoint, scheduler)
         .with_backup(
             config.backup.is_some(),
             backup_dir(config, destination_root),
             config.suffix.clone(),
         )
-        .with_backup_root(backup_namespace.and_then(|(_, root)| root))
+        .with_backup_root(backup_namespace.as_ref().and_then(|(_, root)| root.clone()))
         .with_follow_symlinks(config.preserve.symlink_mode == SymlinkMode::Follow)
         .with_rate_limiter(rate_limiter)
         .with_remove_source_files(config.remove_source_files)
@@ -299,6 +323,25 @@ async fn run_with_authorities(
         .with_acls(config.preserve.acls)
         .with_bsd_flags(config.preserve.flags)
         .with_reporter(Some(reporter.clone()));
+
+    #[cfg(unix)]
+    {
+        use sy::engine::controller::SyncPlanExecutor;
+        plan.validate_local_source_effects(
+            &source_effects,
+            &effect_destination,
+            backup_namespace.as_ref(),
+            config.preserve.xattrs || config.preserve.acls || config.preserve.flags,
+            |operation, policy| {
+                executor
+                    .lower(operation, policy)
+                    .map(|work| work.is_some())
+                    .map_err(|error| ControllerError::backend("LOCAL effect lowering", error))
+            },
+        )
+        .await
+        .map_err(map_controller_error)?;
+    }
 
     let scan_elapsed = scan_started.elapsed();
     let transfer_started = Instant::now();
@@ -320,6 +363,76 @@ async fn run_with_authorities(
     Ok(stats)
 }
 
+/// Positive, role-sensitive allowlist at the returned LOCAL drain boundary.
+/// In particular, never recurse through OwnedDrain/PreflightDrain, committed
+/// finalization, removal errors or arbitrary Error::source chains.
+pub(super) fn is_drained_source_race(error: &SyncError) -> bool {
+    use sy::rooted_fs::RootedFsError;
+    fn rooted(error: &RootedFsError) -> bool {
+        matches!(
+            error,
+            RootedFsError::SourceBindingChanged(_) | RootedFsError::SourceRaceCutoff
+        )
+    }
+    let SyncError::Io(io) = error else {
+        return false;
+    };
+    let Some(cause) = io.get_ref() else {
+        return false;
+    };
+    if let Some(error) = cause.downcast_ref::<RootedFsError>() {
+        return rooted(error);
+    }
+    let Some(error) = cause.downcast_ref::<ControllerError>() else {
+        return false;
+    };
+    controller_source_race(error)
+}
+
+fn controller_source_race(error: &ControllerError) -> bool {
+    // Only explicitly joined operation results may coalesce. Drain failures,
+    // committed failures and arbitrary source chains remain opaque and fatal.
+    if let ControllerError::JoinedOperations { operation, sibling } = error {
+        return controller_source_race(operation) && controller_source_race(sibling);
+    }
+    use sy::engine::reconcile::{EngineError, Side};
+    use sy::remote::local_executor::LocalSyncError;
+    use sy::rooted_fs::RootedFsError;
+    let rooted = |error: &RootedFsError| {
+        matches!(
+            error,
+            RootedFsError::SourceBindingChanged(_) | RootedFsError::SourceRaceCutoff
+        )
+    };
+    match error {
+        ControllerError::Reconcile(EngineError::Endpoint {
+            side: Side::Source,
+            source,
+        }) => source.downcast_ref::<RootedFsError>().is_some_and(rooted),
+        ControllerError::Backend {
+            phase: "execution" | "hardlink group",
+            source,
+        } => match source.downcast_ref::<LocalSyncError>() {
+            Some(LocalSyncError::Endpoint(SyncError::SourceChanged { .. })) => true,
+            Some(LocalSyncError::Rooted(error)) => rooted(error),
+            Some(LocalSyncError::Endpoint(SyncError::Io(io))) => io
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<RootedFsError>())
+                .is_some_and(rooted),
+            _ => false,
+        },
+        ControllerError::Backend {
+            phase:
+                "LOCAL SOURCE effects"
+                | "LOCAL SOURCE delete effects"
+                | "LOCAL SOURCE directory effects"
+                | "LOCAL SOURCE backup effects",
+            source,
+        } => source.downcast_ref::<RootedFsError>().is_some_and(rooted),
+        _ => false,
+    }
+}
+
 /// --backup-dir is local: absolute honored as-is (the local engine's rule);
 /// relative anchored to the destination root.
 pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option<PathBuf> {
@@ -334,6 +447,122 @@ pub(super) fn backup_dir(config: &SyncConfig, destination_root: &Path) -> Option
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_retry_allowlist_accepts_only_pure_joined_races_and_source_roles() {
+        use sy::engine::reconcile::{EngineError, Side};
+        use sy::remote::local_executor::LocalSyncError;
+        use sy::rooted_fs::RootedFsError;
+        let race = || {
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Endpoint(SyncError::SourceChanged {
+                    path: "file".into(),
+                }),
+            )
+        };
+        assert!(is_drained_source_race(&map_controller_error(race())));
+        let scan = |side| {
+            ControllerError::Reconcile(EngineError::Endpoint {
+                side,
+                source: Box::new(RootedFsError::SourceBindingChanged("file".into())),
+            })
+        };
+        assert!(is_drained_source_race(&map_controller_error(scan(
+            Side::Source
+        ))));
+        let cutoff = || {
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Rooted(RootedFsError::SourceRaceCutoff),
+            )
+        };
+        for (operation, sibling) in [(race(), cutoff()), (cutoff(), race())] {
+            assert!(is_drained_source_race(&map_controller_error(
+                ControllerError::JoinedOperations {
+                    operation: Box::new(operation),
+                    sibling: Box::new(sibling),
+                }
+            )));
+        }
+        let fatal = [
+            scan(Side::Destination),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Rooted(RootedFsError::SourceCatalogueTerminal),
+            ),
+            ControllerError::Cancelled { removed_sources: 0 },
+            ControllerError::OwnedDrain {
+                operation: Box::new(race()),
+                source: Box::new(std::io::Error::other("native drain")),
+            },
+            ControllerError::PreflightDrain {
+                operation: Box::new(race()),
+                drain: EngineError::Invariant("failed join"),
+            },
+            ControllerError::backend(
+                "source-removal drain",
+                LocalSyncError::Endpoint(SyncError::SourceChanged {
+                    path: "file".into(),
+                }),
+            ),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Endpoint(SyncError::StagingAbortFailed {
+                    operation: "source race".into(),
+                    abort: "native abort".into(),
+                }),
+            ),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Endpoint(SyncError::CommittedFinalizationFailed {
+                    path: "file".into(),
+                    reason: "source race".into(),
+                }),
+            ),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Rooted(RootedFsError::RootChanged("root".into())),
+            ),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Rooted(RootedFsError::Io(
+                    std::io::ErrorKind::PermissionDenied.into(),
+                )),
+            ),
+            ControllerError::backend(
+                "execution",
+                LocalSyncError::Existing(
+                    sy::endpoint::existing::ExistingDestinationError::ObservationChanged(
+                        sy::engine::domain::RelativePath::new("file").unwrap(),
+                    ),
+                ),
+            ),
+            ControllerError::Worker("native panic".into()),
+        ];
+        for error in fatal {
+            assert!(!controller_source_race(&error), "{error:?}");
+            // A genuine failed effect/drain must veto a race in either order.
+            let joined = ControllerError::JoinedOperations {
+                operation: Box::new(race()),
+                sibling: Box::new(error),
+            };
+            assert!(!controller_source_race(&joined), "{joined:?}");
+            let ControllerError::JoinedOperations { operation, sibling } = joined else {
+                unreachable!()
+            };
+            let reversed = ControllerError::JoinedOperations {
+                operation: sibling,
+                sibling: operation,
+            };
+            assert!(!controller_source_race(&reversed), "{reversed:?}");
+            let joined = ControllerError::JoinedOperations {
+                operation: Box::new(reversed),
+                sibling: Box::new(cutoff()),
+            };
+            assert!(!is_drained_source_race(&map_controller_error(joined)));
+        }
+    }
 
     #[tokio::test]
     async fn mode000_preflight_plans_skip_replace_and_scoped_delete_without_payload_reads() {
@@ -947,64 +1176,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_links_preserves_requested_metadata_on_followed_files() {
-        let source_root = TempDir::new().unwrap();
-        let target_root = TempDir::new().unwrap();
-        let destination_root = TempDir::new().unwrap();
-        let source_file = source_root.path().join("file");
-        let target_file = target_root.path().join("target");
-        std::fs::write(&target_file, b"followed content").unwrap();
-        std::os::unix::fs::symlink(&target_file, &source_file).unwrap();
-        xattr::set(&target_file, "user.sy-copy-links", b"preserved").unwrap();
-        #[cfg(feature = "acl")]
-        let expected_acl = {
-            let mut acl = exacl::getfacl(&target_file, None).unwrap();
-            // SAFETY: `getuid` has no pointer arguments or other preconditions.
-            let uid = unsafe { libc::getuid() };
-            acl.push(exacl::AclEntry::allow_user(
-                &uid.to_string(),
-                exacl::Perm::READ,
-                exacl::Flag::empty(),
-            ));
-            exacl::setfacl(&[&target_file], &acl, None).unwrap();
-            exacl::to_string(&exacl::getfacl(&target_file, None).unwrap())
-                .unwrap()
-                .trim()
-                .to_string()
-        };
-
+    async fn copy_links_descendant_rejects_before_outside_metadata_and_destination_effects() {
+        let source = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let destination = TempDir::new().unwrap();
+        let link = source.path().join("file");
+        let target = outside.path().join("missing");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::write(destination.path().join("kept"), b"OLD").unwrap();
         let mut config = SyncConfig::test_default();
         config.preserve.symlink_mode = SymlinkMode::Follow;
         config.preserve.xattrs = true;
-        #[cfg(feature = "acl")]
-        {
-            config.preserve.acls = true;
-        }
-        run(
-            source_root.path(),
-            destination_root.path(),
+        let error = run(
+            source.path(),
+            destination.path(),
             &config,
             ScanOptions::default(),
             SyncScope::Tree,
         )
         .await
-        .unwrap();
-
-        assert_eq!(
-            xattr::get(destination_root.path().join("file"), "user.sy-copy-links").unwrap(),
-            Some(b"preserved".to_vec())
+        .unwrap_err();
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut unsupported = false;
+        while let Some(error) = cause {
+            if matches!(
+                error.downcast_ref::<sy::rooted_fs::RootedFsError>(),
+                Some(sy::rooted_fs::RootedFsError::SourceFollowUnsupported(_))
+            ) {
+                unsupported = true;
+                break;
+            }
+            cause = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                io.get_ref().map(|error| error as &dyn std::error::Error)
+            } else {
+                error.source()
+            };
+        }
+        assert!(
+            unsupported,
+            "lost typed pre-target qualification failure: {error:?}"
         );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        assert_eq!(std::fs::read_dir(source.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         assert_eq!(
-            std::fs::read(destination_root.path().join("file")).unwrap(),
-            b"followed content"
+            std::fs::read(destination.path().join("kept")).unwrap(),
+            b"OLD"
         );
-        #[cfg(feature = "acl")]
-        assert_eq!(
-            exacl::to_string(&exacl::getfacl(destination_root.path().join("file"), None).unwrap())
-                .unwrap()
-                .trim(),
-            expected_acl
-        );
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
     }
 
     /// -A/--preserve-acls locally: the source list is mirrored onto the

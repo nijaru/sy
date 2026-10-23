@@ -129,6 +129,23 @@ pub struct FinalizeJournalReader {
 }
 
 impl FinalizeJournalReader {
+    pub(crate) async fn validate_records<F, Fut, E>(
+        &mut self,
+        mut validate: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(FinalizeMetadata) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(), E>>,
+        E: From<FinalizeJournalError>,
+    {
+        let saved = (self.cursor, self.remaining, self.forward_cursor);
+        while let Some(record) = self.next().await? {
+            validate(record).await?;
+        }
+        (self.cursor, self.remaining, self.forward_cursor) = saved;
+        Ok(())
+    }
+
     /// Consume preparation requests in the same order as the semantic plan.
     pub async fn next_forward(&mut self) -> Result<Option<FinalizeMetadata>> {
         if self.remaining == 0 {

@@ -420,6 +420,500 @@ fn finalized_group_rejects_foreign_member_binding_and_inode_edits() {
 }
 
 #[cfg(target_os = "macos")]
+async fn source_guarded_destination(source: &Path, destination: &Path) -> RootedFs {
+    source_guarded_destination_with_parents(source, destination, &[]).await
+}
+
+#[cfg(target_os = "macos")]
+async fn source_guarded_destination_with_parents(
+    source: &Path,
+    destination: &Path,
+    parents: &[&str],
+) -> RootedFs {
+    use crate::endpoint::source_root::SourceRoot;
+    use crate::engine::namespace::NamespaceQualification;
+    use crate::rooted_fs::local_source_effects::LocalSourceEffects;
+    use futures::TryStreamExt;
+    let source = SourceRoot::open(source.to_path_buf()).await.unwrap();
+    source
+        .entries(Default::default())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let effects = LocalSourceEffects::seal(&source).await.unwrap();
+    let rooted = RootedFs::open(destination.to_path_buf()).await.unwrap();
+    let (mut rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
+    for path in parents {
+        namespace
+            .qualify(crate::engine::namespace::NamespaceParent::Directory(
+                relative(path),
+            ))
+            .await
+            .unwrap();
+    }
+    namespace.seal().await.unwrap();
+    rooted.local_source_effects = Some(effects);
+    rooted
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn group_link_and_anchor_retirement_recheck_original_ownership_after_source_census() {
+    for (finish, change) in [
+        (false, "foreign-link"),
+        (true, "foreign-link"),
+        (false, "anchor-relocation"),
+        (true, "anchor-relocation"),
+        (false, "OLD-link"),
+        (false, "alias-relocation"),
+    ] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("original"), b"SOURCE").unwrap();
+        std::fs::write(destination.path().join("second"), b"OLD second").unwrap();
+        let rooted = source_guarded_destination(source.path(), destination.path()).await;
+        let second_expected = ExpectedDestination::Unchanged(
+            rooted
+                .path_identity_blocking(&relative("second"))
+                .unwrap()
+                .unwrap()
+                .1,
+        );
+        let staged = prepared(&rooted);
+        let retained = staged.try_clone_file().unwrap();
+        let anchor_dir = destination.path().join(&staged.namespace.staging_dir_name);
+        let anchor = anchor_dir.join("contents");
+        let mut group = staged.into_group_blocking().unwrap();
+        let admission = Arc::new(PublicationAdmission::default());
+        group
+            .publish_member_blocking(
+                &relative("first"),
+                ExpectedDestination::Absent,
+                &admission,
+                || Ok(()),
+            )
+            .unwrap();
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        // Member-private DIR qualification precedes link admission; finish
+        // directly admits anchor retirement. Both pauses are AFTER census.
+        rooted.pause_mutation_at(
+            usize::from(!finish),
+            PublicationPause {
+                point: PublicationPausePoint::AfterSourceValidation,
+                reached,
+                resume: resumed,
+            },
+        );
+        let work = tokio::task::spawn_blocking(move || {
+            if finish {
+                let result = group
+                    .finish_blocking(relative("first"), None, admission)
+                    .map(|_| ());
+                (result, None)
+            } else {
+                let result = group
+                    .publish_member_blocking(
+                        &relative("second"),
+                        second_expected,
+                        &admission,
+                        || Ok(()),
+                    )
+                    .map(|_| ());
+                let cleanup = group.abort_blocking();
+                (result, Some(cleanup))
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let protected = source.path().join("arrival");
+        match change {
+            "foreign-link" => std::fs::hard_link(&anchor, &protected).unwrap(),
+            "anchor-relocation" => std::fs::rename(&anchor_dir, &protected).unwrap(),
+            "OLD-link" => {
+                std::fs::hard_link(destination.path().join("second"), &protected).unwrap()
+            }
+            "alias-relocation" => {
+                let alias_dir = std::fs::read_dir(destination.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .find(|path| path.is_dir() && *path != anchor_dir)
+                    .unwrap();
+                std::fs::rename(alias_dir, &protected).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let protected_file = if change == "anchor-relocation" {
+            protected.join("contents")
+        } else {
+            protected
+        };
+        let before = stat_fd(File::open(&protected_file).unwrap().as_raw_fd()).unwrap();
+        resume.send(()).unwrap();
+        let (result, cleanup) = work.await.unwrap();
+        let error = result.unwrap_err();
+        if finish {
+            assert!(
+                matches!(error, RootedFsError::CommittedFinalizationFailed { .. }),
+                "{error}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    RootedFsError::PartialGroupPublication {
+                        committed_members: 1,
+                        ..
+                    }
+                ),
+                "{error}"
+            );
+        }
+        if let Some(cleanup) = cleanup {
+            if matches!(change, "OLD-link" | "alias-relocation") {
+                cleanup.unwrap();
+            } else {
+                assert!(cleanup.is_err(), "foreign-owned anchor must be retained");
+            }
+        }
+        assert!(
+            staging::same_observation(
+                &before,
+                &stat_fd(File::open(&protected_file).unwrap().as_raw_fd()).unwrap()
+            ),
+            "{finish}/{change}"
+        );
+        if change == "alias-relocation" {
+            assert_eq!(std::fs::read_dir(&protected_file).unwrap().count(), 0);
+        }
+        assert_eq!(
+            std::fs::read(destination.path().join("first")).unwrap(),
+            b"group bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("second")).unwrap(),
+            b"OLD second"
+        );
+        assert_eq!(
+            stat_fd(retained.as_raw_fd()).unwrap().st_nlink,
+            if change == "foreign-link" {
+                3
+            } else if change == "anchor-relocation" {
+                2
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            std::fs::read_dir(destination.path()).unwrap().count(),
+            if change == "foreign-link" { 3 } else { 2 },
+            "no member-private artifact: {finish}/{change}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn group_publication_rechecks_both_private_bindings_after_final_source_census() {
+    for move_anchor in [false, true] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("original"), b"SOURCE").unwrap();
+        let rooted = source_guarded_destination(source.path(), destination.path()).await;
+        let staged = prepared(&rooted);
+        let anchor_dir = destination.path().join(&staged.namespace.staging_dir_name);
+        let retained = staged.try_clone_file().unwrap();
+        let mut group = staged.into_group_blocking().unwrap();
+        let admission = Arc::new(PublicationAdmission::default());
+        group
+            .publish_member_blocking(
+                &relative("first"),
+                ExpectedDestination::Absent,
+                &admission,
+                || Ok(()),
+            )
+            .unwrap();
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        // Private-DIR qualification, alias link and first publication admission
+        // precede the final publication census. Move only after that completes.
+        rooted.pause_mutation_at(
+            3,
+            PublicationPause {
+                point: PublicationPausePoint::AfterSourceValidation,
+                reached,
+                resume: resumed,
+            },
+        );
+        let work = tokio::task::spawn_blocking(move || {
+            let result = group.publish_member_blocking(
+                &relative("second"),
+                ExpectedDestination::Absent,
+                &admission,
+                || Ok(()),
+            );
+            let cleanup = group.abort_blocking();
+            (result, cleanup)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let relocated = if move_anchor {
+            anchor_dir.clone()
+        } else {
+            std::fs::read_dir(destination.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.is_dir() && *path != anchor_dir)
+                .unwrap()
+        };
+        let protected = source.path().join("arrival");
+        std::fs::rename(relocated, &protected).unwrap();
+        let before = stat_fd(retained.as_raw_fd()).unwrap();
+        resume.send(()).unwrap();
+        let (result, cleanup) = work.await.unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(RootedFsError::PartialGroupPublication {
+                    committed_members: 1,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(
+            cleanup.is_err(),
+            "SOURCE-reachable group links must be retained"
+        );
+        assert!(!destination.path().join("second").exists());
+        assert!(protected.join("contents").is_file());
+        assert!(staging::same_observation(
+            &before,
+            &stat_fd(retained.as_raw_fd()).unwrap()
+        ));
+        assert_eq!(
+            std::fs::read(destination.path().join("first")).unwrap(),
+            b"group bytes"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn source_guarded_private_file_effects_recheck_private_binding_after_final_census() {
+    for metadata in [false, true] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("original"), b"SOURCE").unwrap();
+        let rooted = source_guarded_destination(source.path(), destination.path()).await;
+        let mut staged = prepared(&rooted);
+        let anchor_dir = destination.path().join(&staged.namespace.staging_dir_name);
+        let retained = staged.try_clone_file().unwrap();
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        rooted.pause_mutation_at(
+            usize::from(!metadata),
+            PublicationPause {
+                point: PublicationPausePoint::AfterSourceValidation,
+                reached,
+                resume: resumed,
+            },
+        );
+        let work = tokio::task::spawn_blocking(move || {
+            if metadata {
+                let operation = staged.apply_metadata_blocking(Some(0o644), None);
+                (operation, Some(staged.abort()))
+            } else {
+                (staged.commit().map(|_| ()), None)
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let protected = source.path().join("arrival");
+        std::fs::rename(anchor_dir, &protected).unwrap();
+        let before = stat_fd(retained.as_raw_fd()).unwrap();
+        resume.send(()).unwrap();
+        let (operation, cleanup) = work.await.unwrap();
+        assert!(operation.is_err(), "{metadata}");
+        if let Some(cleanup) = cleanup {
+            assert!(cleanup.is_err());
+        }
+        assert!(!destination.path().join("first").exists());
+        assert_eq!(
+            std::fs::read(protected.join("contents")).unwrap(),
+            b"group bytes"
+        );
+        assert!(
+            staging::same_observation(&before, &stat_fd(retained.as_raw_fd()).unwrap()),
+            "{metadata}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn source_guarded_group_rechecks_nonrepresentative_members_before_shared_inode_effects() {
+    for (action, skip) in [("link", 1), ("publish", 3), ("finish", 0), ("flags", 1)] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("original"), b"SOURCE").unwrap();
+        std::fs::create_dir(destination.path().join("nested")).unwrap();
+        let rooted =
+            source_guarded_destination_with_parents(source.path(), destination.path(), &["nested"])
+                .await;
+        let staged = prepared(&rooted);
+        let anchor_dir = destination.path().join(&staged.namespace.staging_dir_name);
+        let retained = staged.try_clone_file().unwrap();
+        let mut group = staged.into_group_blocking().unwrap();
+        let admission = Arc::new(PublicationAdmission::default());
+        for name in ["first", "nested/other"] {
+            group
+                .publish_member_blocking(
+                    &relative(name),
+                    ExpectedDestination::Absent,
+                    &admission,
+                    || Ok(()),
+                )
+                .unwrap();
+        }
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        rooted.pause_mutation_at(
+            skip,
+            PublicationPause {
+                point: PublicationPausePoint::AfterSourceValidation,
+                reached,
+                resume: resumed,
+            },
+        );
+        let work = tokio::task::spawn_blocking(move || {
+            if matches!(action, "finish" | "flags") {
+                let result = group
+                    .finish_blocking(
+                        relative("first"),
+                        (action == "flags").then_some(libc::UF_NODUMP),
+                        admission,
+                    )
+                    .map(|_| ());
+                (result, None)
+            } else {
+                let result = group
+                    .publish_member_blocking(
+                        &relative("third"),
+                        ExpectedDestination::Absent,
+                        &admission,
+                        || Ok(()),
+                    )
+                    .map(|_| ());
+                (result, Some(group.abort_blocking()))
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        let protected = source.path().join("arrival");
+        std::fs::rename(destination.path().join("nested"), &protected).unwrap();
+        let before = stat_fd(retained.as_raw_fd()).unwrap();
+        resume.send(()).unwrap();
+        let (result, cleanup) = work.await.unwrap();
+        assert!(result.is_err(), "{action}: missing all-member barrier");
+        if let Some(cleanup) = cleanup {
+            assert!(cleanup.is_err(), "{action}: shared anchor must be retained");
+        }
+        assert!(
+            staging::same_observation(&before, &stat_fd(retained.as_raw_fd()).unwrap()),
+            "{action}"
+        );
+        assert_eq!(
+            std::fs::read(protected.join("other")).unwrap(),
+            b"group bytes"
+        );
+        assert_eq!(
+            std::fs::read(destination.path().join("first")).unwrap(),
+            b"group bytes"
+        );
+        assert!(!destination.path().join("third").exists());
+        assert_eq!(anchor_dir.exists(), action != "flags", "{action}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn terminal_source_keeps_only_certified_group_cleanup_available() {
+    for relocate_member in [false, true] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let original = source.path().join("original");
+        std::fs::write(&original, b"SOURCE").unwrap();
+        std::fs::create_dir(destination.path().join("nested")).unwrap();
+        let rooted =
+            source_guarded_destination_with_parents(source.path(), destination.path(), &["nested"])
+                .await;
+        let staged = prepared(&rooted);
+        let anchor_dir = destination.path().join(&staged.namespace.staging_dir_name);
+        let retained = staged.try_clone_file().unwrap();
+        let mut group = staged.into_group_blocking().unwrap();
+        let admission = Arc::new(PublicationAdmission::default());
+        for name in ["first", "nested/other"] {
+            group
+                .publish_member_blocking(
+                    &relative(name),
+                    ExpectedDestination::Absent,
+                    &admission,
+                    || Ok(()),
+                )
+                .unwrap();
+        }
+        if relocate_member {
+            std::fs::rename(
+                destination.path().join("nested"),
+                source.path().join("arrival"),
+            )
+            .unwrap();
+        }
+        std::fs::write(&original, b"changed SOURCE").unwrap();
+        assert!(rooted
+            .local_source_effects
+            .as_ref()
+            .unwrap()
+            .admit_native_effect_blocking(SourceEffect {
+                kind: SourceEffectKind::LeafPublication,
+                parent: rooted.root_fd.as_raw_fd(),
+                name: OsStr::new("third"),
+                object: None,
+                path: Path::new("third"),
+            })
+            .is_err());
+        let before = stat_fd(retained.as_raw_fd()).unwrap();
+        let result = group.abort_blocking();
+        assert_eq!(result.is_err(), relocate_member);
+        assert_eq!(anchor_dir.exists(), relocate_member);
+        if relocate_member {
+            assert!(staging::same_observation(
+                &before,
+                &stat_fd(retained.as_raw_fd()).unwrap()
+            ));
+            assert_eq!(
+                std::fs::read(source.path().join("arrival/other")).unwrap(),
+                b"group bytes"
+            );
+        } else {
+            assert_eq!(
+                stat_fd(retained.as_raw_fd()).unwrap().st_nlink,
+                before.st_nlink - 1
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn immutable_group_flags_follow_anchor_retirement_on_original_creator_fd() {
     let root = tempfile::tempdir().unwrap();

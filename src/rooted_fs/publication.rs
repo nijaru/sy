@@ -21,6 +21,8 @@ pub struct RootedPublishedFile {
     admission: Option<Arc<PublicationAdmission>>,
     #[cfg(unix)]
     observed: libc::stat,
+    #[cfg(unix)]
+    pub(super) group_links: Option<Arc<std::sync::Mutex<super::group_links::GroupLinks>>>,
 }
 
 impl std::fmt::Debug for RootedPublishedFile {
@@ -51,6 +53,7 @@ impl RootedPublishedFile {
                 #[cfg(target_os = "macos")]
                 admission: _admission,
                 observed,
+                group_links: None,
             };
             published
                 .verify_binding()
@@ -92,9 +95,17 @@ impl RootedPublishedFile {
             {
                 // Namespace admission ended with cleanup. This distinct
                 // metadata mutation needs late admission of its own.
-                let _permits = self
-                    .rooted
-                    .admit_mutation_with_transaction_blocking(self.admission.as_deref())?;
+                let (parent, leaf) = self.rooted.open_parent_blocking(self.path.as_path())?;
+                let _permits = self.rooted.admit_mutation_with_transaction_blocking(
+                    self.admission.as_deref(),
+                    super::SourceEffect {
+                        kind: super::SourceEffectKind::InodeMetadata,
+                        parent: parent.as_raw_fd(),
+                        name: &leaf,
+                        object: Some(self.file.as_raw_fd()),
+                        path: self.path.as_path(),
+                    },
+                )?;
                 self.verify_binding()?;
                 if !super::apply_bsd_flags_fd(&self.file, flags)? {
                     // No native effect can justify advancing ctime. Retain
@@ -147,6 +158,12 @@ impl RootedPublishedFile {
     fn verify_binding(&self) -> Result<EntryIdentity> {
         #[cfg(unix)]
         {
+            if let Some(links) = &self.group_links {
+                links
+                    .lock()
+                    .map_err(|_| RootedFsError::IncompleteStagedGroup)?
+                    .verify(&self.file, &self.observed)?;
+            }
             self.verify_observation_binding(&self.observed)
         }
         #[cfg(not(unix))]

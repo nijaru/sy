@@ -768,12 +768,9 @@ impl LocalSyncExecutor {
             },
         )
         .await
-        .map_err(|error| match error {
-            crate::error::SyncError::Io(io) => {
-                LocalSyncError::Destination(self.destination_path(destination_path), io)
-            }
-            other => LocalSyncError::Endpoint(other),
-        })?;
+        // The transfer error already carries its SOURCE/DESTINATION role.
+        // Relabeling every native error as DESTINATION loses that distinction.
+        .map_err(LocalSyncError::Endpoint)?;
         // Fail-fast on staged verification mismatch: the previous
         // destination is intact (the transfer layer aborted staging), and
         // the sync surfaces the failure instead of tolerating it.

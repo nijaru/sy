@@ -9,6 +9,7 @@ use crate::remote::path::{
     decode_relative_path, encode_relative_path, ensure_compatible_path_encoding, RemotePathError,
 };
 use crate::remote::router::{IncomingStream, RouterSender, SharedRouterError, StreamInbox};
+use crate::remote::source_file::{SourceCompletionError, SourceFile, SourceMetadataRequest};
 use crate::rooted_fs::{RootedFs, RootedFsError};
 use crate::transfer::delta::{match_delta, BasisIndex, DeltaMatchError, DeltaOp};
 use bytes::Bytes;
@@ -50,30 +51,6 @@ pub struct TransferMetadata {
     /// Complete exacl-unified ACL text applied to staging before commit when
     /// `-A` is on (empty text clears).
     pub acls: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct CapturedTransferPreservation {
-    xattrs: Option<Vec<(OsString, Vec<u8>)>>,
-    acls: Option<String>,
-}
-
-fn read_transfer_preservation(
-    rooted: &RootedFs,
-    file: &File,
-    path: &RelativePath,
-    request: TransferPreservationRequest,
-) -> Result<CapturedTransferPreservation> {
-    let xattrs = request
-        .xattrs
-        .then(|| rooted.read_open_file_xattrs_blocking(file, path))
-        .transpose()?;
-    let acls = request
-        .acls
-        .then(|| rooted.read_open_file_acl_blocking(file, path))
-        .transpose()?
-        .map(|acl| acl.unwrap_or_default());
-    Ok(CapturedTransferPreservation { xattrs, acls })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -394,165 +371,150 @@ pub async fn request_file_transfer_with_stream_policy(
     let expected_identity = source
         .identity
         .ok_or(RemoteTransferError::MissingSourceIdentity)?;
-
-    let opened_root = source_root.clone();
-    let source_path = source.path.clone();
     let expected_size = source.size;
-    let preservation_request = stream_policy.preservation;
-    let compression = stream_policy.compression;
-    let (source_file, final_source_file, captured_preservation) =
-        tokio::task::spawn_blocking(move || {
-            opened_root.validate_blocking()?;
-            let rooted = opened_root.rooted();
-            let file = rooted.open_regular_blocking(&source_path)?;
-            validate_source(&file, expected_identity, expected_size)?;
-            let preservation =
-                read_transfer_preservation(&rooted, &file, &source_path, preservation_request)?;
-            opened_root.validate_blocking()?;
-            let final_file = file.try_clone()?;
-            Ok::<_, RemoteTransferError>((file, final_file, preservation))
-        })
-        .await
-        .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
-    let mut metadata = metadata;
-    if preservation_request.xattrs {
-        metadata.xattrs = captured_preservation.xattrs;
-    }
-    if preservation_request.acls {
-        metadata.acls = captured_preservation.acls;
-    }
-
     let encoded_path = encode_relative_path(destination.path.as_path())?;
     let published_path = destination.path;
     let basis_index = destination.delta_index;
     let begin = match destination.expectation {
-        // The expectation is the scanned destination identity; delta
-        // transfers reuse it as their copy-op basis. The receiver refuses
-        // racing replacements before commit in both cases.
-        Some(expectation) => WireFileBegin::delta(encoded_path, source.size, expectation),
-        // A create: the receiver requires the path to remain absent.
-        None => WireFileBegin::whole(encoded_path, source.size),
-    };
-    let begin = begin
-        .with_metadata(
-            metadata.unix_mode,
-            metadata
-                .modified
-                .map(|value| (value.seconds(), value.nanoseconds())),
-        )?
-        .with_bsd_flags(stream_policy.final_flags);
+        Some(expectation) => WireFileBegin::delta(encoded_path, expected_size, expectation),
+        None => WireFileBegin::whole(encoded_path, expected_size),
+    }
+    .with_metadata(
+        metadata.unix_mode,
+        metadata
+            .modified
+            .map(|value| (value.seconds(), value.nanoseconds())),
+    )?
+    .with_bsd_flags(stream_policy.final_flags);
     let mut inbox = sender.open_stream()?;
     let stream_id = inbox.stream_id();
-    sender
-        .send(Frame::new(
-            FrameKind::FileBegin,
-            FrameFlags::empty(),
-            stream_id,
-            begin.encode(),
-        )?)
-        .await?;
+    let begin = Frame::new(
+        FrameKind::FileBegin,
+        FrameFlags::empty(),
+        stream_id,
+        begin.encode(),
+    )?;
 
+    let preservation_request = stream_policy.preservation;
+    let compression = stream_policy.compression;
+    let (source, preservation) = tokio::task::spawn_blocking(move || {
+        let source = SourceFile::capture_blocking(
+            source_root.rooted(),
+            source.path,
+            expected_identity,
+            expected_size,
+        )?;
+        let (preservation, _) = source.read_metadata_blocking(SourceMetadataRequest {
+            xattrs: preservation_request.xattrs,
+            acls: preservation_request.acls,
+            bsd_flags: false,
+        })?;
+        Ok::<_, RemoteTransferError>((source, preservation))
+    })
+    .await
+    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
+    let mut metadata = metadata;
+    if preservation_request.xattrs {
+        metadata.xattrs = preservation.xattrs;
+    }
+    if preservation_request.acls {
+        metadata.acls = preservation.acl;
+    }
+
+    let begun = sender.send(begin).await;
+    // Even a failed FileBegin releases the native owner on joined blocking work.
+    let (source, reader) = tokio::task::spawn_blocking(move || {
+        begun?;
+        let reader = source.clone_reader_blocking()?;
+        Ok::<_, RemoteTransferError>((source, reader))
+    })
+    .await
+    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
     let (producer_tx, producer_rx) = mpsc::channel(PRODUCER_QUEUE_DEPTH);
-    let producer_root = source_root.clone();
-    let producer_path = source.path.clone();
     let producer = tokio::task::spawn_blocking(move || {
-        producer_root.validate_blocking()?;
-        let summary = produce_source(
-            source_file,
+        produce_source(
+            reader,
             expected_identity,
             expected_size,
             basis_index,
             producer_tx,
             compression,
-        )?;
-        producer_root.validate_blocking()?;
-        producer_root
-            .rooted()
-            .validate_source_observation_blocking(&producer_path)?;
-        if producer_root
-            .rooted()
-            .path_identity_blocking(&producer_path)?
-            != Some((crate::engine::domain::EntryKind::File, expected_identity))
-        {
-            return Err(RemoteTransferError::SourceChanged {
-                expected_size,
-                actual_size: summary.file_size,
-            });
-        }
-        Ok(summary)
+        )
     });
 
-    let summary = send_produced_file(sender, stream_id, producer_rx, producer).await?;
-    // Preservation rides the transfer stream so the server can apply it to
-    // private staging before commit; a failure there aborts the replacement.
-    if let Some(xattrs) = &metadata.xattrs {
-        let entries = xattrs
-            .iter()
-            .map(|(name, value)| {
-                crate::protocol::WireXattr::new(
-                    crate::remote::xattr::name_bytes(name),
-                    value.clone(),
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let payload = crate::protocol::WireXattrResult::new(entries)?;
-        sender
-            .send(Frame::new(
-                FrameKind::FileXattrs,
-                FrameFlags::empty(),
-                stream_id,
-                payload.encode()?,
-            )?)
-            .await?;
-    }
-    if let Some(acls) = &metadata.acls {
-        let payload = crate::protocol::WireAcl::new(acls.clone())?;
-        sender
-            .send(Frame::new(
-                FrameKind::FileAcls,
-                FrameFlags::empty(),
-                stream_id,
-                payload.encode(),
-            )?)
-            .await?;
-    }
-    let final_root = source_root.clone();
-    let final_path = source.path;
-    tokio::task::spawn_blocking(move || {
-        final_root.validate_blocking()?;
-        final_root
-            .rooted()
-            .validate_source_reader_blocking(&final_path, &final_source_file)?;
-        validate_source(&final_source_file, expected_identity, expected_size)?;
-        if final_root.rooted().path_identity_blocking(&final_path)?
-            != Some((crate::engine::domain::EntryKind::File, expected_identity))
-        {
-            return Err(RemoteTransferError::SourceChanged {
-                expected_size,
-                actual_size: expected_size,
-            });
+    let streamed: Result<TransferSummary> = async {
+        let summary = send_produced_file(sender, stream_id, producer_rx, producer).await?;
+        // Requested preservation shares the DATA owner and private transfer stream.
+        if let Some(xattrs) = &metadata.xattrs {
+            let entries = xattrs
+                .iter()
+                .map(|(name, value)| {
+                    crate::protocol::WireXattr::new(
+                        crate::remote::xattr::name_bytes(name),
+                        value.clone(),
+                    )
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let payload = crate::protocol::WireXattrResult::new(entries)?;
+            sender
+                .send(Frame::new(
+                    FrameKind::FileXattrs,
+                    FrameFlags::empty(),
+                    stream_id,
+                    payload.encode()?,
+                )?)
+                .await?;
         }
-        final_root.validate_blocking()?;
-        Ok::<_, RemoteTransferError>(())
+        if let Some(acls) = &metadata.acls {
+            let payload = crate::protocol::WireAcl::new(acls.clone())?;
+            sender
+                .send(Frame::new(
+                    FrameKind::FileAcls,
+                    FrameFlags::empty(),
+                    stream_id,
+                    payload.encode(),
+                )?)
+                .await?;
+        }
+        Ok(summary)
+    }
+    .await;
+    let (source, summary) = tokio::task::spawn_blocking(move || {
+        let summary = streamed?;
+        source.validate_blocking()?;
+        Ok::<_, RemoteTransferError>((source, summary))
     })
     .await
     .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))??;
-    sender
-        .send(Frame::new(
-            FrameKind::FileEnd,
-            FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
-            stream_id,
-            WireFileEnd::new(summary.file_size, summary.digest).encode(),
-        )?)
-        .await?;
-    let ack = receive_ack(&mut inbox, stream_id).await?;
-    Ok((
-        summary,
-        crate::rooted_fs::PublishedFileProof {
-            path: published_path,
-            identity: EntryIdentity::from_bytes(ack.identity()),
-        },
-    ))
+    let acknowledged: Result<_> = async {
+        sender
+            .send(Frame::new(
+                FrameKind::FileEnd,
+                FrameFlags::FINAL | FrameFlags::ACK_REQUIRED,
+                stream_id,
+                WireFileEnd::new(summary.file_size, summary.digest).encode(),
+            )?)
+            .await?;
+        receive_ack(&mut inbox, stream_id).await
+    }
+    .await;
+    // Retain the DATA owner through receipt. A later SOURCE failure cannot turn
+    // acknowledged publication into rollback or source-removal permission.
+    tokio::task::spawn_blocking(move || {
+        let ack = acknowledged?;
+        source
+            .validate_blocking()
+            .map_err(|source| io::Error::other(SourceCompletionError { source }))?;
+        Ok((
+            summary,
+            crate::rooted_fs::PublishedFileProof {
+                path: published_path,
+                identity: EntryIdentity::from_bytes(ack.identity()),
+            },
+        ))
+    })
+    .await
+    .map_err(|error| RemoteTransferError::ProducerJoin(error.to_string()))?
 }
 
 /// Own the bounded producer queue and join its blocking worker on every send
@@ -1195,6 +1157,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_followed_source_stream_retains_owner_through_publication_receipt() {
+        use crate::endpoint::source_root::SourceRoot;
+        use crate::rooted_fs::operand::{BoundSource, SourceShape};
+        for late_change in [false, true] {
+            let source_root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            let target = outside.path().join("target");
+            let selected = source_root.path().join("selected");
+            std::fs::write(&target, b"original DATA").unwrap();
+            xattr::set(&target, "user.sy-push-owner", b"original").unwrap();
+            std::os::unix::fs::symlink(&target, &selected).unwrap();
+            let stamp = |path: &Path| {
+                let metadata = std::fs::symlink_metadata(path).unwrap();
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.nlink(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            };
+            let originals = [stamp(&selected), stamp(&target)];
+            let bound = BoundSource::open_local_following(selected.clone(), false)
+                .await
+                .unwrap();
+            let SourceShape::Leaf { name } = bound.shape else {
+                panic!("not selected")
+            };
+            let authority = SourceRoot::from_rooted(bound.rooted).unwrap();
+            let source = authority
+                .selected_entries(
+                    name,
+                    crate::engine::scan::ScanRequest {
+                        follow_symlinks: true,
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+                .remove(0);
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (mut client_reader, mut client_writer) = tokio::io::split(client_io);
+            let (mut server_reader, mut server_writer) = tokio::io::split(server_io);
+            let raced_target = target.clone();
+            let server = tokio::spawn(async move {
+                let opened = server_handshake(&mut server_reader, &mut server_writer)
+                    .await
+                    .unwrap();
+                let mut router = FrameRouter::start(
+                    server_reader,
+                    server_writer,
+                    RouterRole::Server,
+                    RouterConfig::default(),
+                )
+                .unwrap();
+                let IncomingStream { first, mut inbox } =
+                    router.incoming().recv().await.unwrap().unwrap();
+                let sender = router.sender();
+                let stream_id = inbox.stream_id();
+                let (begin, relative) = decode_reconstruction_begin(
+                    first.frame(),
+                    stream_id,
+                    opened.client.platform.os,
+                )
+                .unwrap();
+                drop(first);
+                let rooted = RootedFs::open(opened.root).await.unwrap();
+                let basis = begin.basis();
+                let prepared = tokio::task::spawn_blocking(move || {
+                    prepare_reconstruction(rooted, &relative, basis)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                let mut receiver = ReconstructionReceiver::start(prepared, begin);
+                let ready = receiver
+                    .receive(&mut inbox, require_file_end_flags)
+                    .await
+                    .unwrap();
+                let admission = sender.publication_admission();
+                let (summary, publication) = tokio::task::spawn_blocking(move || {
+                    let result = ready.commit_blocking(&admission)?;
+                    if late_change {
+                        // External SOURCE change after real DEST commit but before ACK.
+                        std::fs::write(raced_target, b"changed DATA")?;
+                    }
+                    Ok::<_, RemoteTransferError>(result)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                sender
+                    .send(
+                        Frame::new(
+                            FrameKind::Ack,
+                            FrameFlags::empty(),
+                            stream_id,
+                            crate::protocol::WireFileAck::new(*publication.identity.as_bytes())
+                                .encode(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                summary
+            });
+            let session = client_handshake(
+                &mut client_reader,
+                &mut client_writer,
+                Operation::Push,
+                destination.path(),
+            )
+            .await
+            .unwrap();
+            let router = FrameRouter::start(
+                client_reader,
+                client_writer,
+                RouterRole::Client,
+                RouterConfig::default(),
+            )
+            .unwrap();
+            let result = request_file_transfer_with_stream_policy(
+                &router.sender(),
+                authority,
+                source,
+                TransferDestination::create(RelativePath::new("copied").unwrap()),
+                TransferMetadata::default(),
+                session.server.platform.os,
+                TransferStreamPolicy {
+                    preservation: TransferPreservationRequest {
+                        xattrs: true,
+                        acls: false,
+                    },
+                    ..Default::default()
+                },
+            )
+            .await;
+            if late_change {
+                let Err(RemoteTransferError::Io(error)) = result else {
+                    panic!("expected committed SOURCE completion error: {result:?}")
+                };
+                assert!(error
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<SourceCompletionError>()
+                    .is_some());
+                server.await.unwrap();
+                assert_eq!(std::fs::read(&target).unwrap(), b"changed DATA");
+            } else {
+                let (summary, publication) = result.unwrap();
+                assert_eq!(summary, server.await.unwrap());
+                assert_eq!(publication.path, RelativePath::new("copied").unwrap());
+                assert_eq!([stamp(&selected), stamp(&target)], originals);
+            }
+            assert_eq!(std::fs::read_link(&selected).unwrap(), target);
+            assert_eq!(
+                std::fs::read(destination.path().join("copied")).unwrap(),
+                b"original DATA"
+            );
+            assert_eq!(
+                xattr::get(destination.path().join("copied"), "user.sy-push-owner").unwrap(),
+                Some(b"original".to_vec())
+            );
+            assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn whole_file_stream_commits_only_after_verified_file_end() {
         let source_root = tempfile::TempDir::new().unwrap();
         let destination_root = tempfile::TempDir::new().unwrap();
@@ -1364,65 +1497,6 @@ mod tests {
             std::fs::read(destination_root.path().join("file.bin")).unwrap(),
             source_data
         );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn push_preservation_capture_stays_on_held_source_after_path_replacement() {
-        let source_root = tempfile::TempDir::new().unwrap();
-        let source_path = source_root.path().join("file.bin");
-        let replacement_path = source_root.path().join("replacement.bin");
-        std::fs::write(&source_path, b"held source").unwrap();
-        std::fs::write(&replacement_path, b"replacement").unwrap();
-        xattr::set(&source_path, "user.sy_test", b"held").unwrap();
-        xattr::set(&replacement_path, "user.sy_test", b"replacement").unwrap();
-
-        let rooted = RootedFs::open(source_root.path().to_path_buf())
-            .await
-            .unwrap();
-        let relative = RelativePath::new(PathBuf::from("file.bin")).unwrap();
-        let (rooted, file, relative) = tokio::task::spawn_blocking(move || {
-            let file = rooted.open_regular_blocking(&relative)?;
-            validate_source(
-                &file,
-                crate::endpoint::local_identity::metadata_identity(
-                    &file.metadata()?,
-                    EntryKind::File,
-                )
-                .ok_or(RemoteTransferError::MissingOpenedIdentity)?,
-                b"held source".len() as u64,
-            )?;
-            Ok::<_, RemoteTransferError>((rooted, file, relative))
-        })
-        .await
-        .unwrap()
-        .unwrap();
-        std::fs::rename(&replacement_path, &source_path).unwrap();
-
-        let preservation = tokio::task::spawn_blocking(move || {
-            read_transfer_preservation(
-                &rooted,
-                &file,
-                &relative,
-                TransferPreservationRequest {
-                    xattrs: true,
-                    acls: false,
-                },
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
-
-        let xattrs = preservation.xattrs.unwrap();
-        assert_eq!(
-            xattrs
-                .iter()
-                .find(|(name, _)| name == "user.sy_test")
-                .map(|(_, value)| value.as_slice()),
-            Some(&b"held"[..])
-        );
-        assert!(preservation.acls.is_none());
     }
 
     #[tokio::test]

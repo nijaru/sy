@@ -94,3 +94,40 @@ async fn disk_completion_cannot_skip_another_original_group_or_first_record() {
     assert!(completed.contains([2; 32], changed).await.is_err());
     assert!(completed.contains([2; 32], first).await.is_err());
 }
+
+#[tokio::test]
+async fn altered_completion_scratch_cannot_authorize_skipping_or_new_records() {
+    use std::io::{Seek, SeekFrom, Write};
+    let (catalogue, reader, _) = selection().await;
+    let first = HardlinkGroupPlan::new(&catalogue, &reader, [2; 32])
+        .await
+        .unwrap()
+        .members()
+        .await
+        .unwrap()
+        .first_position()
+        .await
+        .unwrap();
+    for damage in ["payload", "truncate"] {
+        let completed = CompletedGroups::default();
+        completed.insert([2; 32], first, [3; 32]).await.unwrap();
+        {
+            let mut guard = completed.disk.lock().unwrap();
+            let file = &mut guard.as_mut().unwrap().index.file;
+            if damage == "truncate" {
+                file.set_len(0).unwrap();
+            } else {
+                file.seek(SeekFrom::End(-1)).unwrap();
+                file.write_all(&[0xff]).unwrap();
+            }
+        }
+        assert!(
+            completed.contains([2; 32], first).await.is_err(),
+            "{damage}"
+        );
+        assert!(
+            completed.insert([4; 32], first, [5; 32]).await.is_err(),
+            "{damage}"
+        );
+    }
+}

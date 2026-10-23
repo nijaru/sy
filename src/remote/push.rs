@@ -11,6 +11,7 @@ use crate::engine::work::WorkItem;
 use crate::remote::acl::{read_preserved_acls, AclLocation, RemoteAclError};
 use crate::remote::bsdflags::RemoteBsdFlagsError;
 use crate::remote::runtime::{ClientRemoteHandle, RemoteSessionError};
+use crate::remote::source_file::{SourceFileAccess, SourceFileError, SourceMetadataRequest};
 use crate::remote::transfer::{
     TransferDestination, TransferMetadata, TransferPreservationRequest, TransferStreamPolicy,
 };
@@ -118,7 +119,16 @@ pub enum RemotePushError {
     BsdFlags(#[from] RemoteBsdFlagsError),
 }
 
+impl From<SourceFileError> for RemotePushError {
+    fn from(error: SourceFileError) -> Self {
+        Self::Remote(RemoteSessionError::Transfer(error.into()))
+    }
+}
+
 mod group;
+
+#[cfg(all(test, target_os = "macos"))]
+mod source_metadata_tests;
 
 pub type LowerResult<T> = std::result::Result<T, RemotePushLowerError>;
 pub type Result<T> = std::result::Result<T, RemotePushError>;
@@ -839,31 +849,9 @@ impl RemotePushExecutor {
                 modified,
                 policy,
             } => {
-                let expected_destination = destination.identity.ok_or_else(|| {
-                    RemotePushError::MissingDestinationIdentity(
-                        destination.path.as_path().to_path_buf(),
-                    )
-                })?;
-                self.check_source_identity(&source).await?;
-                let xattrs = self.read_source_xattrs(&source).await?;
-                let acls = self.read_source_acls(&source).await?;
-                let bsd_flags = self.read_source_bsd_flags(&source).await?;
-                let metadata = crate::remote::runtime::metadata::observed_metadata(
-                    &destination.path,
-                    source.kind,
-                    expected_destination,
-                    unix_mode,
-                    modified,
-                    &crate::rooted_fs::MetadataPreservation {
-                        xattrs: xattrs.as_deref(),
-                        acl: acls.as_deref(),
-                        bsd_flags,
-                    },
-                )
-                .map_err(RemoteSessionError::from)?;
-                self.check_source_identity(&source).await?;
-                let identity = self.remote.apply_metadata(metadata).await?;
-                self.check_source_identity(&source).await?;
+                let identity = self
+                    .apply_source_metadata(&source, &destination, unix_mode, modified)
+                    .await?;
                 // Release metadata admission before acquiring the separate
                 // file/hash budget for a fresh existing-destination receipt.
                 drop(_permit);
@@ -917,7 +905,100 @@ impl RemotePushExecutor {
             })
     }
 
-    /// Revalidate a linking member's scan identity (cheap stat, no bytes).
+    async fn apply_source_metadata(
+        &self,
+        source: &Entry,
+        destination: &Entry,
+        unix_mode: Option<u32>,
+        modified: Option<Timestamp>,
+    ) -> Result<EntryIdentity> {
+        let expected_destination = destination.identity.ok_or_else(|| {
+            RemotePushError::MissingDestinationIdentity(destination.path.as_path().to_path_buf())
+        })?;
+        if source.is_file() {
+            let expected_source = source
+                .identity
+                .ok_or_else(|| ExistingDestinationError::MissingObservation(source.path.clone()))?;
+            let rooted = self.source_root.rooted();
+            let source = source.clone();
+            let destination_path = destination.path.clone();
+            let request = SourceMetadataRequest {
+                xattrs: self.xattrs,
+                acls: self.acls,
+                bsd_flags: self.bsd_flags,
+            };
+            let (original, metadata) = tokio::task::spawn_blocking(move || -> Result<_> {
+                let original = SourceFileAccess::capture_blocking(
+                    rooted,
+                    source.path,
+                    expected_source,
+                    source.size,
+                    false,
+                    request,
+                )?;
+                let (preservation, bsd_flags) = original.read_metadata_blocking(request)?;
+                let metadata = crate::remote::runtime::metadata::observed_metadata(
+                    &destination_path,
+                    EntryKind::File,
+                    expected_destination,
+                    unix_mode,
+                    modified,
+                    &crate::rooted_fs::MetadataPreservation {
+                        xattrs: preservation.xattrs.as_deref(),
+                        acl: preservation.acl.as_deref(),
+                        bsd_flags,
+                    },
+                )
+                .map_err(RemoteSessionError::from)?;
+                original.validate_blocking()?;
+                Ok((original, metadata))
+            })
+            .await
+            .map_err(|error| crate::rooted_fs::RootedFsError::Worker(error.to_string()))??;
+            let acknowledged = self.remote.apply_metadata(metadata).await;
+            // Retain the exact reader (or readless observation) until the RPC
+            // outcome; native validation and destruction belong on this worker.
+            let completion = tokio::task::spawn_blocking(move || -> Result<_> {
+                let identity = acknowledged?;
+                original.validate_blocking()?;
+                Ok(identity)
+            })
+            .await
+            .map_err(|error| {
+                RemotePushError::Directory(crate::rooted_fs::RootedFsError::Worker(
+                    error.to_string(),
+                ))
+            })
+            .and_then(std::convert::identity);
+            return completion
+                .map_err(|error| RemotePushError::SourceCompletionUncertain(Box::new(error)));
+        }
+        self.check_source_identity(source).await?;
+        let xattrs = self.read_source_xattrs(source).await?;
+        let acls = self.read_source_acls(source).await?;
+        let bsd_flags = self.read_source_bsd_flags(source).await?;
+        let metadata = crate::remote::runtime::metadata::observed_metadata(
+            &destination.path,
+            source.kind,
+            expected_destination,
+            unix_mode,
+            modified,
+            &crate::rooted_fs::MetadataPreservation {
+                xattrs: xattrs.as_deref(),
+                acl: acls.as_deref(),
+                bsd_flags,
+            },
+        )
+        .map_err(RemoteSessionError::from)?;
+        self.check_source_identity(source).await?;
+        let identity = self.remote.apply_metadata(metadata).await?;
+        self.check_source_identity(source)
+            .await
+            .map_err(|error| RemotePushError::SourceCompletionUncertain(Box::new(error)))?;
+        Ok(identity)
+    }
+
+    /// Revalidate a named SOURCE member; this grants no following or DATA authority.
     async fn check_source_identity(&self, source: &Entry) -> Result<()> {
         self.source_root.validate().await?;
         let rooted = self.source_root.rooted();
@@ -1166,11 +1247,6 @@ impl RemotePushExecutor {
         if !self.xattrs || source.is_symlink() {
             return Ok(None);
         }
-        if source.is_file() {
-            return Ok(Some(
-                existing::observed_xattrs(self.source_root.clone(), source.clone()).await?,
-            ));
-        }
         let location = XattrLocation::Local(&self.source_root);
         let xattrs = read_preserved_xattrs(&location, source).await?;
         Ok(Some(xattrs))
@@ -1181,13 +1257,6 @@ impl RemotePushExecutor {
     async fn read_source_acls(&self, source: &Entry) -> Result<Option<String>> {
         if !self.acls || source.is_symlink() {
             return Ok(None);
-        }
-        if source.is_file() {
-            return Ok(Some(
-                existing::observed_acl(self.source_root.clone(), source.clone())
-                    .await?
-                    .unwrap_or_default(),
-            ));
         }
         let location = AclLocation::Local(&self.source_root);
         let acl = read_preserved_acls(&location, source).await?;

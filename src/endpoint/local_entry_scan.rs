@@ -122,9 +122,12 @@ pub(crate) fn source_entry_stream(
             traversal::walk_tree_rooted(&root.rooted(), request, &sender, Default::default()),
             &sender,
         );
-        root.validate_blocking()?;
+        let result = source_scan_result(&root, result);
+        if result.is_ok() {
+            root.validate_blocking()?;
+        }
         #[cfg(unix)]
-        attempt.finish(result.is_ok() && !sender.is_closed());
+        attempt.finish(result.is_ok() && !sender.is_closed())?;
         result
     })
 }
@@ -137,7 +140,7 @@ pub(crate) fn selected_source_stream(
 ) -> EntryStream {
     EntryStream::spawn_blocking(1, move |sender| {
         #[cfg(unix)]
-        let attempt = root.rooted().start_source_scan_blocking()?;
+        let attempt = root.rooted().start_selected_source_scan_blocking(&path)?;
         root.validate_blocking()?;
         let result = traversal::selected_leaf_rooted(
             &root.rooted(),
@@ -147,10 +150,56 @@ pub(crate) fn selected_source_stream(
             &sender,
         )
         .map_err(|error| Box::new(error) as BoxError);
-        root.validate_blocking()?;
+        let result = source_scan_result(&root, result);
+        if result.is_ok() {
+            root.validate_blocking()?;
+        }
         #[cfg(unix)]
-        attempt.finish(result.is_ok() && !sender.is_closed());
+        attempt.finish(result.is_ok() && !sender.is_closed())?;
         result
+    })
+}
+
+// Only these exact scanner wrappers carry a rooted SOURCE mismatch. Cleanup
+// composites, mandatory native I/O and malformed scratch remain opaque/fatal.
+fn source_scan_result(
+    root: &super::source_root::SourceRoot,
+    result: Result<(), BoxError>,
+) -> Result<(), BoxError> {
+    result.map_err(|error| {
+        if let Some(LocalScanError::Metadata { path, source }) =
+            error.downcast_ref::<LocalScanError>()
+        {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                if let Some(relative) = path
+                    .strip_prefix(root.path())
+                    .ok()
+                    .and_then(|path| RelativePath::new(path).ok())
+                {
+                    match root
+                        .rooted()
+                        .validate_source_observation_blocking(&relative)
+                    {
+                        Err(change @ sy::rooted_fs::RootedFsError::SourceBindingChanged(_))
+                        | Err(change @ sy::rooted_fs::RootedFsError::RootChanged(_)) => {
+                            return Box::new(change) as BoxError
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(LocalScanError::Walk(io)) = error.downcast_ref::<LocalScanError>() {
+            if let Some(sy::rooted_fs::RootedFsError::SourceBindingChanged(path)) = io
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<sy::rooted_fs::RootedFsError>())
+            {
+                return Box::new(sy::rooted_fs::RootedFsError::SourceBindingChanged(
+                    path.clone(),
+                )) as BoxError;
+            }
+        }
+        error
     })
 }
 

@@ -11,6 +11,7 @@ impl RootedStagedFile {
         #[cfg(unix)]
         {
             let before = stat_fd(original.as_raw_fd())?;
+            self.validate_private_source_effect_blocking()?;
             let current = stat_fd(self.file.as_raw_fd())?;
             if before.st_uid != current.st_uid || before.st_gid != current.st_gid {
                 // SAFETY: the destination is our held private regular file;

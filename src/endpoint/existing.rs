@@ -183,7 +183,7 @@ fn observed_xattrs_blocking(
     rooted: &RootedFs,
     entry: &Entry,
 ) -> Result<Vec<(std::ffi::OsString, Vec<u8>)>> {
-    let file = rooted.open_regular_blocking(&entry.path)?;
+    let file = rooted.open_observed_regular_blocking(&entry.path)?;
     validate_file(rooted, &file, entry)?;
     let attrs = rooted.read_open_file_xattrs_blocking(&file, &entry.path)?;
     validate_file(rooted, &file, entry)?;
@@ -191,7 +191,7 @@ fn observed_xattrs_blocking(
 }
 
 fn observed_acl_blocking(rooted: &RootedFs, entry: &Entry) -> Result<Option<String>> {
-    let file = rooted.open_regular_blocking(&entry.path)?;
+    let file = rooted.open_observed_regular_blocking(&entry.path)?;
     validate_file(rooted, &file, entry)?;
     let acl = rooted.read_open_file_acl_blocking(&file, &entry.path)?;
     validate_file(rooted, &file, entry)?;
@@ -239,7 +239,7 @@ fn fingerprint_blocking(
     options: FingerprintOptions,
 ) -> Result<ExistingFingerprint> {
     rooted.verify_source_root_path_blocking()?;
-    let mut file = rooted.open_regular_blocking(&entry.path)?;
+    let mut file = rooted.open_observed_regular_blocking(&entry.path)?;
     let metadata = validate_file(rooted, &file, entry)?;
     #[cfg(not(unix))]
     let _ = &metadata;
@@ -375,7 +375,8 @@ mod tests {
             .append_existing(&source, &receipt)
             .await
             .map_err(std::io::Error::other)?;
-        let root = crate::endpoint::source_root::SourceRoot::from_rooted(rooted);
+        let root = crate::endpoint::source_root::SourceRoot::from_rooted(rooted)
+            .map_err(std::io::Error::other)?;
         let source_rooted = root.rooted();
         journal
             .replay(root, |proof| {
@@ -507,9 +508,12 @@ mod tests {
             let source_directory = tempfile::tempdir().unwrap();
             std::fs::write(source_directory.path().join("input"), b"kept bytes").unwrap();
             let source = observe_file(source_directory.path(), "input");
-            let source_rooted = RootedFs::open(source_directory.path().to_path_buf())
-                .await
-                .unwrap();
+            let source_rooted = crate::endpoint::source_root::SourceRoot::open(
+                source_directory.path().to_path_buf(),
+            )
+            .await
+            .unwrap()
+            .rooted();
             crate::rooted_fs::test_source::scan(&source_rooted).await;
             let source_fingerprint = fingerprint(
                 source_rooted.clone(),
@@ -556,7 +560,10 @@ mod tests {
             }
             let source = observe_file(root.path(), "input");
             let destination = observe_file(root.path(), "renamed");
-            let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+            let rooted = crate::endpoint::source_root::SourceRoot::open(root.path().to_path_buf())
+                .await
+                .unwrap()
+                .rooted();
             crate::rooted_fs::test_source::scan(&rooted).await;
             let options = FingerprintOptions::default();
             let proof = receipt(
@@ -599,7 +606,11 @@ mod tests {
         }
         let source = observe_file(root.path(), "input");
         let destination = observe_file(root.path(), "renamed");
-        let rooted = RootedFs::open(root.path().to_path_buf()).await.unwrap();
+        let rooted = crate::endpoint::source_root::SourceRoot::open(root.path().to_path_buf())
+            .await
+            .unwrap()
+            .rooted();
+        crate::rooted_fs::test_source::scan(&rooted).await;
         let options = FingerprintOptions::default();
         let proof = receipt(
             &source,

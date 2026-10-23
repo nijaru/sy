@@ -93,7 +93,7 @@ impl SyncPlanExecutor for HoldSecondPushWorker {
 }
 
 #[tokio::test]
-async fn routed_push_source_failure_cuts_off_waiting_worker_before_owned_drain() {
+async fn routed_push_source_failure_cuts_off_and_joins_waiting_operation() {
     let source_dir = tempfile::tempdir().unwrap();
     let destination_dir = tempfile::tempdir().unwrap();
     std::fs::write(source_dir.path().join("a"), b"source a").unwrap();
@@ -185,9 +185,13 @@ async fn routed_push_source_failure_cuts_off_waiting_worker_before_owned_drain()
         std::fs::read(source_dir.path().join("b")).unwrap(),
         b"source b"
     );
-    let ControllerError::OwnedDrain { operation, .. } = error else {
-        panic!("lost waiting worker's drain failure: {error:?}");
+    let ControllerError::JoinedOperations { operation, sibling } = error else {
+        panic!("lost waiting worker's operation failure: {error:?}");
     };
+    assert!(matches!(*sibling, ControllerError::Backend { source, .. }
+        if matches!(source.downcast_ref::<crate::remote::push::RemotePushError>(),
+            Some(crate::remote::push::RemotePushError::Remote(
+                crate::remote::runtime::RemoteSessionError::Mutation(_))))));
     let ControllerError::Backend { source, .. } = *operation else {
         panic!("lost original SOURCE failure: {operation:?}");
     };

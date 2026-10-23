@@ -732,7 +732,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn replacement_root_rules_cannot_be_cached_as_original_deletion_protection() {
+    fn replacement_root_rules_terminally_invalidate_original_deletion_protection() {
         let parent = tempfile::tempdir().unwrap();
         let original = parent.path().join("source");
         let replacement = parent.path().join("replacement");
@@ -745,14 +745,21 @@ mod tests {
         let mut scope = scope(&original);
         // The source producer has finished, but this destination-only rule
         // lookup has not occurred yet. Missing replacement rules must not grant
-        // delete authority or poison the cache after the original root returns.
+        // delete authority. Restoring the name cannot repair a failed SOURCE run.
         std::fs::rename(&original, &held).unwrap();
         std::fs::rename(&replacement, &original).unwrap();
         assert!(scope.is_ignored(Path::new("sub/victim"), false));
         std::fs::rename(&original, &replacement).unwrap();
         std::fs::rename(&held, &original).unwrap();
         assert!(scope.is_ignored(Path::new("sub/victim"), false));
-        assert!(!scope.is_ignored(Path::new("sub/ordinary"), false));
+        assert!(scope.is_ignored(Path::new("sub/ordinary"), false));
+        let error = scope
+            .source_match(Path::new("sub/ordinary"), false)
+            .unwrap_err();
+        assert!(
+            matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<crate::rooted_fs::RootedFsError>()),
+            Some(crate::rooted_fs::RootedFsError::RootChanged(path)) if path == &original)
+        );
     }
 
     #[test]

@@ -219,9 +219,10 @@ fn reopen(
     relative: &Path,
     follow: bool,
     stack: &mut Stack,
+    rooted: Option<&crate::rooted_fs::RootedFs>,
 ) -> Result<Directory, LocalScanError> {
     let frame = stack.read(0)?;
-    let mut directory = Directory::root(root)?;
+    let mut directory = rooted.map_or_else(|| Directory::root(root), Directory::held)?;
     if directory.identity()? != Identity(frame.device, frame.inode) {
         return Err(LocalScanError::DirectoryChanged(root.to_path_buf()));
     }
@@ -366,6 +367,26 @@ fn selected_leaf_with_root(
             )
             .map_err(io::Error::other)?;
     }
+    #[cfg(unix)]
+    if let Some(rooted) = rooted {
+        let metadata = rooted
+            .source_scan_metadata_blocking(relative, request.follow_symlinks)
+            .map_err(io::Error::other)?;
+        if (request.include_git_dir || relative.as_path() != Path::new(".git"))
+            && (missing_allowed || !scope.source_match(relative.as_path(), metadata.is_dir)?)
+        {
+            if metadata.is_dir && !missing_allowed {
+                return Err(LocalScanError::Walk(io::Error::other(
+                    "selected leaf is a directory; a tree scope is required",
+                )));
+            }
+            let entry = rooted
+                .source_entry_metadata_blocking(relative, request)
+                .map_err(io::Error::other)?;
+            let _ = sender.blocking_send(Ok(entry));
+        }
+        return Ok(());
+    }
     let metadata = match entry_metadata(&absolute, request) {
         Ok(metadata) => Some(metadata),
         Err(LocalScanError::Metadata { source, .. })
@@ -475,12 +496,23 @@ fn walk_tree_with_root(
     let mut names = spool.open(frame.run)?;
     let result = (|| {
         while !sender.is_closed() {
-            // Entry conversion uses lexical paths (including copy-links).
-            // Revalidate every ancestor before resolving those paths, and on
-            // EOF so an empty/replaced root is not a successful source scan.
-            drop(reopen(root, &path, request.follow_symlinks, &mut stack)?);
+            // SOURCE continuations reopen through the held root, no-follow.
+            // Unbound lexical scanning remains a separate legacy contract.
+            drop(reopen(
+                root,
+                &path,
+                request.follow_symlinks && rooted.is_none(),
+                &mut stack,
+                rooted,
+            )?);
             let Some(name) = names.next()? else {
                 stack.check_top(depth)?;
+                #[cfg(unix)]
+                if let Some(rooted) = rooted {
+                    rooted
+                        .complete_source_directory_blocking(&path)
+                        .map_err(io::Error::other)?;
+                }
                 drop(names);
                 spool.remove(frame.run)?;
                 if depth == 0 {
@@ -490,53 +522,71 @@ fn walk_tree_with_root(
                 path.pop();
                 stack.truncate(depth + 1)?;
                 drop(directory);
-                directory = reopen(root, &path, request.follow_symlinks, &mut stack)?;
+                directory = reopen(
+                    root,
+                    &path,
+                    request.follow_symlinks && rooted.is_none(),
+                    &mut stack,
+                    rooted,
+                )?;
                 frame = stack.read(depth)?;
                 names = spool.open(frame.run)?;
                 continue;
             };
             let relative = path.join(&name);
             let absolute = root.join(&relative);
-            #[cfg(unix)]
-            if let Some(rooted) = rooted {
-                let selected = crate::engine::domain::RelativePath::new(relative.clone()).map_err(
-                    |source| LocalScanError::RelativePath {
-                        path: relative.clone(),
-                        source,
-                    },
-                )?;
-                rooted
-                    .validate_source_observation_blocking(&selected)
+            let selected = crate::engine::domain::RelativePath::new(relative.clone())
+                .map_err(io::Error::other)?;
+            // SOURCE metadata uses native no-follow ancestry, even when the
+            // configured spelling races. Unbound scanners retain their legacy
+            // lexical contract; they are not SOURCE confinement authority.
+            let (is_directory, metadata) = if let Some(rooted) = rooted {
+                let metadata = rooted
+                    .source_scan_metadata_blocking(&selected, request.follow_symlinks)
                     .map_err(io::Error::other)?;
-            }
-            let metadata = entry_metadata(&absolute, request)?;
-            if scratch.matches(&absolute, &metadata, request.follow_symlinks)? {
-                continue;
-            }
-            // WalkBuilder detects followed loops before ignore filtering and
-            // even at max-depth. Ignoring a loop cannot turn a failed source
-            // observation into a successful scan that authorizes deletion.
-            if request.follow_symlinks && metadata.is_dir() && {
-                let id = path_identity(&absolute, &metadata, true)?;
-                stack.contains(depth, (id.0, id.1))?
-            } {
-                return Err(LocalScanError::SymlinkLoop(absolute));
-            }
+                (metadata.is_dir, None)
+            } else {
+                let metadata = entry_metadata(&absolute, request)?;
+                if scratch.matches(&absolute, &metadata, request.follow_symlinks)? {
+                    continue;
+                }
+                if request.follow_symlinks && metadata.is_dir() {
+                    let id = path_identity(&absolute, &metadata, true)?;
+                    if stack.contains(depth, (id.0, id.1))? {
+                        return Err(LocalScanError::SymlinkLoop(absolute));
+                    }
+                }
+                (metadata.is_dir(), Some(metadata))
+            };
             if !request.include_git_dir && name == ".git" {
                 continue;
             }
-            // Match against lexical ancestry BEFORE descending. Re-rooting a
-            // shallow walker here would canonicalize external link ancestry.
-            if scope.source_match(&relative, metadata.is_dir())? {
+            if scope.source_match(&relative, is_directory)? {
                 continue;
             }
-            let entry = engine_entry(root, &absolute, &metadata, request)?;
-            let child = if metadata.is_dir()
-                && request.max_depth.is_none_or(|limit| depth + 1 < limit)
-            {
-                let child = directory.child(&name, request.follow_symlinks)?;
+            let entry = if let Some(rooted) = rooted {
+                rooted
+                    .source_entry_metadata_blocking(&selected, request)
+                    .map_err(io::Error::other)?
+            } else {
+                engine_entry(
+                    root,
+                    &absolute,
+                    metadata
+                        .as_ref()
+                        .ok_or_else(|| io::Error::other("unbound metadata missing"))?,
+                    request,
+                )?
+            };
+            let child = if is_directory && request.max_depth.is_none_or(|limit| depth + 1 < limit) {
+                let child = directory.child(&name, request.follow_symlinks && rooted.is_none())?;
                 let child_identity = child.identity()?;
-                if child_identity != path_identity(&absolute, &metadata, request.follow_symlinks)? {
+                if metadata
+                    .as_ref()
+                    .map(|metadata| path_identity(&absolute, metadata, request.follow_symlinks))
+                    .transpose()?
+                    .is_some_and(|expected| child_identity != expected)
+                {
                     return Err(LocalScanError::DirectoryChanged(absolute));
                 }
                 Some(child)
@@ -582,63 +632,4 @@ fn walk_tree_with_root(
 }
 
 #[cfg(unix)]
-struct DirectoryStream(*mut libc::DIR);
-#[cfg(unix)]
-impl DirectoryStream {
-    fn open(fd: std::os::fd::RawFd) -> io::Result<Self> {
-        // SAFETY: fd is live; reopening '.' gives an independent directory
-        // cursor rather than dup's shared open-file-description offset.
-        let scan_fd = unsafe {
-            libc::openat(
-                fd,
-                c".".as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if scan_fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: scan_fd is fresh; fdopendir owns it on success only.
-        let dir = unsafe { libc::fdopendir(scan_fd) };
-        if dir.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so scan_fd still belongs to us.
-            unsafe {
-                libc::close(scan_fd);
-            }
-            return Err(error);
-        }
-        Ok(Self(dir))
-    }
-}
-#[cfg(unix)]
-impl Drop for DirectoryStream {
-    fn drop(&mut self) {
-        // SAFETY: this guard exclusively owns a live DIR pointer.
-        unsafe {
-            libc::closedir(self.0);
-        }
-    }
-}
-#[cfg(unix)]
-impl Iterator for DirectoryStream {
-    type Item = io::Result<OsString>;
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            errno::set_errno(errno::Errno(0));
-            // SAFETY: self exclusively owns this live DIR pointer.
-            let entry = unsafe { libc::readdir(self.0) };
-            if entry.is_null() {
-                let errno = errno::errno().0;
-                return (errno != 0).then(|| Err(io::Error::from_raw_os_error(errno)));
-            }
-            // SAFETY: successful readdir returns NUL-terminated d_name valid
-            // until next readdir; copy the name before advancing.
-            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                use std::os::unix::ffi::OsStringExt;
-                return Some(Ok(OsString::from_vec(name.to_vec())));
-            }
-        }
-    }
-}
+use crate::fs_util::directory_stream::DirectoryStream;

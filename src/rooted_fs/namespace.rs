@@ -469,7 +469,7 @@ fn verify_literal_name(parent: RawFd, name: &OsStr, path: &Path) -> Result<()> {
         return Ok(());
     }
     let mut exact = false;
-    for entry in super::scan::DirectoryStream::open(parent)? {
+    for entry in crate::fs_util::directory_stream::DirectoryStream::open(parent)? {
         exact |= entry?.as_bytes() == name.as_bytes();
     }
     if !exact {

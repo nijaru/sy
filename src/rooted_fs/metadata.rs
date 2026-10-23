@@ -228,7 +228,7 @@ impl RootedFs {
             return Ok(false);
         }
         self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
-        let _permit = self.admit_mutation_blocking()?;
+        let _permit = self.admit_validated_observation_blocking(None)?;
         if !basic_metadata_matches(&observe()?, unix_mode, modified)? {
             return Err(RootedFsError::DestinationChanged(
                 relative.as_path().to_path_buf(),
@@ -277,7 +277,7 @@ impl RootedFs {
                 }
                 // Matching state is an admitted no-effect operation. Compare
                 // again through the SAME original descriptor after admission.
-                let _permits = self.admit_mutation_with_transaction_blocking(None)?;
+                let _permits = self.admit_validated_observation_blocking(None)?;
                 preservation.matches(file, unix_mode, modified)
             })
         }
@@ -342,7 +342,13 @@ impl RootedFs {
                 }
                 if let Some(modified) = modified {
                     self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
-                    let _permit = self.admit_mutation_blocking()?;
+                    let _permit = self.admit_mutation_blocking(SourceEffect {
+                        kind: SourceEffectKind::InodeMetadata,
+                        parent: parent.as_raw_fd(),
+                        name: &leaf,
+                        object: None,
+                        path: relative.as_path(),
+                    })?;
                     // Portable symlink time is a no-follow parent-relative
                     // syscall, not an atomic identity-conditional mutation.
                     set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
@@ -385,7 +391,14 @@ impl RootedFs {
             }
             self.verify_metadata_binding_blocking(relative.as_path(), &file, kind)?;
             // Keep the session closure guard even for effect-free completion.
-            let _permit = self.admit_mutation_blocking()?;
+            let (parent, leaf) = self.open_parent_blocking(relative.as_path())?;
+            let _permit = self.admit_mutation_blocking(SourceEffect {
+                kind: SourceEffectKind::InodeMetadata,
+                parent: parent.as_raw_fd(),
+                name: &leaf,
+                object: Some(file.as_raw_fd()),
+                path: relative.as_path(),
+            })?;
             if effect_free {
                 if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected)
                     || !preservation.matches(&file, unix_mode, modified)?
@@ -395,6 +408,17 @@ impl RootedFs {
                     ));
                 }
             } else {
+                if self.local_source_effects.is_some() {
+                    // SOURCE census can block after the earlier observations.
+                    // It cannot advance OLD identity or preserve exclusivity.
+                    if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected) {
+                        return Err(RootedFsError::DestinationChanged(
+                            relative.as_path().to_path_buf(),
+                        ));
+                    }
+                    self.verify_metadata_binding_blocking(relative.as_path(), &file, kind)?;
+                    require_exclusive_file_metadata(&file, relative.as_path())?;
+                }
                 preservation.apply(&file, unix_mode, modified)?;
             }
             let current = identity_from_stat(&stat_fd(file.as_raw_fd())?).ok_or_else(|| {

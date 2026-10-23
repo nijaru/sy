@@ -16,23 +16,19 @@ use sy::remote::runtime::ClientRemoteHandle;
 use sy::remote::ssh::{SshLaunchOptions, SshRemoteSession};
 use sy::transfer::delta::BasisIndexLimits;
 
-pub(super) async fn run(
-    source_root: &Path,
+pub(super) async fn run_acquired(
+    bound: sy::rooted_fs::operand::BoundSource,
     destination_root: &Path,
     host: &str,
     user: &Option<String>,
     config: &SyncConfig,
     scan_options: ScanOptions,
-    contents: bool,
 ) -> Result<SyncStats> {
-    let bound = if config.preserve.symlink_mode == SymlinkMode::Follow {
-        sy::rooted_fs::operand::BoundSource::open_following(source_root.to_path_buf(), contents)
-            .await
-    } else {
-        sy::rooted_fs::operand::BoundSource::open(source_root.to_path_buf(), contents).await
-    }
-    .map_err(map_io)?;
-    let source_authority = sy::endpoint::source_root::SourceRoot::from_rooted(bound.rooted);
+    let source_authority =
+        sy::endpoint::source_root::SourceRoot::from_rooted(bound.rooted).map_err(map_io)?;
+    // Validate original operator provenance before even connecting: the peer
+    // must never receive a replacement SOURCE's shape or deletion authority.
+    source_authority.validate().await.map_err(map_io)?;
     // Refuse before connecting or allocating controller/session journals.
     sy::endpoint::local_entry_scan::validate_scratch_location(
         source_authority.path().to_path_buf(),
@@ -152,6 +148,7 @@ async fn execute_bound(
     scope: sy::engine::domain::SyncScope,
 ) -> Result<SyncStats> {
     use sy::endpoint::Endpoint;
+    source_authority.validate().await.map_err(map_io)?;
     admit_remote_preservation(&remote, source_authority.endpoint().capabilities(), config)?;
     let source_root = source_authority.path();
     let reporter = std::sync::Arc::new(sy::sync::output::SyncReporter::new(
@@ -271,6 +268,11 @@ async fn execute_bound(
     .map_err(map_controller_error)?;
 
     source_authority.validate().await.map_err(map_io)?;
+    if config.remove_source_files {
+        plan.validate_source_removal_support(&source_authority)
+            .await
+            .map_err(map_controller_error)?;
+    }
     if config.preserve.hardlinks {
         plan.seal_hardlink_membership()
             .await
@@ -383,6 +385,81 @@ mod tests {
             fixture.assert_sources_intact();
             fixture.assert_publications(after_publication);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followed_source_removal_refuses_before_remote_parent_acquisition() {
+        use std::os::unix::fs::MetadataExt;
+        let fixture = TempDir::new().unwrap();
+        let target = fixture.path().join("target");
+        let selected = fixture.path().join("selected");
+        let destination = fixture.path().join("missing/output");
+        std::fs::write(&target, b"SOURCE DATA").unwrap();
+        std::os::unix::fs::symlink(&target, &selected).unwrap();
+        let identity = |path: &Path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let originals = [identity(&selected), identity(&target)];
+        let bound =
+            sy::rooted_fs::operand::BoundSource::open_local_following(selected.clone(), false)
+                .await
+                .unwrap();
+        let sy::rooted_fs::operand::SourceShape::Leaf { name } = bound.shape.clone() else {
+            panic!("expected selected FILE shape");
+        };
+        let source = sy::endpoint::source_root::SourceRoot::from_rooted(bound.rooted).unwrap();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(server_io);
+        let server = tokio::spawn(sy::remote::serve::serve_transport(
+            reader,
+            writer,
+            Default::default(),
+        ));
+        let (reader, writer) = tokio::io::split(client_io);
+        let client = ClientRemoteSession::connect_operand(
+            reader,
+            writer,
+            Operation::Push,
+            &destination,
+            &sy::remote::operand::RemoteOperand::Destination {
+                source: bound.shape,
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut config = supported_config();
+        config.remove_source_files = true;
+        config.preserve.symlink_mode = SymlinkMode::Follow;
+        let result = execute_bound(
+            source,
+            &destination,
+            client.request_handle(),
+            &config,
+            ScanOptions::default(),
+            sy::engine::domain::SyncScope::SelectedLeaf {
+                source: name,
+                destination: RelativePath::new("output").unwrap(),
+            },
+        )
+        .await;
+        super::super::hardlink_tests::finish_session(client, server).await;
+        assert!(!destination.parent().unwrap().exists());
+        assert_eq!([identity(&selected), identity(&target)], originals);
+        assert_eq!(std::fs::read(&target).unwrap(), b"SOURCE DATA");
+        assert_eq!(std::fs::read_link(&selected).unwrap(), target);
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--remove-source-files does not support followed SOURCE names"));
     }
 
     #[cfg(unix)]

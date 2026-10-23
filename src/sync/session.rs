@@ -72,6 +72,34 @@ pub enum SyncStrategy {
     ObjectStore,
 }
 
+/// PUSH retains classification and operator provenance separately from each
+/// run's child observations. Failed acquisition never retries a new pathname.
+enum PushSource {
+    Unacquired,
+    Captured(sy::rooted_fs::operand::BoundSource),
+    Terminal,
+}
+
+/// Acquisition failure/cancellation is terminal: another call must never
+/// recapture a replacement at the operator spelling.
+enum LocalSource {
+    Unacquired,
+    Captured(sy::endpoint::source_root::SourceRoot),
+    Terminal,
+}
+
+/// Constructed only after the LOCAL engine returned and all owned work joined.
+/// The exact failed owner travels with the outcome; it is not an effect lease.
+pub(super) struct DrainedSourceRace {
+    source: sy::endpoint::source_root::SourceRoot,
+    pub(super) cause: SyncError,
+}
+
+pub(super) enum WatchSyncOutcome {
+    Complete(SyncStats),
+    SourceRace(DrainedSourceRace),
+}
+
 pub struct SyncSession {
     source: EndpointPair,
     dest: EndpointPair,
@@ -79,6 +107,8 @@ pub struct SyncSession {
     scan_options: ScanOptions,
     scope: SyncScope,
     source_contents: bool,
+    local_source: tokio::sync::Mutex<LocalSource>,
+    push_source: tokio::sync::Mutex<PushSource>,
 }
 
 impl SyncSession {
@@ -90,6 +120,8 @@ impl SyncSession {
             scan_options: ScanOptions::default(),
             scope: SyncScope::Tree,
             source_contents: true,
+            local_source: tokio::sync::Mutex::new(LocalSource::Unacquired),
+            push_source: tokio::sync::Mutex::new(PushSource::Unacquired),
         }
     }
 
@@ -108,11 +140,12 @@ impl SyncSession {
         )
         .await?;
         let mut session = Self::new(
-            EndpointPair::Local(Box::new(LocalEndpoint::new(source))),
+            EndpointPair::Local(Box::new(LocalEndpoint::new(source.path().to_path_buf()))),
             EndpointPair::Local(Box::new(LocalEndpoint::new(destination))),
             config,
         );
         session.scope = scope;
+        session.local_source = tokio::sync::Mutex::new(LocalSource::Captured(source));
         Ok(session)
     }
 
@@ -148,28 +181,141 @@ impl SyncSession {
         }
     }
 
+    async fn acquire_local_source(
+        &self,
+        owner: &mut LocalSource,
+        retry: Option<DrainedSourceRace>,
+    ) -> Result<(
+        sy::endpoint::source_root::SourceRoot,
+        sy::endpoint::source_root::SourceRunAttempt,
+    )> {
+        use sy::endpoint::local::map_source_rooted_fs_error;
+        use sy::endpoint::source_root::SourceRoot;
+        let retained_attempt = match (&*owner, &retry) {
+            (LocalSource::Captured(original), Some(race)) if original.same_run(&race.source) => {
+                Some(
+                    original
+                        .retry_attempt()
+                        .map_err(map_source_rooted_fs_error)?,
+                )
+            }
+            (LocalSource::Captured(original), None) => {
+                // A failed race is not usable by ordinary sync. Reject it before
+                // consuming the retained owner needed by the explicit retry.
+                Some(original.attempt().map_err(map_source_rooted_fs_error)?)
+            }
+            (LocalSource::Unacquired, None) => None,
+            _ => {
+                return Err(super::policy::map_io(
+                    sy::rooted_fs::RootedFsError::SourceCatalogueTerminal,
+                ))
+            }
+        };
+        // Set the irreversible state and arm the old owner's nonblocking
+        // cutoff BEFORE any acquisition/replay await. Drop cannot join native
+        // work; it denies reuse and never claims a drained retry outcome.
+        let previous = std::mem::replace(owner, LocalSource::Terminal);
+        let source = match (previous, retry) {
+            (LocalSource::Captured(original), Some(_)) => {
+                original.retry_after_source_change().await
+            }
+            (LocalSource::Captured(original), None) => original.begin_run().await,
+            (LocalSource::Unacquired, None) => {
+                SourceRoot::open(self.source.path().to_path_buf()).await
+            }
+            _ => {
+                return Err(super::policy::map_io(
+                    sy::rooted_fs::RootedFsError::SourceCatalogueTerminal,
+                ))
+            }
+        }
+        .map_err(map_source_rooted_fs_error)?;
+        let attempt = source.attempt().map_err(map_source_rooted_fs_error)?;
+        *owner = LocalSource::Captured(source.clone());
+        if let Some(retained_attempt) = retained_attempt {
+            retained_attempt.finish();
+        }
+        Ok((source, attempt))
+    }
+
+    #[cfg(test)]
+    async fn local_source(&self) -> Result<sy::endpoint::source_root::SourceRoot> {
+        let mut owner = self.local_source.lock().await;
+        let (source, attempt) = self.acquire_local_source(&mut owner, None).await?;
+        attempt.finish();
+        Ok(source)
+    }
+
     async fn direct_local(&self) -> Result<SyncStats> {
-        super::local::run(
-            self.source.path(),
+        match self.local_attempt(None).await? {
+            WatchSyncOutcome::Complete(stats) => Ok(stats),
+            WatchSyncOutcome::SourceRace(race) => Err(race.cause),
+        }
+    }
+
+    pub(super) async fn sync_for_watch(
+        &self,
+        retry: Option<DrainedSourceRace>,
+    ) -> Result<WatchSyncOutcome> {
+        if self.select_strategy() != SyncStrategy::DirectLocal {
+            // Reaping OpenSSH does not prove terminal remote native drain.
+            return self.sync().await.map(WatchSyncOutcome::Complete);
+        }
+        self.local_attempt(retry).await
+    }
+
+    async fn local_attempt(&self, retry: Option<DrainedSourceRace>) -> Result<WatchSyncOutcome> {
+        // Serialize acquisition, execution, drain and successor installation.
+        let mut owner = self.local_source.lock().await;
+        let (source, attempt) = self.acquire_local_source(&mut owner, retry).await?;
+        // Preflight closes both producers; execute_until joins the controller,
+        // native workers and removal owner. Composite errors remain intact.
+        let result = super::local::run_acquired(
+            source.clone(),
             self.dest.path(),
             &self.config,
             self.scan_options,
             self.scope.clone(),
         )
-        .await
+        .await;
+        let outcome = match result {
+            Ok(stats) => Ok(WatchSyncOutcome::Complete(stats)),
+            Err(cause) => {
+                let eligible = super::local::is_drained_source_race(&cause);
+                let retired = source.retire_failed_run(eligible).await;
+                if eligible {
+                    retired.map_err(super::policy::map_io)?;
+                    Ok(WatchSyncOutcome::SourceRace(DrainedSourceRace {
+                        source,
+                        cause,
+                    }))
+                } else {
+                    Err(cause)
+                }
+            }
+        };
+        attempt.finish();
+        outcome
     }
 
     /// Verify local source and destination trees through the same strict,
     /// bounded ordered merge used by synchronization. Regular files are
     /// compared with streaming BLAKE3 only after cheap kind/size checks.
     pub async fn verify(&self) -> Result<VerificationResult> {
-        let source_endpoint = self.source.as_endpoint().ok_or_else(|| {
+        self.source.as_endpoint().ok_or_else(|| {
             SyncError::Config("source must be local for verification".to_string())
         })?;
         let dest_endpoint = self.dest.as_endpoint().ok_or_else(|| {
             SyncError::Config("destination must be local for verification".to_string())
         })?;
 
+        let mut owner = self.local_source.lock().await;
+        let (source_authority, attempt) = self.acquire_local_source(&mut owner, None).await?;
+        source_authority
+            .validate()
+            .await
+            .map_err(sy::endpoint::local::map_source_rooted_fs_error)?;
+        let source_endpoint = source_authority.endpoint();
         let source = source_endpoint.root();
         let dest = dest_endpoint.root();
         let started = Instant::now();
@@ -178,10 +324,7 @@ impl SyncSession {
         let destination_request = super::policy::destination_scan_request(&self.config);
         let (source_stream, dest_stream) = match &self.scope {
             SyncScope::Tree => (
-                crate::endpoint::local_entry_scan::local_entry_stream(
-                    source.to_path_buf(),
-                    source_request,
-                ),
+                source_authority.entries(source_request),
                 crate::endpoint::local_entry_scan::local_entry_stream(
                     dest.to_path_buf(),
                     destination_request,
@@ -191,12 +334,7 @@ impl SyncSession {
                 source: source_path,
                 destination,
             } => (
-                crate::endpoint::local_entry_scan::selected_leaf_stream(
-                    source.to_path_buf(),
-                    source_path.clone(),
-                    source_request,
-                    false,
-                ),
+                source_authority.selected_entries(source_path.clone(), source_request, false),
                 crate::endpoint::local_entry_scan::selected_leaf_stream(
                     dest.to_path_buf(),
                     destination.clone(),
@@ -246,7 +384,7 @@ impl SyncSession {
                     } => {
                         let relative = source_entry.path.as_path();
                         match entries_match(
-                            source_endpoint,
+                            &source_endpoint,
                             dest_endpoint,
                             &source_entry,
                             &dest_entry,
@@ -278,7 +416,47 @@ impl SyncSession {
             (Ok(()), Ok(())) => {}
         }
         result.duration = started.elapsed();
+        attempt.finish();
         Ok(result)
+    }
+
+    async fn push_source(&self) -> Result<sy::rooted_fs::operand::BoundSource> {
+        use sy::endpoint::source_root::SourceRoot;
+        use sy::rooted_fs::operand::BoundSource;
+        let mut owner = self.push_source.lock().await;
+        match &mut *owner {
+            PushSource::Unacquired => {
+                // Cancellation or failure during first acquisition cannot
+                // cause a later run to select a replacement SOURCE.
+                *owner = PushSource::Terminal;
+                let bound = if self.config.preserve.symlink_mode == crate::cli::SymlinkMode::Follow
+                {
+                    BoundSource::open_local_following(
+                        self.source.path().to_path_buf(),
+                        self.source_contents,
+                    )
+                    .await
+                } else {
+                    BoundSource::open_local(self.source.path().to_path_buf(), self.source_contents)
+                        .await
+                }
+                .map_err(super::policy::map_io)?;
+                *owner = PushSource::Captured(bound.clone());
+                Ok(bound)
+            }
+            PushSource::Captured(bound) => {
+                let source = SourceRoot::from_rooted(bound.rooted.clone())
+                    .map_err(super::policy::map_io)?
+                    .begin_run()
+                    .await
+                    .map_err(super::policy::map_io)?;
+                bound.rooted = source.rooted();
+                Ok(bound.clone())
+            }
+            PushSource::Terminal => Err(super::policy::map_io(
+                sy::rooted_fs::RootedFsError::SourceCatalogueTerminal,
+            )),
+        }
     }
 
     async fn streaming_push(&self) -> Result<SyncStats> {
@@ -294,16 +472,26 @@ impl SyncSession {
                 ))
             }
         };
-        super::push::run(
-            self.source.path(),
+        let bound = self.push_source().await?;
+        let source = sy::endpoint::source_root::SourceRoot::from_rooted(bound.rooted.clone())
+            .map_err(super::policy::map_io)?;
+        let attempt = source.attempt().map_err(super::policy::map_io)?;
+        let result = super::push::run_acquired(
+            bound,
             dest_root,
             host,
             user,
             &self.config,
             self.scan_options,
-            self.source_contents,
         )
-        .await
+        .await;
+        if result.is_err() {
+            // No remote terminal-native-drain certificate exists. Even a data
+            // race retires this owner permanently; it cannot enable watch retry.
+            let _ = source.retire_failed_run(false).await;
+        }
+        attempt.finish();
+        result
     }
 
     async fn streaming_pull(&self) -> Result<SyncStats> {
@@ -389,6 +577,324 @@ mod tests {
             EndpointPair::Local(Box::new(LocalEndpoint::new(dest.path().to_path_buf()))),
             config,
         )
+    }
+
+    fn push_session(source: &Path, config: SyncConfig) -> SyncSession {
+        SyncSession::new(
+            EndpointPair::Local(Box::new(LocalEndpoint::new(source.to_path_buf()))),
+            EndpointPair::Ssh {
+                host: "must-not-connect.invalid".into(),
+                user: None,
+                operand: PathBuf::from("/must-not-create"),
+            },
+            config,
+        )
+    }
+
+    fn assert_source_root_changed(error: SyncError, path: &Path) {
+        let SyncError::Io(error) = error else {
+            panic!("expected typed original SOURCE error, got {error:?}")
+        };
+        assert!(
+            matches!(
+                error.get_ref().and_then(|cause| cause.downcast_ref::<sy::rooted_fs::RootedFsError>()),
+                Some(sy::rooted_fs::RootedFsError::RootChanged(changed)) if changed == path
+            ),
+            "wrong SOURCE failure: {error:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_push_rejects_foreign_operator_before_connection() {
+        use futures::TryStreamExt;
+        use sy::endpoint::source_root::SourceRoot;
+        for case in ["root", "ancestor", "link"] {
+            let fixture = TempDir::new().unwrap();
+            let ancestor = fixture.path().join("ancestor");
+            let root = ancestor.join("tree");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("file"), b"original").unwrap();
+            let operand = if case == "link" {
+                let link = fixture.path().join("selected");
+                std::os::unix::fs::symlink("ancestor/tree", &link).unwrap();
+                link.join(".")
+            } else {
+                root.clone()
+            };
+            let mut config = test_config();
+            config.delete = DeleteMode::Enabled {
+                limit: crate::sync::config::DeleteLimit::Unlimited,
+                force: false,
+            };
+            let session = push_session(&operand, config);
+            // Exercise the real session acquisition and first scan without an
+            // SSH peer. Only the connection boundary is deliberately absent.
+            let bound = session.push_source().await.unwrap();
+            let source = SourceRoot::from_rooted(bound.rooted).unwrap();
+            source
+                .entries(Default::default())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            match case {
+                "root" => {
+                    std::fs::rename(&root, fixture.path().join("held")).unwrap();
+                    // An empty replacement must not authorize --delete.
+                    std::fs::create_dir(&root).unwrap();
+                }
+                "ancestor" => {
+                    let held = fixture.path().join("held");
+                    std::fs::rename(&ancestor, &held).unwrap();
+                    std::fs::create_dir(&ancestor).unwrap();
+                    std::fs::rename(held.join("tree"), &root).unwrap();
+                }
+                "link" => {
+                    let link = fixture.path().join("selected");
+                    std::fs::remove_file(&link).unwrap();
+                    std::os::unix::fs::symlink(&root, &link).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            // This assertion also makes the regression probe safe: fresh
+            // acquisition fails here rather than ever reaching OpenSSH.
+            assert_source_root_changed(session.push_source().await.unwrap_err(), source.path());
+            assert_source_root_changed(session.sync().await.unwrap_err(), source.path());
+            if case == "root" {
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+                assert_eq!(
+                    std::fs::read(fixture.path().join("held/file")).unwrap(),
+                    b"original"
+                );
+            } else {
+                assert_eq!(std::fs::read(root.join("file")).unwrap(), b"original");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_push_refreshes_children_through_original_shape_and_root() {
+        use futures::TryStreamExt;
+        use sy::endpoint::source_root::SourceRoot;
+        let fixture = TempDir::new().unwrap();
+        std::fs::write(fixture.path().join("first"), b"original").unwrap();
+        let session = push_session(fixture.path(), test_config()).with_source_contents(false);
+        let first = session.push_source().await.unwrap();
+        assert!(matches!(&first.shape,
+            sy::rooted_fs::operand::SourceShape::Directory { basename: Some(name) }
+            if name.as_path() == Path::new(fixture.path().file_name().unwrap())));
+        let original = SourceRoot::from_rooted(first.rooted).unwrap();
+        original
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        std::fs::write(fixture.path().join("second"), b"fresh child").unwrap();
+        let next = session.push_source().await.unwrap();
+        assert!(matches!(&next.shape,
+            sy::rooted_fs::operand::SourceShape::Directory { basename: Some(name) }
+            if name.as_path() == Path::new(fixture.path().file_name().unwrap())));
+        let next = SourceRoot::from_rooted(next.rooted).unwrap();
+        let entries: Vec<_> = next
+            .entries(Default::default())
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        next.validate().await.unwrap();
+        assert!(original
+            .rooted()
+            .open_regular_blocking(&sy::engine::domain::RelativePath::new("second").unwrap())
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_race_outcome_waits_for_native_work_and_retries_exact_failed_owner() {
+        use sy::rooted_fs::{PublicationPause, PublicationPausePoint};
+        let source = TempDir::new().unwrap();
+        let dest = TempDir::new().unwrap();
+        std::fs::write(source.path().join("file"), b"old").unwrap();
+        let session = std::sync::Arc::new(local_session(&source, &dest, test_config()));
+        let authority = session.local_source().await.unwrap();
+        let (reached, wait) = tokio::sync::oneshot::channel();
+        let (resume, receive) = std::sync::mpsc::channel();
+        authority.rooted().pause_mutation_at(
+            0,
+            PublicationPause {
+                point: PublicationPausePoint::AfterSourceValidation,
+                reached,
+                resume: receive,
+            },
+        );
+        let running = session.clone();
+        let mut attempt = tokio::spawn(async move { running.sync_for_watch(None).await });
+        wait.await.unwrap();
+        std::fs::write(source.path().join("file"), b"new source data").unwrap();
+        assert!(
+            futures::poll!(&mut attempt).is_pending(),
+            "drained outcome cannot precede native completion"
+        );
+        assert!(!dest.path().join("file").exists());
+        resume.send(()).unwrap();
+        let WatchSyncOutcome::SourceRace(race) = attempt.await.unwrap().unwrap() else {
+            panic!("expected classified joined race")
+        };
+        assert!(authority.same_run(&race.source));
+        assert!(
+            session.sync().await.is_err(),
+            "ordinary sync remains fail-fast"
+        );
+        std::fs::write(source.path().join("arrival"), b"new child").unwrap();
+        assert!(matches!(
+            session.sync_for_watch(Some(race)).await.unwrap(),
+            WatchSyncOutcome::Complete(_)
+        ));
+        assert_eq!(
+            std::fs::read(dest.path().join("file")).unwrap(),
+            b"new source data"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("arrival")).unwrap(),
+            b"new child"
+        );
+        assert!(authority.validate().await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_refresh_preserves_source_role_for_original_ancestor_change() {
+        let fixture = TempDir::new().unwrap();
+        let ancestor = fixture.path().join("ancestor");
+        let parent = ancestor.join("parent");
+        let source = parent.join("source");
+        let dest = TempDir::new().unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("file"), b"original").unwrap();
+        let session = SyncSession::for_local_paths(&source, dest.path(), true, test_config())
+            .await
+            .unwrap();
+        session.sync().await.unwrap();
+        std::fs::write(source.join("arrival"), b"fresh child").unwrap();
+        session.sync().await.unwrap();
+        assert_eq!(
+            std::fs::read(dest.path().join("arrival")).unwrap(),
+            b"fresh child"
+        );
+        let held = fixture.path().join("held");
+        std::fs::rename(&ancestor, &held).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        // ROOT and immediate parent stay genuine; only the higher original
+        // operator ancestor changes. Verification must not label it DEST.
+        std::fs::rename(held.join("parent"), &parent).unwrap();
+        assert_source_root_changed(session.verify().await.unwrap_err(), &source);
+        assert_eq!(std::fs::read(source.join("file")).unwrap(), b"original");
+        assert_eq!(
+            std::fs::read(dest.path().join("file")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_local_acquisition_never_recaptures_or_revives_source() {
+        use sy::endpoint::source_root::SourceRoot;
+        use sy::rooted_fs::{PublicationPause, PublicationPausePoint, RootedFsError};
+        // Occupy the only blocking worker: acquisition/replay is genuinely
+        // queued at its native boundary, without adding production test hooks.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for case in ["initial-sync", "initial-verify", "completed", "source-race"] {
+                let source = TempDir::new().unwrap();
+                let dest = TempDir::new().unwrap();
+                std::fs::write(source.path().join("file"), b"original").unwrap();
+                let session = local_session(&source, &dest, test_config());
+                let mut retry = None;
+                let original: Option<SourceRoot> = match case {
+                    "completed" => {
+                        session.sync().await.unwrap();
+                        let owner = session.local_source.lock().await;
+                        let LocalSource::Captured(original) = &*owner else { panic!("missing owner") };
+                        Some(original.clone())
+                    }
+                    "source-race" => {
+                        let original = session.local_source().await.unwrap();
+                        let (reached, wait) = tokio::sync::oneshot::channel();
+                        let (resume, receive) = std::sync::mpsc::channel();
+                        original.rooted().pause_mutation_at(0, PublicationPause {
+                            point: PublicationPausePoint::AfterSourceValidation,
+                            reached,
+                            resume: receive,
+                        });
+                        let change = async {
+                            wait.await.unwrap();
+                            std::fs::write(source.path().join("file"), b"new DATA").unwrap();
+                            resume.send(()).unwrap();
+                        };
+                        let (outcome, ()) = tokio::join!(session.sync_for_watch(None), change);
+                        let WatchSyncOutcome::SourceRace(race) = outcome.unwrap() else {
+                            panic!("expected drained SOURCE race")
+                        };
+                        assert!(original.same_run(&race.source));
+                        retry = Some(race);
+                        Some(original)
+                    }
+                    _ => None,
+                };
+                let (reached, wait) = tokio::sync::oneshot::channel();
+                let (resume, receive) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    reached.send(()).unwrap();
+                    receive.recv().unwrap();
+                });
+                wait.await.unwrap();
+                let mut attempt: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> =
+                    match case {
+                        "initial-verify" => Box::pin(async { session.verify().await.map(|_| ()) }),
+                        "source-race" => Box::pin(async { session.sync_for_watch(retry).await.map(|_| ()) }),
+                        _ => Box::pin(async { session.sync().await.map(|_| ()) }),
+                    };
+                assert!(futures::poll!(&mut attempt).is_pending());
+                drop(attempt);
+                // Prove cutoff while the ORIGINAL spelling is still intact,
+                // before queued replay can detect our later root replacement.
+                if let Some(original) = &original {
+                    if case == "source-race" {
+                        assert!(matches!(original.retry_attempt(),
+                            Err(RootedFsError::SourceCatalogueTerminal)), "failed proof retained retry authority");
+                    } else {
+                        assert!(matches!(original.validate_blocking(),
+                            Err(RootedFsError::SourceCatalogueTerminal)), "completed owner remained usable");
+                    }
+                }
+                let held = source.path().with_extension("held");
+                std::fs::rename(source.path(), &held).unwrap();
+                std::fs::create_dir(source.path()).unwrap();
+                std::fs::write(source.path().join("file"), b"replacement").unwrap();
+                resume.send(()).unwrap();
+                blocker.await.unwrap();
+                for error in [session.sync().await.unwrap_err(), session.verify().await.unwrap_err()] {
+                    assert!(matches!(error, SyncError::Io(ref error)
+                        if matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<RootedFsError>()),
+                            Some(RootedFsError::SourceCatalogueTerminal))), "{case}: {error:?}");
+                }
+                if let Some(original) = original {
+                    assert!(original.validate().await.is_err(), "{case}: old owner revived");
+                    assert!(original.begin_run().await.is_err());
+                    assert!(original.retry_after_source_change().await.is_err());
+                }
+                assert_eq!(std::fs::read(held.join("file")).unwrap(),
+                    if case == "source-race" { b"new DATA".as_slice() } else { b"original".as_slice() });
+                assert_eq!(std::fs::read(source.path().join("file")).unwrap(), b"replacement");
+                assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), usize::from(case == "completed"));
+                std::fs::remove_dir_all(held).unwrap();
+            }
+        });
     }
 
     #[tokio::test]

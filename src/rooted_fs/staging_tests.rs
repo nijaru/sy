@@ -267,6 +267,19 @@ fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
         .join("contents");
     std::os::unix::fs::symlink("owned", &contents).unwrap();
     let held = open_symlink_at(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name).unwrap();
+    let mut created_namespace = rooted
+        .begin_namespace_blocking(
+            Path::new("created"),
+            ExpectedDestination::Absent,
+            StagingOrigin::Created,
+        )
+        .unwrap();
+    let created_private = root.path().join(&created_namespace.staging_dir_name);
+    let created_file = create_staging_file_at(
+        created_namespace.staging_dir_fd.as_raw_fd(),
+        &created_namespace.temp_name,
+    )
+    .unwrap();
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -293,8 +306,15 @@ fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
     assert!(
         matches!(namespace.register_staging(&held), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
     );
+    assert!(
+        matches!(created_namespace.register_created_staging(created_file), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
+    );
     drop(occupied);
     drop(held);
+    // Genuine creation moves its original FD into the owner before duplication;
+    // the same exhaustion must now leave enough authority for safe cleanup.
+    created_namespace.abort().unwrap();
+    assert!(!created_private.exists());
     // Even if the cached inode numbers still match, no retained descriptor
     // pins their identity. Refuse cleanup rather than assume no inode reuse.
     assert!(matches!(

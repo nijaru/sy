@@ -229,6 +229,7 @@ impl LocalSyncExecutor {
                 let digest = existing::hash_observed_bytes(&mut input, size, &source.path)?;
                 input.seek(SeekFrom::Start(0))?;
                 let copied = copy(&mut input, staged.file_mut(), rate_limiter.as_ref())?;
+                drop(input);
                 if staged.file_mut().metadata()?.len() != size {
                     return Err(RootedFsError::CopySourceChanged(
                         source.path.as_path().to_path_buf(),
@@ -550,8 +551,13 @@ pub(super) fn validate_source(
             .path_identity_blocking(&source.path)?
             .and_then(|(kind, identity)| (kind == EntryKind::File).then_some(identity))
     };
-    if source.identity.is_none() || named != source.identity {
-        return Err(RootedFsError::CopySourceChanged(
+    if source.identity.is_none() {
+        return Err(RootedFsError::SourceUnobserved(
+            source.path.as_path().to_path_buf(),
+        ));
+    }
+    if named != source.identity {
+        return Err(RootedFsError::SourceBindingChanged(
             source.path.as_path().to_path_buf(),
         ));
     }
@@ -559,7 +565,7 @@ pub(super) fn validate_source(
         if crate::endpoint::local_identity::metadata_identity(&file.metadata()?, EntryKind::File)
             != source.identity
         {
-            return Err(RootedFsError::CopySourceChanged(
+            return Err(RootedFsError::SourceBindingChanged(
                 source.path.as_path().to_path_buf(),
             ));
         }
@@ -598,7 +604,9 @@ async fn source_preservation_lease_rejects_wrong_fd_even_after_name_restoration(
                 acl: false
             }
         ),
-        Err(LocalSyncError::Rooted(RootedFsError::CopySourceChanged(_)))
+        Err(LocalSyncError::Rooted(RootedFsError::SourceBindingChanged(
+            _
+        )))
     ));
     assert!(
         authority

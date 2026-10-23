@@ -175,40 +175,38 @@ pub(crate) struct CompletedGroups {
 }
 
 struct CompletionDisk {
-    index: super::disk_radix::DiskRadix,
-    records: std::fs::File,
-    end: u64,
+    index: crate::authenticated_index::AuthenticatedIndex<72>,
     healthy: bool,
+}
+
+impl CompletionDisk {
+    fn apply<T>(
+        &mut self,
+        work: impl FnOnce(
+            &mut crate::authenticated_index::AuthenticatedIndex<72>,
+        ) -> Result<T, GroupError>,
+    ) -> Result<T, GroupError> {
+        if !self.healthy {
+            return Err(GroupError::Invalid("completion index is incomplete"));
+        }
+        self.healthy = false;
+        let result = work(&mut self.index)?;
+        self.healthy = true;
+        Ok(result)
+    }
 }
 
 impl CompletedGroups {
     async fn with_disk<T: Send + 'static>(
         &self,
-        work: impl FnOnce(&mut CompletionDisk) -> Result<T, GroupError> + Send + 'static,
+        work: impl FnOnce(&mut Option<CompletionDisk>) -> Result<T, GroupError> + Send + 'static,
     ) -> Result<T, GroupError> {
         let disk = std::sync::Arc::clone(&self.disk);
         tokio::task::spawn_blocking(move || {
             let mut guard = disk
                 .lock()
                 .map_err(|_| GroupError::Invalid("completion lock poisoned"))?;
-            if guard.is_none() {
-                *guard = Some(CompletionDisk {
-                    index: super::disk_radix::DiskRadix::new()?,
-                    records: tempfile::tempfile()?,
-                    end: 0,
-                    healthy: true,
-                });
-            }
-            let disk = guard
-                .as_mut()
-                .ok_or(GroupError::Invalid("missing completion index"))?;
-            if !disk.healthy || disk.records.metadata()?.len() != disk.end {
-                return Err(GroupError::Invalid("completion index is incomplete"));
-            }
-            disk.healthy = false;
-            let result = work(disk)?;
-            disk.healthy = true;
-            Ok(result)
+            work(&mut guard)
         })
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))?
@@ -219,27 +217,21 @@ impl CompletedGroups {
         group: [u8; 32],
         first: PlanRecordPosition,
     ) -> Result<bool, GroupError> {
-        self.with_disk(move |disk| {
-            use std::io::{Read, Seek, SeekFrom};
-            let Some(offset) = disk.index.get(group)? else {
+        self.with_disk(move |slot| {
+            let Some(disk) = slot else {
                 return Ok(false);
             };
-            if offset.checked_add(136).is_none_or(|end| end > disk.end) {
-                return Err(GroupError::Invalid("completion outside recorded extent"));
-            }
-            disk.records.seek(SeekFrom::Start(offset))?;
-            let mut record = [0; 136];
-            disk.records.read_exact(&mut record)?;
-            if record[..32] != group
-                || record[32..40] != first.ordinal.to_le_bytes()
-                || record[40..72] != first.digest
-                || record[104..] != *blake3::hash(&record[..104]).as_bytes()
-            {
-                return Err(GroupError::Invalid(
-                    "completion does not match original first member",
-                ));
-            }
-            Ok(true)
+            disk.apply(|index| {
+                let Some(record) = index.get_bytes(group)? else {
+                    return Ok(false);
+                };
+                if record[..8] != first.ordinal.to_le_bytes() || record[8..40] != first.digest {
+                    return Err(GroupError::Invalid(
+                        "completion does not match original first member",
+                    ));
+                }
+                Ok(true)
+            })
         })
         .await
     }
@@ -250,26 +242,25 @@ impl CompletedGroups {
         first: PlanRecordPosition,
         seal: [u8; 32],
     ) -> Result<(), GroupError> {
-        self.with_disk(move |disk| {
-            use std::io::{Seek, SeekFrom, Write};
-            if disk.index.get(group)?.is_some() {
-                return Err(GroupError::Invalid("group completed twice"));
+        self.with_disk(move |slot| {
+            if slot.is_none() {
+                *slot = Some(CompletionDisk {
+                    index: crate::authenticated_index::AuthenticatedIndex::new()?,
+                    healthy: true,
+                });
             }
-            let mut record = [0; 136];
-            record[..32].copy_from_slice(&group);
-            record[32..40].copy_from_slice(&first.ordinal.to_le_bytes());
-            record[40..72].copy_from_slice(&first.digest);
-            record[72..104].copy_from_slice(&seal);
-            let digest = *blake3::hash(&record[..104]).as_bytes();
-            record[104..].copy_from_slice(&digest);
-            disk.records.seek(SeekFrom::Start(disk.end))?;
-            disk.records.write_all(&record)?;
-            disk.index.insert(group, disk.end)?;
-            disk.end = disk
-                .end
-                .checked_add(136)
-                .ok_or(GroupError::Invalid("completion extent overflow"))?;
-            Ok(())
+            slot.as_mut()
+                .ok_or(GroupError::Invalid("missing completion index"))?
+                .apply(|index| {
+                    if index.get_bytes(group)?.is_some() {
+                        return Err(GroupError::Invalid("group completed twice"));
+                    }
+                    let mut record = [0; 72];
+                    record[..8].copy_from_slice(&first.ordinal.to_le_bytes());
+                    record[8..40].copy_from_slice(&first.digest);
+                    record[40..].copy_from_slice(&seal);
+                    Ok(index.set_bytes(group, record)?)
+                })
         })
         .await
     }

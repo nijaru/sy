@@ -30,6 +30,21 @@ impl BackupRoot {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) async fn validate_local_source_effect(
+        &self,
+        effects: &local_source_effects::LocalSourceEffects,
+        path: RelativePath,
+    ) -> Result<()> {
+        effects
+            .validate_effect(
+                &self.original()?,
+                path,
+                local_source_effects::SourceEffectKind::LeafPublication,
+            )
+            .await
+    }
+
     fn original(&self) -> Result<DestinationRoot> {
         let state = self
             .state

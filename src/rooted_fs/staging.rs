@@ -9,7 +9,7 @@ pub(super) struct VerifiedObservation {
 
 #[cfg(unix)]
 pub(super) struct OwnedStagingEntry {
-    pub(super) file: File,
+    pub(super) file: Arc<File>,
     pub(super) created: libc::stat,
 }
 
@@ -45,6 +45,30 @@ pub(super) fn same_observation(before: &libc::stat, after: &libc::stat) -> bool 
         && before.st_ctime_nsec == after.st_ctime_nsec
 }
 
+impl RootedStagedFile {
+    #[cfg(unix)]
+    pub(super) fn validate_private_source_effect_blocking(&self) -> Result<()> {
+        if self.namespace.rooted.local_source_effects.is_none() {
+            return Ok(());
+        }
+        self.observe_original_file()?;
+        self.namespace
+            .rooted
+            .require_source_effect_blocking(SourceEffect {
+                kind: SourceEffectKind::PrivateFileMetadata,
+                parent: self.namespace.staging_dir_fd.as_raw_fd(),
+                name: &self.namespace.temp_name,
+                object: Some(self.file.as_raw_fd()),
+                path: &self.namespace.destination_path,
+            })?;
+        // Census can outlive the original private-DIR binding while FILE stat
+        // remains unchanged. A setter needs the same late namespace proof.
+        self.namespace.verify_group_links_blocking()?;
+        self.namespace.verify_private_cleanup_directory_blocking()?;
+        self.observe_original_file().map(|_| ())
+    }
+}
+
 impl RootedNamespaceTransaction {
     #[cfg(unix)]
     fn staging_changed(&self) -> RootedFsError {
@@ -60,12 +84,31 @@ impl RootedNamespaceTransaction {
         // that inode against reuse, including descriptor-exhaustion failures.
         let retained = file.try_clone()?;
         self.staged = Some(OwnedStagingEntry {
-            file: retained,
+            file: Arc::new(retained),
             created,
         });
         self.cleanup_owned = Some(created);
         self.observe_staging()?;
         Ok(())
+    }
+
+    /// Move the genuine creation FD into the owner before duplication. A failed
+    /// writer-FD clone must not discard the only pin needed for abort cleanup.
+    #[cfg(unix)]
+    pub(super) fn register_created_staging(&mut self, file: File) -> Result<File> {
+        let created = stat_fd(file.as_raw_fd())?;
+        self.staged = Some(OwnedStagingEntry {
+            file: Arc::new(file),
+            created,
+        });
+        self.cleanup_owned = Some(created);
+        self.observe_staging()?;
+        Ok(self
+            .staged
+            .as_ref()
+            .ok_or_else(|| self.staging_changed())?
+            .file
+            .try_clone()?)
     }
 
     #[cfg(unix)]
@@ -113,7 +156,69 @@ impl RootedNamespaceTransaction {
     }
 
     #[cfg(unix)]
-    pub(super) fn remove_owned_contents(&self) -> Result<bool> {
+    pub(super) fn verify_private_cleanup_parent_blocking(&self) -> Result<()> {
+        let qualified = matches!(
+            self.private_creation,
+            local_source_effects::PrivateCreationAdmission::Qualified(_)
+        );
+        if !qualified {
+            // Without a SOURCE scope, retained private ownership survives parent
+            // relocation. The private directory's own named binding is still
+            // checked before touching its contents.
+            return Ok(());
+        }
+        self.rooted.verify_root_path_blocking()?;
+        // SOURCE health is irrelevant, but every original DST ancestor still
+        // matters: a foreign SOURCE directory could now enclose the same parent.
+        let mut current = self.rooted.root_fd.try_clone()?;
+        let mut prefix = PathBuf::new();
+        self.rooted
+            .verify_namespace_directory(&prefix, current.as_raw_fd())?;
+        for component in self
+            .destination_path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .components()
+        {
+            let Component::Normal(name) = component else {
+                return Err(RootedFsError::InvalidRelativePath);
+            };
+            current = open_dir_at(current.as_raw_fd(), name)?;
+            prefix.push(name);
+            self.rooted
+                .verify_namespace_directory(&prefix, current.as_raw_fd())?;
+        }
+        if !same_inode(
+            &stat_fd(current.as_raw_fd())?,
+            &stat_fd(self.parent_fd.as_raw_fd())?,
+        ) {
+            return Err(RootedFsError::DestinationChanged(
+                self.destination_path.clone(),
+            ));
+        }
+        self.private_creation
+            .verify_parent_blocking(self.parent_fd.as_raw_fd(), &self.destination_path)
+    }
+
+    /// A held creator directory alone is insufficient: it may have been moved
+    /// into SOURCE. Check its original DST parent/name before touching children.
+    #[cfg(unix)]
+    pub(super) fn verify_private_cleanup_directory_blocking(&self) -> Result<()> {
+        self.verify_private_cleanup_parent_blocking()?;
+        let held = stat_fd(self.staging_dir_fd.as_raw_fd())?;
+        let named = stat_at_optional(self.parent_fd.as_raw_fd(), &self.staging_dir_name)?;
+        if named.as_ref().is_some_and(|named| same_inode(&held, named))
+            || (named.is_none() && held.st_nlink == 0)
+        {
+            Ok(())
+        } else {
+            Err(RootedFsError::StagingDirectoryChanged)
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remove_owned_contents(&mut self) -> Result<bool> {
+        self.verify_private_cleanup_directory_blocking()?;
         let Some(named) = stat_at_optional(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?
         else {
             return Ok(false);
@@ -125,15 +230,41 @@ impl RootedNamespaceTransaction {
         {
             return Err(self.staging_changed());
         }
-        if self.strict_cleanup {
-            let owned = self.staged.as_ref().ok_or_else(|| self.staging_changed())?;
-            if same_inode(&owned.created, &named) {
-                // A group inode can already be visible. Only its sealed full
-                // observation permits an owned unlink; never clean foreign
-                // edits merely because the inode number still matches.
+        let owned = self.staged.as_ref().ok_or_else(|| self.staging_changed())?;
+        if same_inode(&owned.created, &named) {
+            if self.strict_cleanup || self.committed {
+                // Groups and completed publications may share a visible inode.
+                // Their full seal includes each proven own link transition.
                 self.sealed.ok_or_else(|| self.staging_changed())?;
                 self.observe_staging()?;
             }
+            let held = stat_fd(owned.file.as_raw_fd())?;
+            if !same_inode(&owned.created, &held)
+                || !same_observation(&held, &named)
+                || (!self.strict_cleanup
+                    && !self.committed
+                    && held.st_nlink != owned.created.st_nlink)
+            {
+                // An unexpected outside alias can be in SOURCE; unlink would
+                // change its nlink/ctime. Groups instead use their full seal
+                // and the exact owned -1 transition in abort_blocking.
+                return Err(self.staging_changed());
+            }
+        } else {
+            // Exchange may park OLD here. Creation admission does not authorize
+            // its retirement, even when the private container is genuinely ours.
+            self.rooted.require_source_effect_blocking(SourceEffect {
+                kind: SourceEffectKind::NamespaceRetirement,
+                parent: self.staging_dir_fd.as_raw_fd(),
+                name: &self.temp_name,
+                object: None,
+                path: &self.destination_path,
+            })?;
+        }
+        self.verify_group_links_blocking()?;
+        if self.group_links.is_some() {
+            self.verify_private_cleanup_directory_blocking()?;
+            self.observe_staging()?;
         }
         // Mutable private directory children do not invalidate inode ownership.
         // Never recursively delete them: rmdir retains a nonempty artifact.
@@ -142,6 +273,14 @@ impl RootedNamespaceTransaction {
             &self.temp_name,
             named.st_mode & libc::S_IFMT == libc::S_IFDIR,
         )?;
+        if let Some(link) = self.group_private_link.take() {
+            if let (group_links::PrivateLink::Anchor, Some(links)) = (link, &self.group_links) {
+                links
+                    .lock()
+                    .map_err(|_| RootedFsError::IncompleteStagedGroup)?
+                    .retire_anchor();
+            }
+        }
         Ok(true)
     }
 }

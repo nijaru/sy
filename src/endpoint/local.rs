@@ -171,7 +171,9 @@ impl LocalEndpoint {
         self.rooted.get().map(std::convert::AsRef::as_ref)
     }
 
-    async fn destination_authority(&self) -> Result<&sy::rooted_fs::operand::DestinationRoot> {
+    pub(crate) async fn destination_authority(
+        &self,
+    ) -> Result<&sy::rooted_fs::operand::DestinationRoot> {
         // Cache initial absence through its held ancestor too. A later Create
         // must acquire that original pending authority, never classify a fresh
         // replacement of an ancestor after preflight.
@@ -214,6 +216,19 @@ impl LocalEndpoint {
             self.with_destination_authority(bound),
             std::sync::Arc::new(authority),
         ))
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn with_local_source_effects(
+        self,
+        effects: sy::rooted_fs::local_source_effects::LocalSourceEffects,
+    ) -> Result<Self> {
+        let bound = self
+            .destination_authority()
+            .await?
+            .clone()
+            .with_local_source_effects(effects);
+        Ok(self.with_destination_authority(bound))
     }
 
     pub(crate) async fn rooted_fs(
@@ -343,6 +358,18 @@ pub(crate) fn map_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncEr
     }
 }
 
+/// SOURCE root continuity is fatal and keeps its typed original-binding cause;
+/// only CHILD binding/data changes are recoverable source races.
+pub(crate) fn map_source_rooted_fs_error(error: sy::rooted_fs::RootedFsError) -> SyncError {
+    match error {
+        sy::rooted_fs::RootedFsError::Io(error) => SyncError::Io(error),
+        sy::rooted_fs::RootedFsError::SourceBindingChanged(path) => {
+            SyncError::SourceChanged { path }
+        }
+        error => SyncError::Io(std::io::Error::other(error)),
+    }
+}
+
 pub(crate) fn verify_committed_root(
     rooted: &sy::rooted_fs::RootedFs,
     destination: &Path,
@@ -360,10 +387,8 @@ fn map_rooted_read_error(
     rooted: &sy::rooted_fs::RootedFs,
     error: sy::rooted_fs::RootedFsError,
 ) -> SyncError {
-    if rooted.is_local_source_authority()
-        && matches!(error, sy::rooted_fs::RootedFsError::RootChanged(_))
-    {
-        SyncError::Io(std::io::Error::other(error))
+    if rooted.is_local_source_authority() {
+        map_source_rooted_fs_error(error)
     } else {
         map_rooted_fs_error(error)
     }
@@ -592,6 +617,18 @@ impl LocalStagedWriter {
         result.map_err(map_rooted_fs_error)
     }
 
+    async fn drain_async_writer(&mut self) -> Result<()> {
+        if let Some(file) = self.file.take() {
+            // write_all can return while Tokio's native write is still running.
+            // Join it before ownership checks or cleanup inspect the inode.
+            let duplicate = file.into_std().await;
+            tokio::task::spawn_blocking(move || drop(duplicate))
+                .await
+                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
+        }
+        Ok(())
+    }
+
     /// Transfer the ORIGINAL creator and protected anchor to the native group
     /// owner. The async duplicate is drained and dropped, never reopened from a
     /// visible member; conversion itself does not authorize publication.
@@ -605,12 +642,7 @@ impl LocalStagedWriter {
                 }),
             };
         }
-        if let Some(file) = self.file.take() {
-            let duplicate = file.into_std().await;
-            tokio::task::spawn_blocking(move || drop(duplicate))
-                .await
-                .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
-        }
+        self.drain_async_writer().await?;
         let staged = self
             .staged
             .take()
@@ -1150,7 +1182,7 @@ impl StagedWriter for LocalStagedWriter {
     }
 
     async fn abort(mut self: Box<Self>) -> Result<()> {
-        self.file.take();
+        self.drain_async_writer().await?;
         let staged = self.staged.take().ok_or_else(|| {
             SyncError::Io(std::io::Error::other(
                 "staged writer lost its transaction before explicit abort",
@@ -1217,26 +1249,13 @@ impl Endpoint for LocalEndpoint {
     }
 
     async fn metadata_following(&self, path: &Path) -> Result<FileMetadata> {
-        // Following is an explicit local --copy-links contract. Retain the
-        // original root around the external target observation as well.
+        // Following requires original SOURCE provenance, not a lexical path.
         let rooted = self.rooted_fs(false).await?;
         let relative = self.relative_path(path)?;
-        let path = self.resolve(path);
         tokio::task::spawn_blocking(move || {
             rooted
-                .validate_source_observation_blocking(&relative)
-                .map_err(|error| map_rooted_read_error(&rooted, error))?;
-            rooted
-                .verify_root_path_blocking()
-                .map_err(|error| map_rooted_read_error(&rooted, error))?;
-            let metadata = fs::metadata(path)?;
-            rooted
-                .validate_source_observation_blocking(&relative)
-                .map_err(|error| map_rooted_read_error(&rooted, error))?;
-            rooted
-                .verify_root_path_blocking()
-                .map_err(|error| map_rooted_read_error(&rooted, error))?;
-            Ok(file_metadata_from_fs(&metadata))
+                .source_metadata_following_blocking(&relative)
+                .map_err(|error| map_rooted_read_error(&rooted, error))
         })
         .await
         .map_err(|error| SyncError::Io(std::io::Error::other(error)))?
@@ -1456,43 +1475,12 @@ impl Endpoint for LocalEndpoint {
         {
             let relative = sy::engine::domain::RelativePath::new(path.to_path_buf())
                 .map_err(|error| SyncError::Config(error.to_string()))?;
-            let full_path = self.resolve(relative.as_path());
             let rooted = self.rooted_fs(false).await?;
             return tokio::task::spawn_blocking(move || {
                 rooted
-                    .verify_root_path_blocking()
-                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
-                rooted
-                    .validate_source_observation_blocking(&relative)
-                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
-                // --copy-links explicitly follows the leaf (and intermediate)
-                // symlinks. O_NONBLOCK prevents a raced FIFO replacement from
-                // pinning this worker before descriptor-type validation.
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true);
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NONBLOCK);
-                let file = options.open(&full_path)?;
-                if !file.metadata()?.is_file() {
-                    return Err(SyncError::Config(
-                        "followed native transfer source is not a regular file".to_string(),
-                    ));
-                }
-                use std::os::fd::AsRawFd;
-                rooted
-                    .validate_source_reader_blocking(&relative, &file)
-                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
-                let fd = file.as_raw_fd();
-                // SAFETY: `fd` is a live open descriptor.
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if flags >= 0 {
-                    // SAFETY: `fd` is live; clear O_NONBLOCK so subsequent reads use normal blocking I/O.
-                    unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-                }
-                rooted
-                    .verify_root_path_blocking()
-                    .map_err(|error| map_rooted_read_error(&rooted, error))?;
-                Ok(Some(file))
+                    .open_source_following_blocking(&relative)
+                    .map(Some)
+                    .map_err(|error| map_rooted_read_error(&rooted, error))
             })
             .await
             .map_err(|error| SyncError::Io(std::io::Error::other(error.to_string())))?;
@@ -1679,6 +1667,80 @@ impl Endpoint for LocalEndpoint {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staging_source_exclusion_keeps_original_root_error_role() {
+        use futures::TryStreamExt;
+        use sy::endpoint::source_root::SourceRoot;
+        use sy::rooted_fs::{local_source_effects::LocalSourceEffects, RootedFsError};
+        let fixture = TempDir::new().unwrap();
+        let ancestor = fixture.path().join("ancestor");
+        let parent = ancestor.join("parent");
+        let source_path = parent.join("source");
+        std::fs::create_dir_all(&source_path).unwrap();
+        std::fs::write(source_path.join("file"), b"original").unwrap();
+        let source = SourceRoot::open(source_path.clone()).await.unwrap();
+        source
+            .entries(Default::default())
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let effects = LocalSourceEffects::seal(&source).await.unwrap();
+        let dest = TempDir::new().unwrap();
+        let (endpoint, namespace) = LocalEndpoint::new(dest.path().to_path_buf())
+            .with_namespace_qualification()
+            .await
+            .unwrap();
+        namespace.seal().await.unwrap();
+        let endpoint = endpoint.with_local_source_effects(effects).await.unwrap();
+        let mut writer = endpoint
+            .begin_write(Path::new("file"), ExpectedDestination::Absent)
+            .await
+            .unwrap();
+        writer.write(b"private").await.unwrap();
+        let held = fixture.path().join("held");
+        std::fs::rename(&ancestor, &held).unwrap();
+        std::fs::create_dir(&ancestor).unwrap();
+        std::fs::rename(held.join("parent"), &parent).unwrap();
+        writer.prepare_publication().await.unwrap();
+        let error = match writer.commit().await {
+            Err(error) => error,
+            Ok(_) => panic!("SOURCE ancestor replacement permitted publication"),
+        };
+        assert!(
+            matches!(error, SyncError::Io(ref error)
+            if matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<RootedFsError>()),
+                Some(RootedFsError::RootChanged(path)) if path == &source_path)),
+            "{error:?}"
+        );
+        assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(source_path.join("file")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn source_error_mapping_preserves_native_io_kind_and_destination_role() {
+        use sy::rooted_fs::RootedFsError;
+        let error = map_source_rooted_fs_error(RootedFsError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SOURCE read denied",
+        )));
+        assert!(matches!(error, SyncError::Io(error)
+            if error.kind() == std::io::ErrorKind::PermissionDenied));
+        let path = PathBuf::from("root");
+        assert!(
+            matches!(map_source_rooted_fs_error(RootedFsError::RootChanged(path.clone())),
+            SyncError::Io(error) if matches!(error.get_ref().and_then(|cause| cause.downcast_ref::<RootedFsError>()),
+                Some(RootedFsError::RootChanged(changed)) if changed == &path))
+        );
+        assert!(
+            matches!(map_rooted_fs_error(RootedFsError::RootChanged(path.clone())),
+            SyncError::DestinationChanged { path: changed } if changed == path)
+        );
+    }
 
     #[tokio::test]
     async fn absent_staged_timestamp_does_not_replace_native_observation() {
@@ -2771,7 +2833,15 @@ mod tests {
         .await
         .expect("opening a FIFO must not block")
         .unwrap_err();
-        assert!(matches!(result, SyncError::Config(_)));
+        let SyncError::Io(error) = result else {
+            panic!("lost typed unqualified SOURCE cause")
+        };
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<crate::rooted_fs::RootedFsError>()),
+            Some(crate::rooted_fs::RootedFsError::SourceFollowUnsupported(_))
+        ));
     }
 
     #[cfg(unix)]

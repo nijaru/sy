@@ -8,7 +8,7 @@ use crate::protocol::{
     WireGroupRole,
 };
 use crate::remote::group::destination_client::DestinationGroup;
-use crate::remote::source_file::{GroupSource, SourceMetadataRequest};
+use crate::remote::source_file::{SourceFileAccess, SourceMetadataRequest};
 use crate::rooted_fs::PublishedFileProof;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
@@ -68,7 +68,7 @@ impl RemotePushExecutor {
             };
             move || {
                 root.validate_blocking()?;
-                let file = GroupSource::capture_blocking(
+                let file = SourceFileAccess::capture_blocking(
                     root.rooted(),
                     source.path,
                     identity,
@@ -97,7 +97,7 @@ impl RemotePushExecutor {
 
     async fn validate_group_member(
         &self,
-        original: Arc<GroupSource>,
+        original: Arc<SourceFileAccess>,
         source: &Entry,
     ) -> Result<()> {
         let source = source.clone();
@@ -121,7 +121,7 @@ impl RemotePushExecutor {
     async fn validate_group(
         &self,
         group: &HardlinkGroupPlan<'_>,
-        original: &Arc<GroupSource>,
+        original: &Arc<SourceFileAccess>,
     ) -> Result<()> {
         let mut members = group.members().await.map_err(failure)?;
         while let Some(member) = members.next().await.map_err(failure)? {
@@ -136,7 +136,7 @@ impl RemotePushExecutor {
         group: &mut HardlinkGroupPlan<'_>,
         intent: GroupIntent,
         first: SyncOp,
-        original: Arc<GroupSource>,
+        original: Arc<SourceFileAccess>,
     ) -> Result<()> {
         let mut members = group.members().await.map_err(failure)?;
         while let Some(member) = members.next().await.map_err(failure)? {

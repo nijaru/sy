@@ -37,6 +37,14 @@ pub struct PendingRoot {
 }
 
 impl PendingRoot {
+    #[cfg(unix)]
+    pub(super) fn bind_local_source_effects(
+        &mut self,
+        effects: local_source_effects::LocalSourceEffects,
+    ) {
+        self.ancestor.local_source_effects = Some(effects);
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -55,6 +63,7 @@ impl DestinationRoot {
         };
         rooted.mutation_admission = main.mutation_admission.clone();
         rooted.run_admission = main.run_admission.clone();
+        rooted.local_source_effects = main.local_source_effects.clone();
         rooted.retirement = Arc::clone(&main.retirement);
         #[cfg(test)]
         {
@@ -149,22 +158,36 @@ impl DestinationRoot {
 }
 
 impl BoundSource {
+    /// Local SOURCE binds the native operator transcript during this first
+    /// acquisition. Remote `open` below intentionally retains held-root lifetime.
+    pub async fn open_local(path: PathBuf, contents: bool) -> Result<Self> {
+        Self::acquire_local(path, contents, false).await
+    }
+
+    pub async fn open_local_following(path: PathBuf, contents: bool) -> Result<Self> {
+        Self::acquire_local(path, contents, true).await
+    }
+
+    async fn acquire_local(path: PathBuf, contents: bool, follow: bool) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            {
+                source_observations::operator::acquire(path, contents, follow)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (path, contents, follow);
+                Err(RootedFsError::UnsupportedPlatform)
+            }
+        })
+        .await
+        .map_err(|error| RootedFsError::Worker(error.to_string()))?
+    }
+
+    /// Negotiated remote SOURCE keeps held-root authority, not local operator
+    /// continuity. Directory syntax still intentionally follows its root link.
     pub async fn open(path: PathBuf, contents: bool) -> Result<Self> {
-        Self::open_with_directory_links(path, contents, false).await
-    }
-
-    /// Explicit local --copy-links also applies to a directory root operand.
-    /// This does not authorize following descendant paths on a remote source.
-    pub async fn open_following(path: PathBuf, contents: bool) -> Result<Self> {
-        Self::open_with_directory_links(path, contents, true).await
-    }
-
-    async fn open_with_directory_links(
-        path: PathBuf,
-        contents: bool,
-        follow: bool,
-    ) -> Result<Self> {
-        tokio::task::spawn_blocking(move || source_blocking(path, contents, follow))
+        tokio::task::spawn_blocking(move || source_blocking(path, contents))
             .await
             .map_err(|error| RootedFsError::Worker(error.to_string()))?
     }
@@ -199,9 +222,9 @@ fn requires_directory(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn source_blocking(path: PathBuf, contents: bool, follow: bool) -> Result<BoundSource> {
+fn source_blocking(path: PathBuf, contents: bool) -> Result<BoundSource> {
     let requires_directory = requires_directory(&path);
-    if follow || requires_directory {
+    if requires_directory {
         let (rooted, shape) = match classify_destination(&path)? {
             DestinationClassification::Directory(rooted) => {
                 let basename = if contents {
@@ -459,7 +482,15 @@ impl PendingRoot {
             if let Some(address) = backup_address {
                 self.ancestor.verify_backup_address_blocking(address)?;
             }
-            let _permit = self.ancestor.admit_mutation_blocking()?;
+            // Pending root acquisition has not been admitted by LOCAL completed
+            // preflight. Ordinary in-root mkdir permission is not that contract.
+            let _permit = self.ancestor.admit_mutation_blocking(SourceEffect {
+                kind: SourceEffectKind::Unknown,
+                parent: fd.as_raw_fd(),
+                name,
+                object: None,
+                path: &prefix,
+            })?;
             self.ancestor.verify_parent_binding_blocking(&prefix, &fd)?;
             if let Some(address) = backup_address {
                 self.ancestor.verify_backup_address_blocking(address)?;
@@ -499,6 +530,7 @@ impl PendingRoot {
         let mut rooted = RootedFs::from_operand_fd(self.path, fd);
         rooted.mutation_admission = self.ancestor.mutation_admission;
         rooted.run_admission = self.ancestor.run_admission;
+        rooted.local_source_effects = self.ancestor.local_source_effects;
         rooted.retirement = self.ancestor.retirement;
         #[cfg(test)]
         {
@@ -548,10 +580,10 @@ mod tests {
                 Err(RootedFsError::RootChanged(_))
             ));
         }
-        let local_source = crate::endpoint::source_root::SourceRoot::from_rooted(source.rooted);
+        // A negotiated held root cannot be promoted after classification.
         assert!(matches!(
-            local_source.validate().await,
-            Err(RootedFsError::RootChanged(_))
+            crate::endpoint::source_root::SourceRoot::from_rooted(source.rooted),
+            Err(RootedFsError::SourceOperatorUncaptured)
         ));
         assert_eq!(std::fs::read(foreign.join("file")).unwrap(), b"foreign");
     }
@@ -614,7 +646,7 @@ mod tests {
 }
 
 #[cfg(not(unix))]
-fn source_blocking(_path: PathBuf, _contents: bool, _follow: bool) -> Result<BoundSource> {
+fn source_blocking(_path: PathBuf, _contents: bool) -> Result<BoundSource> {
     Err(RootedFsError::UnsupportedPlatform)
 }
 #[cfg(not(unix))]
