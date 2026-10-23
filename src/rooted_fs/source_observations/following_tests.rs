@@ -92,6 +92,50 @@ fn original_and_resolution_link_literals_compare_exact_raw_bytes() {
 }
 
 #[test]
+fn named_observation_completion_preserves_native_race_and_fatal_error_roles() {
+    for change in ["stable", "missing", "retyped"] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("dir");
+        std::fs::create_dir(&directory).unwrap();
+        std::os::unix::fs::symlink("data", directory.join("entry")).unwrap();
+        let parent = File::open(&directory).unwrap();
+        let name = OsStr::new("entry");
+        let path = Path::new("dir/entry");
+        let named =
+            NativeObservation::from_stat(&stat_at_no_follow(parent.as_raw_fd(), name).unwrap())
+                .unwrap();
+        // External changes in the capture-to-final-check window. Both key and
+        // no-follow stat queries must retain this logical CHILD error role.
+        match change {
+            "missing" => std::fs::remove_file(directory.join(name)).unwrap(),
+            "retyped" => {
+                std::fs::rename(directory.join(name), directory.join("held")).unwrap();
+                std::fs::write(directory.join(name), b"foreign").unwrap();
+            }
+            _ => {}
+        }
+        let result = finish_named_observation(parent.as_raw_fd(), path, named);
+        if change == "stable" {
+            assert!(result.is_ok());
+        } else {
+            assert!(
+                matches!(result, Err(RootedFsError::SourceBindingChanged(changed)) if changed == path)
+            );
+        }
+    }
+    for errno in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINVAL] {
+        assert!(matches!(
+            source_read_race(io::Error::from_raw_os_error(errno).into(), Path::new("entry")),
+            RootedFsError::Io(error) if error.raw_os_error() == Some(errno)
+        ));
+    }
+    assert!(matches!(
+        source_read_race(RootedFsError::RootChanged(PathBuf::from("original")), Path::new("entry")),
+        RootedFsError::RootChanged(path) if path == Path::new("original")
+    ));
+}
+
+#[test]
 fn observed_link_retyped_between_stat_and_readlink_is_a_source_race() {
     let root = tempfile::tempdir().unwrap();
     std::os::unix::fs::symlink("data", root.path().join("middle")).unwrap();

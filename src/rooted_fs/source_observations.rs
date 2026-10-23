@@ -604,11 +604,7 @@ fn inspect_with_stat(
     } else {
         (named, None, stat, None, Vec::new())
     };
-    let object_key = object_key(parent, Some(name))?;
-    let after = NativeObservation::from_stat(&stat_at_no_follow(parent, name)?)?;
-    if !named.matches(after, true) {
-        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
-    }
+    let object_key = finish_named_observation(parent, path, named)?;
     if let Some(original) = &target {
         if &observed_target_at(parent, name, path)? != original {
             return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
@@ -629,6 +625,24 @@ fn inspect_with_stat(
         stat,
         terminal,
     ))
+}
+
+/// Close the named observation after any link/target work. Either native query
+/// can detect the named change; the original selected-LINK owner must promote
+/// that result to a sticky operator failure instead of a CHILD race.
+fn finish_named_observation(
+    parent: RawFd,
+    path: &Path,
+    named: NativeObservation,
+) -> Result<Option<NativeObjectKey>> {
+    let name = path.file_name().ok_or(RootedFsError::InvalidRelativePath)?;
+    let object_key =
+        object_key(parent, Some(name)).map_err(|error| source_read_race(error, path))?;
+    let after = stat_at_no_follow(parent, name).map_err(|error| source_read_race(error, path))?;
+    if !named.matches(NativeObservation::from_stat(&after)?, true) {
+        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
+    }
+    Ok(object_key)
 }
 
 /// A raw filename, not a normalized path or a virtual-root interpretation.
@@ -839,13 +853,20 @@ impl RootedFs {
         let original = catalogue.get(path_key(path))?;
         let terminal = catalogue.selected_terminal(self, path)?;
         let result = match terminal {
-            Some(terminal) if follow => inspect_selected(
-                parent,
-                path,
-                NativeObservation::from_stat(&terminal.stat)?,
-                terminal.object_key,
-            ),
-            _ => inspect(parent, path, follow),
+            Some(terminal) => {
+                let result = if follow {
+                    inspect_selected(
+                        parent,
+                        path,
+                        NativeObservation::from_stat(&terminal.stat)?,
+                        terminal.object_key,
+                    )
+                } else {
+                    inspect(parent, path, false)
+                };
+                catalogue.original_link_result(self, path, result)
+            }
+            None => inspect(parent, path, follow),
         };
         let result = result.map_err(|error| match error {
             RootedFsError::SourceFollowUnsupported(_) if original.is_some() => {
@@ -1014,13 +1035,14 @@ impl Catalogue {
                 None
             };
             let (observed, stat, inspected_terminal) = if let Some(terminal) = &terminal {
+                let result = inspect_selected(
+                    directory.as_raw_fd(),
+                    &relative,
+                    NativeObservation::from_stat(&terminal.stat)?,
+                    terminal.object_key,
+                );
                 (
-                    inspect_selected(
-                        directory.as_raw_fd(),
-                        &relative,
-                        NativeObservation::from_stat(&terminal.stat)?,
-                        terminal.object_key,
-                    )?,
+                    self.original_link_result(rooted, &relative, result)?,
                     terminal.stat,
                     None,
                 )

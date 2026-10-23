@@ -381,6 +381,85 @@ async fn selected_regular_leaf_follow_policy_preserves_original_observation() {
 }
 
 #[tokio::test]
+async fn selected_link_loss_after_terminal_replay_is_immediately_sticky() {
+    for change in ["missing", "retyped", "retargeted"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("file");
+        let link = fixture.path().join("selected");
+        let parked = fixture.path().join("parked");
+        std::fs::write(&file, b"original DATA").unwrap();
+        std::os::unix::fs::symlink("file", &link).unwrap();
+        let bound = BoundSource::open_local_following(link.clone(), false)
+            .await
+            .unwrap();
+        let SourceShape::Leaf { name } = bound.shape else {
+            panic!("expected selected link")
+        };
+        let rooted = bound.rooted;
+        let source = SourceRoot::from_rooted(rooted.clone()).unwrap();
+        source
+            .selected_entries(
+                name.clone(),
+                crate::engine::scan::ScanRequest {
+                    follow_symlinks: true,
+                    ..Default::default()
+                },
+                false,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        {
+            let mut owner = rooted.source_observations.lock().unwrap();
+            let catalogue = owner.active().unwrap();
+            catalogue.begin().unwrap();
+            let terminal = catalogue
+                .selected_terminal(&rooted, name.as_path())
+                .unwrap()
+                .unwrap();
+            let original = catalogue.require(name.as_path()).unwrap();
+            // The original operator replay succeeded. Lose/retype the named
+            // LINK before its final check, or capture a new equal-referent LINK.
+            std::fs::rename(&link, &parked).unwrap();
+            match change {
+                "retyped" => std::fs::write(&link, b"foreign").unwrap(),
+                "retargeted" => std::os::unix::fs::symlink("./file", &link).unwrap(),
+                _ => {}
+            }
+            let parent = rooted.root_fd.as_raw_fd();
+            let effective = NativeObservation::from_stat(&terminal.stat).unwrap();
+            let result = if change == "retargeted" {
+                inspect_selected(parent, name.as_path(), effective, terminal.object_key)
+            } else {
+                finish_named_observation(parent, name.as_path(), original.named).and_then(|_| {
+                    inspect_selected(parent, name.as_path(), effective, terminal.object_key)
+                })
+            };
+            assert!(matches!(
+                catalogue.original_link_result(&rooted, name.as_path(), result),
+                Err(RootedFsError::RootChanged(_))
+            ));
+            assert!(
+                matches!(
+                    catalogue.check_lifetime(),
+                    Err(RootedFsError::RootChanged(_))
+                ),
+                "failure must be sticky before any retry or trailing replay"
+            );
+        }
+        if change != "missing" {
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::fs::rename(&parked, &link).unwrap();
+        assert!(matches!(
+            rooted.retry_source_run_blocking(),
+            Err(RootedFsError::RootChanged(_))
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), b"original DATA");
+    }
+}
+
+#[tokio::test]
 async fn selected_followed_leaf_retarget_to_same_inode_rejects_scan() {
     let fixture = tempfile::tempdir().unwrap();
     let first = fixture.path().join("first");

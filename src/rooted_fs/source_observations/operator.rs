@@ -639,6 +639,36 @@ impl CatalogueState {
 }
 
 impl Catalogue {
+    fn operator_changed(&mut self, rooted: &RootedFs) -> RootedFsError {
+        let path = rooted.root_path.as_ref().clone();
+        let Ok(mut lifetime) = self.lifetime.lock() else {
+            return RootedFsError::SourceCatalogueTerminal;
+        };
+        *lifetime = Some(path.clone());
+        RootedFsError::RootChanged(path)
+    }
+
+    /// `inspect_selected` observes only the original named LINK, never the
+    /// effective FILE's mutable DATA. Its failures cannot authorize CHILD retry.
+    pub(super) fn original_link_result(
+        &mut self,
+        rooted: &RootedFs,
+        path: &Path,
+        result: Result<Observation>,
+    ) -> Result<Observation> {
+        let observed = match result {
+            Err(RootedFsError::SourceBindingChanged(_)) => {
+                return Err(self.operator_changed(rooted));
+            }
+            result => result?,
+        };
+        let original = self.require(path)?;
+        if !original.named.matches(observed.named, true) || original.target != observed.target {
+            return Err(self.operator_changed(rooted));
+        }
+        Ok(observed)
+    }
+
     fn replay_address(
         &mut self,
         rooted: &RootedFs,
@@ -647,26 +677,14 @@ impl Catalogue {
         // Failed native lookup is a root-change error, not permission to retry
         // acquisition. Scratch/authentication errors keep their typed cause.
         match self.validate_operator(rooted, data) {
-            Err(RootedFsError::RootChanged(_)) => {
-                let path = rooted.root_path.as_ref().clone();
-                *self
-                    .lifetime
-                    .lock()
-                    .map_err(|_| RootedFsError::SourceCatalogueTerminal)? = Some(path.clone());
-                Err(RootedFsError::RootChanged(path))
-            }
+            Err(RootedFsError::RootChanged(_)) => Err(self.operator_changed(rooted)),
             Err(RootedFsError::Io(error))
                 if matches!(
                     error.raw_os_error(),
                     Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
                 ) =>
             {
-                let path = rooted.root_path.as_ref().clone();
-                *self
-                    .lifetime
-                    .lock()
-                    .map_err(|_| RootedFsError::SourceCatalogueTerminal)? = Some(path.clone());
-                Err(RootedFsError::RootChanged(path))
+                Err(self.operator_changed(rooted))
             }
             Err(error) => Err(error),
             Ok(observed) => Ok(observed),
