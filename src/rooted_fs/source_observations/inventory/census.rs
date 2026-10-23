@@ -21,7 +21,12 @@ impl Catalogue {
                 return Err(invalid().into());
             }
             if !original.matches(
-                &inspect(root, directory.as_raw_fd(), &relative, false)?,
+                &inspect(
+                    ResolutionRoot::Held(root),
+                    directory.as_raw_fd(),
+                    &relative,
+                    false,
+                )?,
                 true,
             ) {
                 return Err(RootedFsError::SourceBindingChanged(relative));
@@ -44,6 +49,19 @@ impl Catalogue {
         }
         let mut parent = [0; 32];
         for (index, step) in original.resolution.iter().enumerate() {
+            let step = match step {
+                ResolutionStep::Root(reset) => {
+                    let root = self.require(Path::new(""))?;
+                    if !root.named.matches(reset.named, true)
+                        || root.object_key != Some(reset.object_key)
+                    {
+                        return Ok(false);
+                    }
+                    parent = [0; 32];
+                    continue;
+                }
+                ResolutionStep::Entry(step) => step,
+            };
             if step.name == OsStr::new(".") || step.name == OsStr::new("..") {
                 // Native parent results must corroborate the original graph;
                 // neither dot creates membership, traversal EOF, or a ROOT lease.
@@ -237,7 +255,10 @@ impl SourceInventory {
                         return Err(invalid().into());
                     }
                     let current = inspect(
-                        self.rooted.root_fd.as_raw_fd(),
+                        ResolutionRoot::Catalogued {
+                            rooted: &self.rooted,
+                            catalogue: c,
+                        },
                         directory.as_raw_fd(),
                         &child_path,
                         original.followed,

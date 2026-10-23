@@ -489,6 +489,10 @@ fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
         ("./dir/./bridge", "./deeper/./data", false),
         (".//dir///.//bridge", ".//deeper///.//data", false),
         ("dir/../dir/bridge", "../dir/deeper/data", true),
+        ("{ROOT}/dir/bridge", "{ROOT}/dir/deeper/data", false),
+        ("dir/bridge", "{ROOT}/.//dir///deeper/data", false),
+        ("{ROOT}/.//dir///bridge", "deeper/data", false),
+        ("{FD_ROOT}/dir/bridge", "{FD_ROOT}/dir/deeper/data", false),
     ] {
         for target_alias in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
@@ -497,8 +501,16 @@ fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
                 std::fs::create_dir_all(root.join("dir/deeper")).unwrap();
             }
             std::fs::write(source.join("dir/deeper/data"), b"SOURCE DATA").unwrap();
-            std::os::unix::fs::symlink(target, source.join("entry")).unwrap();
-            std::os::unix::fs::symlink(bridge, source.join("dir/bridge")).unwrap();
+            let relative_operand = target.contains("{FD_ROOT}");
+            let native_address = source.canonicalize().unwrap();
+            let target = target
+                .replace("{ROOT}", source.to_str().unwrap())
+                .replace("{FD_ROOT}", native_address.to_str().unwrap());
+            let bridge = bridge
+                .replace("{ROOT}", source.to_str().unwrap())
+                .replace("{FD_ROOT}", native_address.to_str().unwrap());
+            std::os::unix::fs::symlink(&target, source.join("entry")).unwrap();
+            std::os::unix::fs::symlink(&bridge, source.join("dir/bridge")).unwrap();
             let names = ["entry", "dir/bridge", "dir/deeper/data"];
             for name in names {
                 if target_alias && name == "entry" {
@@ -510,8 +522,15 @@ fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
             }
             let source_originals = names.map(|name| identity(&source.join(name)));
             let old = names.map(|name| identity(&destination.join(name)));
-            let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-                .arg(format!("{}/", source.display()))
+            let mut command = Command::new(env!("CARGO_BIN_EXE_sy"));
+            command
+                .current_dir(fixture.path())
+                .arg(if relative_operand {
+                    "source/".to_string()
+                } else {
+                    format!("{}/", source.display())
+                });
+            let output = command
                 .arg(&destination)
                 .args(["--copy-links", "--no-hooks", "--ignore-times", "--backup"])
                 .output()
@@ -558,13 +577,13 @@ fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
                 std::fs::read_link(source.join("entry"))
                     .unwrap()
                     .as_os_str(),
-                Path::new(target).as_os_str()
+                Path::new(&target).as_os_str()
             );
             assert_eq!(
                 std::fs::read_link(source.join("dir/bridge"))
                     .unwrap()
                     .as_os_str(),
-                Path::new(bridge).as_os_str()
+                Path::new(&bridge).as_os_str()
             );
         }
     }

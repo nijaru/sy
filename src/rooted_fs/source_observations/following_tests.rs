@@ -17,7 +17,7 @@ fn sibling_chain_bounds_cycles_and_unsupported_targets() {
         }
         let parent = File::open(root.path()).unwrap();
         let result = inspect(
-            parent.as_raw_fd(),
+            ResolutionRoot::Held(parent.as_raw_fd()),
             parent.as_raw_fd(),
             Path::new("link-0"),
             true,
@@ -26,7 +26,7 @@ fn sibling_chain_bounds_cycles_and_unsupported_targets() {
             let observation = result.unwrap();
             assert_eq!(observation.resolution.len(), length);
             assert_eq!(
-                observation.resolution.last().unwrap().name,
+                observation.resolution.last().unwrap().entry().unwrap().name,
                 OsStr::new("data")
             );
             assert!(observation.matches(&Observation::decode(&observation.encode()).unwrap(), true));
@@ -55,7 +55,7 @@ fn sibling_chain_bounds_cycles_and_unsupported_targets() {
         std::os::unix::fs::symlink(target, root.path().join("middle")).unwrap();
         let parent = File::open(root.path()).unwrap();
         assert!(matches!(
-            inspect(parent.as_raw_fd(), parent.as_raw_fd(), Path::new("first"), true),
+            inspect(ResolutionRoot::Held(parent.as_raw_fd()), parent.as_raw_fd(), Path::new("first"), true),
             Err(RootedFsError::SourceFollowUnsupported(path)) if path == Path::new("first")
         ));
     }
@@ -72,7 +72,7 @@ fn original_and_resolution_link_literals_compare_exact_raw_bytes() {
         std::os::unix::fs::symlink(literal, root.path().join("link")).unwrap();
         let parent = File::open(root.path()).unwrap();
         let original = inspect(
-            parent.as_raw_fd(),
+            ResolutionRoot::Held(parent.as_raw_fd()),
             parent.as_raw_fd(),
             Path::new("link"),
             false,
@@ -88,16 +88,16 @@ fn original_and_resolution_link_literals_compare_exact_raw_bytes() {
             !original.matches(&other, true),
             "native stat equality cannot erase literal spelling"
         );
-        let step = ResolutionStep {
+        let step = ResolutionStep::Entry(following::ResolutionEntry {
             name: original.name,
             named: original.named,
             object_key: original.object_key,
             target: original.target,
-        };
+        });
         let mut bytes = Vec::new();
         step.encode(&mut bytes);
         let mut changed = ResolutionStep::decode(&mut bytes.as_slice()).unwrap();
-        changed.target = other.target;
+        changed.entry_mut().unwrap().target = other.target;
         assert!(!same_resolution(&[step], &[changed]));
     }
 }
@@ -176,7 +176,7 @@ fn sibling_chain_codec_rejects_truncation_unbounded_and_disconnected_hops() {
     std::os::unix::fs::symlink("data", root.path().join("middle")).unwrap();
     let parent = File::open(root.path()).unwrap();
     let mut observation = inspect(
-        parent.as_raw_fd(),
+        ResolutionRoot::Held(parent.as_raw_fd()),
         parent.as_raw_fd(),
         Path::new("first"),
         true,
@@ -195,12 +195,14 @@ fn sibling_chain_codec_rejects_truncation_unbounded_and_disconnected_hops() {
     oversized[count_offset..count_offset + 4]
         .copy_from_slice(&((MAX_FOLLOW_STEPS + 1) as u32).to_le_bytes());
     assert!(Observation::decode(&oversized).is_err());
-    observation.resolution[0].name = OsString::from("foreign");
+    observation.resolution[0].entry_mut().unwrap().name = OsString::from("foreign");
     assert!(Observation::decode(&observation.encode()).is_err());
-    observation.resolution[0].name = OsString::from("middle");
-    observation.resolution[0].target = Some(LinkTarget::new(OsStr::new("first")));
+    observation.resolution[0].entry_mut().unwrap().name = OsString::from("middle");
+    observation.resolution[0].entry_mut().unwrap().target =
+        Some(LinkTarget::new(OsStr::new("first")));
     assert!(Observation::decode(&observation.encode()).is_err());
-    observation.resolution[0].target = Some(LinkTarget::new(OsStr::new(&"x".repeat(MAX_TARGET))));
+    observation.resolution[0].entry_mut().unwrap().target =
+        Some(LinkTarget::new(OsStr::new(&"x".repeat(MAX_TARGET))));
     assert!(
         Observation::decode(&observation.encode()).is_err(),
         "the aggregate transcript byte budget applies independently of hop count"

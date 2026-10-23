@@ -64,7 +64,7 @@ async fn forward_file_and_nested_chain_keep_exact_physical_membership() {
                     original
                         .resolution
                         .iter()
-                        .filter(|step| step.name == OsStr::new("."))
+                        .filter(|step| matches!(step, ResolutionStep::Entry(entry) if entry.name == OsStr::new(".")))
                         .count(),
                     dots
                 );
@@ -235,7 +235,7 @@ fn forward_resolver_replays_deep_targets_under_low_fd_limit() {
         let parent = File::open(Path::new(&root)).unwrap();
         for _ in 0..8 {
             let (observation, _, terminal) = inspect_with_stat(
-                parent.as_raw_fd(),
+                ResolutionRoot::Held(parent.as_raw_fd()),
                 parent.as_raw_fd(),
                 Path::new("entry"),
                 true,
@@ -312,7 +312,7 @@ fn forward_file_resolution_refuses_directory_links_and_lexical_shortcuts() {
         std::os::unix::fs::symlink(target, root.path().join("entry")).unwrap();
         assert!(matches!(
             inspect(
-                parent.as_raw_fd(),
+                ResolutionRoot::Held(parent.as_raw_fd()),
                 parent.as_raw_fd(),
                 Path::new("entry"),
                 true

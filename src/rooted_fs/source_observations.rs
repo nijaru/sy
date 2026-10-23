@@ -19,13 +19,13 @@ const MAX_RECORD: usize = 32
     + 4
     + MAX_TARGET
     + 4
-    + MAX_FOLLOW_STEPS * (4 + 64 + 32 + 4)
+    + MAX_FOLLOW_STEPS * (1 + 4 + 64 + 32 + 4)
     + MAX_TARGET
     + 4;
 use super::local_source_effects::native_object::{object_key, NativeObjectKey};
 
 mod following;
-use following::{inspect_relative_file, same_resolution, ResolutionStep};
+use following::{inspect_file, same_resolution, ResolutionRoot, ResolutionStep};
 pub(super) mod inventory;
 pub(super) mod operator;
 use inventory::SourceRootProtection;
@@ -573,12 +573,17 @@ fn observed_target_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<LinkTa
     })
 }
 
-fn inspect(root: RawFd, parent: RawFd, path: &Path, follow: bool) -> Result<Observation> {
+fn inspect(
+    root: ResolutionRoot<'_>,
+    parent: RawFd,
+    path: &Path,
+    follow: bool,
+) -> Result<Observation> {
     inspect_with_stat(root, parent, path, follow).map(|(observation, _, _)| observation)
 }
 
 fn inspect_with_stat(
-    root: RawFd,
+    root: ResolutionRoot<'_>,
     parent: RawFd,
     path: &Path,
     follow: bool,
@@ -602,7 +607,7 @@ fn inspect_with_stat(
     let (effective, followed_object_key, stat, terminal, resolution_start, resolution) = if followed
     {
         let target = target.as_deref().ok_or_else(invalid)?;
-        let file = inspect_relative_file(root, parent, path, named, target)?;
+        let file = inspect_file(root, parent, path, named, target)?;
         (
             NativeObservation::from_stat(&file.binding.stat)?,
             file.binding.object_key,
@@ -689,7 +694,7 @@ fn inspect_selected(
     effective: NativeObservation,
     followed_object_key: Option<NativeObjectKey>,
 ) -> Result<Observation> {
-    let mut observed = inspect(parent, parent, path, false)?;
+    let mut observed = inspect(ResolutionRoot::Held(parent), parent, path, false)?;
     if observed.named.kind != libc::S_IFLNK as u64 {
         return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
     }
@@ -873,11 +878,24 @@ impl RootedFs {
                         terminal.object_key,
                     )
                 } else {
-                    inspect(self.root_fd.as_raw_fd(), parent, path, false)
+                    inspect(
+                        ResolutionRoot::Held(self.root_fd.as_raw_fd()),
+                        parent,
+                        path,
+                        false,
+                    )
                 };
                 catalogue.original_link_result(self, path, result)
             }
-            None => inspect(self.root_fd.as_raw_fd(), parent, path, follow),
+            None => inspect(
+                ResolutionRoot::Catalogued {
+                    rooted: self,
+                    catalogue,
+                },
+                parent,
+                path,
+                follow,
+            ),
         };
         let result = result.map_err(|error| match error {
             RootedFsError::SourceFollowUnsupported(_) if original.is_some() => {
@@ -1059,7 +1077,10 @@ impl Catalogue {
                 )
             } else {
                 inspect_with_stat(
-                    rooted.root_fd.as_raw_fd(),
+                    ResolutionRoot::Catalogued {
+                        rooted,
+                        catalogue: self,
+                    },
                     directory.as_raw_fd(),
                     &relative,
                     original.followed,

@@ -30,6 +30,17 @@ enum LeafData {
     NewRun,
 }
 
+#[derive(Clone, Copy)]
+enum ReplayPurpose {
+    Address(LeafData),
+    Root,
+}
+
+enum ReplayedAddress {
+    Address(Option<Box<TerminalBinding>>),
+    Root(OwnedFd),
+}
+
 pub(super) struct OriginalAddress {
     cwd: Option<Arc<OwnedFd>>,
     count: u64,
@@ -186,7 +197,7 @@ pub(in crate::rooted_fs) fn acquire(
                 leaf = Some((selected.name, original));
             } else {
                 let original = inspect(
-                    directory.as_raw_fd(),
+                    ResolutionRoot::Held(directory.as_raw_fd()),
                     directory.as_raw_fd(),
                     Path::new(&name),
                     false,
@@ -341,6 +352,21 @@ impl Catalogue {
         rooted: &RootedFs,
         data: LeafData,
     ) -> Result<Option<TerminalBinding>> {
+        match self.walk_operator(rooted, ReplayPurpose::Address(data))? {
+            ReplayedAddress::Address(terminal) => Ok(terminal.map(|terminal| *terminal)),
+            ReplayedAddress::Root(_) => Err(invalid().into()),
+        }
+    }
+
+    fn walk_operator(
+        &mut self,
+        rooted: &RootedFs,
+        purpose: ReplayPurpose,
+    ) -> Result<ReplayedAddress> {
+        let data = match purpose {
+            ReplayPurpose::Address(data) => data,
+            ReplayPurpose::Root => LeafData::CurrentRun,
+        };
         let address = self
             .operator
             .as_ref()
@@ -559,7 +585,7 @@ impl Catalogue {
                     // The last directory is already genuinely held. Binding
                     // validation needs named metadata, not fresh search/read
                     // permission on that root (e.g. a later mode-000 census).
-                    if ordinal == count - 1 {
+                    if ordinal == count - 1 && matches!(purpose, ReplayPurpose::Address(_)) {
                         let after = NativeObservation::from_stat(&stat_at_no_follow(
                             directory.as_raw_fd(),
                             &record.name,
@@ -576,7 +602,7 @@ impl Catalogue {
                         if offset != end {
                             return Err(invalid().into());
                         }
-                        return Ok(None);
+                        return Ok(ReplayedAddress::Address(None));
                     }
                     let next = directory_at(directory.as_raw_fd(), &record.name)?;
                     let after = NativeObservation::from_stat(&stat_at_no_follow(
@@ -597,6 +623,14 @@ impl Catalogue {
                     cursor = Some(next);
                 }
             }
+            if ordinal == root && matches!(purpose, ReplayPurpose::Root) {
+                if ordinal == count - 1 && offset != end {
+                    return Err(invalid().into());
+                }
+                // The root-address exception ends here, even when the original
+                // operand followed a selected FILE outside this LINK parent.
+                return Ok(ReplayedAddress::Root(cursor.ok_or_else(invalid)?));
+            }
             previous = key;
         }
         if offset != end
@@ -612,7 +646,7 @@ impl Catalogue {
                 rooted.root_path.as_ref().clone(),
             ));
         }
-        Ok(terminal_data)
+        Ok(ReplayedAddress::Address(terminal_data.map(Box::new)))
     }
 }
 
@@ -680,9 +714,93 @@ impl Catalogue {
         rooted: &RootedFs,
         data: LeafData,
     ) -> Result<Option<TerminalBinding>> {
+        let result = self.validate_operator(rooted, data);
+        self.operator_result(rooted, result)
+    }
+
+    /// A native object AND mounted view must corroborate the original held
+    /// ROOT. This permits a read-only reset, not namespace ancestry claims.
+    pub(super) fn qualify_absolute_root(
+        &mut self,
+        rooted: &RootedFs,
+        address: &LinkTarget,
+        path: &Path,
+    ) -> Result<following::RootReset> {
+        let unsupported = || RootedFsError::SourceFollowUnsupported(path.to_path_buf());
+        let original = self.require(Path::new(""))?;
+        let expected_key = original.object_key.ok_or_else(unsupported)?;
+        let matches_root = |fd| -> Result<bool> {
+            Ok(original
+                .effective
+                .same_binding(NativeObservation::from_stat(&stat_fd(fd)?)?)
+                && object_key(fd, None)? == Some(expected_key))
+        };
+        let has_operator = self.operator.is_some();
+        let result = (|| {
+            if !matches_root(rooted.root_fd.as_raw_fd())? {
+                return Err(RootedFsError::RootChanged(
+                    rooted.root_path.as_ref().clone(),
+                ));
+            }
+            if has_operator {
+                let ReplayedAddress::Root(reached) =
+                    self.walk_operator(rooted, ReplayPurpose::Root)?
+                else {
+                    return Err(invalid().into());
+                };
+                if !matches_root(reached.as_raw_fd())? {
+                    return Err(RootedFsError::RootChanged(
+                        rooted.root_path.as_ref().clone(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        self.operator_result(rooted, result)?;
+        if !has_operator || address.as_os_str() != rooted.root_path.as_os_str() {
+            // A returned pathname is only a candidate. Do not walk arbitrary
+            // target prefixes or adopt a new ROOT after pathname projection.
+            if following::native_root_address(rooted.root_fd.as_raw_fd())?.as_ref() != Some(address)
+            {
+                return Err(unsupported());
+            }
+            let result = (|| {
+                let mut budget = 0;
+                let mut cursor = directory_at(libc::AT_FDCWD, OsStr::new("/"))?;
+                for name in components(address, &mut budget)? {
+                    cursor = directory_at(cursor.as_raw_fd(), &name)?;
+                }
+                if !matches_root(cursor.as_raw_fd())?
+                    || following::native_root_address(rooted.root_fd.as_raw_fd())?.as_ref()
+                        != Some(address)
+                {
+                    return Err(unsupported());
+                }
+                Ok(())
+            })();
+            result.map_err(|error| match error {
+                RootedFsError::Io(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)
+                    ) =>
+                {
+                    unsupported()
+                }
+                error => error,
+            })?;
+        }
+        Ok(following::RootReset {
+            address: address.clone(),
+            named: original.effective,
+            object_key: expected_key,
+        })
+    }
+
+    fn operator_result<T>(&mut self, rooted: &RootedFs, result: Result<T>) -> Result<T> {
         // Failed native lookup is a root-change error, not permission to retry
         // acquisition. Scratch/authentication errors keep their typed cause.
-        match self.validate_operator(rooted, data) {
+        match result {
             Err(RootedFsError::RootChanged(_)) => Err(self.operator_changed(rooted)),
             Err(RootedFsError::Io(error))
                 if matches!(

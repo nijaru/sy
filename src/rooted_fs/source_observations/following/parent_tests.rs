@@ -23,10 +23,15 @@ fn root_prefix_authenticates_raw_names_codec_and_supplied_parent() {
     let root = File::open(fixture.path()).unwrap();
     let directory = File::open(&directory_path).unwrap();
     let path = Path::new(name).join("link");
-    let (original, _, terminal) =
-        inspect_with_stat(root.as_raw_fd(), directory.as_raw_fd(), &path, true).unwrap();
+    let (original, _, terminal) = inspect_with_stat(
+        ResolutionRoot::Held(root.as_raw_fd()),
+        directory.as_raw_fd(),
+        &path,
+        true,
+    )
+    .unwrap();
     assert_eq!(original.resolution_start, 1);
-    assert_eq!(original.resolution[0].name, name);
+    assert_eq!(original.resolution[0].entry().unwrap().name, name);
     assert!(original.matches(&Observation::decode(&original.encode()).unwrap(), true));
     let terminal = terminal.unwrap();
     let mut file = open_file_at(terminal.parent.as_raw_fd(), &terminal.name).unwrap();
@@ -36,15 +41,18 @@ fn root_prefix_authenticates_raw_names_codec_and_supplied_parent() {
     // APFS rejects invalid UTF-8 directory names, so exercise their exact tape
     // representation separately from native lookup on this filesystem.
     let mut raw = Observation::decode(&original.encode()).unwrap();
-    raw.resolution[0].name = OsStr::from_bytes(b"dir-\xff").to_os_string();
-    raw.parent = key([0; 32], &raw.resolution[0].name);
+    raw.resolution[0].entry_mut().unwrap().name = OsStr::from_bytes(b"dir-\xff").to_os_string();
+    raw.parent = key([0; 32], &raw.resolution[0].entry_mut().unwrap().name);
     assert!(raw.matches(&Observation::decode(&raw.encode()).unwrap(), true));
     for mutation in 0..3 {
         let mut changed = Observation::decode(&original.encode()).unwrap();
         match mutation {
             0 => changed.resolution_start = 0,
             1 => changed.parent = [0; 32],
-            _ => changed.resolution[0].target = Some(LinkTarget::new(OsStr::new("data"))),
+            _ => {
+                changed.resolution[0].entry_mut().unwrap().target =
+                    Some(LinkTarget::new(OsStr::new("data")))
+            }
         }
         assert!(Observation::decode(&changed.encode()).is_err());
     }
@@ -52,7 +60,12 @@ fn root_prefix_authenticates_raw_names_codec_and_supplied_parent() {
     std::os::unix::fs::symlink("./data", foreign.path().join("link")).unwrap();
     let foreign_parent = File::open(foreign.path()).unwrap();
     assert!(matches!(
-        inspect_with_stat(root.as_raw_fd(), foreign_parent.as_raw_fd(), &path, true),
+        inspect_with_stat(
+            ResolutionRoot::Held(root.as_raw_fd()),
+            foreign_parent.as_raw_fd(),
+            &path,
+            true
+        ),
         Err(RootedFsError::SourceBindingChanged(_))
     ));
 }
@@ -70,7 +83,12 @@ fn parents_keep_root_context_literal_provenance_and_codec_bounds() {
         ("entry", root.as_raw_fd(), 0),
         ("dir/link", directory.as_raw_fd(), 1),
     ] {
-        let result = inspect_with_stat(root.as_raw_fd(), parent, Path::new(name), true);
+        let result = inspect_with_stat(
+            ResolutionRoot::Held(root.as_raw_fd()),
+            parent,
+            Path::new(name),
+            true,
+        );
         if !supported(root.as_raw_fd()) {
             assert!(matches!(
                 result,
@@ -80,10 +98,9 @@ fn parents_keep_root_context_literal_provenance_and_codec_bounds() {
         }
         let (original, _, terminal) = result.unwrap();
         assert_eq!(original.resolution_start, prefix);
-        assert!(original
-            .resolution
-            .iter()
-            .any(|step| step.name == OsStr::new("..")));
+        assert!(original.resolution.iter().any(
+            |step| matches!(step, ResolutionStep::Entry(entry) if entry.name == OsStr::new(".."))
+        ));
         assert!(original.matches(&Observation::decode(&original.encode()).unwrap(), true));
         let terminal = terminal.unwrap();
         let mut reader = open_file_at(terminal.parent.as_raw_fd(), &terminal.name).unwrap();
@@ -111,7 +128,7 @@ fn parents_keep_root_context_literal_provenance_and_codec_bounds() {
         std::os::unix::fs::symlink(target, fixture.path().join("refuse")).unwrap();
         assert!(matches!(
             inspect(
-                root.as_raw_fd(),
+                ResolutionRoot::Held(root.as_raw_fd()),
                 root.as_raw_fd(),
                 Path::new("refuse"),
                 true
@@ -122,7 +139,7 @@ fn parents_keep_root_context_literal_provenance_and_codec_bounds() {
     }
     if supported(root.as_raw_fd()) {
         let original = inspect(
-            root.as_raw_fd(),
+            ResolutionRoot::Held(root.as_raw_fd()),
             directory.as_raw_fd(),
             Path::new("dir/link"),
             true,
@@ -131,7 +148,7 @@ fn parents_keep_root_context_literal_provenance_and_codec_bounds() {
         let moved = tempfile::tempdir().unwrap();
         std::fs::rename(fixture.path(), moved.path().join("relocated")).unwrap();
         let (observed, _, terminal) = inspect_with_stat(
-            root.as_raw_fd(),
+            ResolutionRoot::Held(root.as_raw_fd()),
             directory.as_raw_fd(),
             Path::new("dir/link"),
             true,
@@ -159,7 +176,12 @@ fn native_parent_must_match_predecessor_and_original_child_edge() {
         std::fs::write(fixture.path().join("a/file"), b"DATA").unwrap();
         std::os::unix::fs::symlink("a/d/../file", fixture.path().join("entry")).unwrap();
         let root = File::open(fixture.path()).unwrap();
-        let result = inspect(root.as_raw_fd(), root.as_raw_fd(), Path::new("entry"), true);
+        let result = inspect(
+            ResolutionRoot::Held(root.as_raw_fd()),
+            root.as_raw_fd(),
+            Path::new("entry"),
+            true,
+        );
         if !supported(root.as_raw_fd()) {
             assert!(matches!(
                 result,
@@ -176,9 +198,10 @@ fn native_parent_must_match_predecessor_and_original_child_edge() {
             std::fs::create_dir(fixture.path().join("a/d")).unwrap();
         } else {
             let foreign = File::open(fixture.path().join("b")).unwrap();
-            original.resolution[0].named =
+            original.resolution[0].entry_mut().unwrap().named =
                 NativeObservation::from_stat(&stat_fd(foreign.as_raw_fd()).unwrap()).unwrap();
-            original.resolution[0].object_key = object_key(foreign.as_raw_fd(), None).unwrap();
+            original.resolution[0].entry_mut().unwrap().object_key =
+                object_key(foreign.as_raw_fd(), None).unwrap();
         }
         let stack = vec![(0, [0; 32]), (1, key([0; 32], OsStr::new("a")))];
         let result = native_parent(
@@ -304,8 +327,12 @@ fn parent_replay_or_refusal_keeps_constant_descriptors_on_deep_paths() {
     if let Some(root) = std::env::var_os(CHILD) {
         let root = File::open(Path::new(&root)).unwrap();
         for _ in 0..8 {
-            let result =
-                inspect_with_stat(root.as_raw_fd(), root.as_raw_fd(), Path::new("entry"), true);
+            let result = inspect_with_stat(
+                ResolutionRoot::Held(root.as_raw_fd()),
+                root.as_raw_fd(),
+                Path::new("entry"),
+                true,
+            );
             if !supported(root.as_raw_fd()) {
                 assert!(matches!(
                     result,
