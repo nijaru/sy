@@ -3,6 +3,66 @@ use crate::endpoint::source_root::SourceRoot;
 use crate::engine::namespace::NamespaceQualification;
 use futures::TryStreamExt;
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn missing_parent_declaration_neither_creates_nor_adopts_future_directories() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let destination_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source_dir.path().join("b")).unwrap();
+    std::fs::write(source_dir.path().join("b/original"), b"SOURCE").unwrap();
+    let source = SourceRoot::open(source_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    source
+        .entries(Default::default())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let effects = LocalSourceEffects::seal(&source).await.unwrap();
+    let rooted = RootedFs::open(destination_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let (mut rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
+    namespace
+        .qualify(crate::engine::namespace::NamespaceParent::Directory(
+            RelativePath::new("a/b").unwrap(),
+        ))
+        .await
+        .unwrap();
+    namespace.seal().await.unwrap();
+    let destination = operand::DestinationRoot::Present(rooted.clone());
+    let path = RelativePath::new("a/b/new").unwrap();
+    effects
+        .validate_effect(
+            &destination,
+            path.clone(),
+            SourceEffectKind::LeafPublication,
+        )
+        .await
+        .unwrap();
+    assert!(!destination_dir.path().join("a").exists());
+
+    // A declaration is not a lease or a creator receipt for any future parent.
+    std::os::unix::fs::symlink(source_dir.path(), destination_dir.path().join("a")).unwrap();
+    assert!(
+        matches!(effects.validate_effect(&destination, path.clone(), SourceEffectKind::LeafPublication).await,
+        Err(RootedFsError::DestinationChanged(changed)) if changed == Path::new("a"))
+    );
+    rooted.local_source_effects = Some(effects);
+    assert!(rooted.begin_staged_file_blocking(&path).is_err());
+    assert!(!source_dir.path().join("b/new").exists());
+    assert_eq!(
+        std::fs::read(source_dir.path().join("b/original")).unwrap(),
+        b"SOURCE"
+    );
+    assert_eq!(
+        std::fs::read_dir(source_dir.path().join("b"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn native_staging_repeats_original_validation_without_preflight_permission() {
     let source_dir = tempfile::tempdir().unwrap();

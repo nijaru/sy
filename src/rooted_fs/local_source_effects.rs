@@ -132,10 +132,24 @@ impl LocalSourceEffects {
                                 | SourceEffectKind::DirectoryNamespaceChange
                         ) =>
                 {
-                    // APFS's current namespace owner deliberately does not
-                    // certify native creation inheritance for a missing chain.
-                    // Do not project this held ancestor onto future parents.
-                    return self.refuse_native_effect_blocking(path);
+                    // Only new-only descendants can exist below this original
+                    // absent slot. Admit its actual namespace effect, not a
+                    // projected identity or name profile for future parents.
+                    self.admit_native_effect_blocking(SourceEffect {
+                        kind: SourceEffectKind::DirectoryNamespaceChange,
+                        parent: directory.as_raw_fd(),
+                        name,
+                        object: None,
+                        path: &prefix,
+                    })?;
+                    // Admission above qualifies this actual APFS volume. Plain
+                    // mkdir allocates new directory objects, not directory
+                    // aliases. Every materialized parent still needs its own
+                    // namespace binding and native SOURCE admission at use.
+                    if !ancestry::unique_directory_parents(directory.as_raw_fd())? {
+                        return self.refuse_native_effect_blocking(path);
+                    }
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             }

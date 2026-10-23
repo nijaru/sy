@@ -51,7 +51,7 @@ fn directory(fd: RawFd, object: NativeObjectKey) -> Result<Option<Directory>> {
 /// APFS has one native parent per directory. Require the volume capability
 /// query to corroborate the absence of directory hardlinks, not just its name.
 #[cfg(target_os = "macos")]
-fn unique_directory_parents(fd: RawFd) -> Result<bool> {
+pub(super) fn unique_directory_parents(fd: RawFd) -> Result<bool> {
     let mut attrs = libc::attrlist {
         bitmapcount: libc::ATTR_BIT_MAP_COUNT,
         reserved: 0,
@@ -191,6 +191,11 @@ mod tests {
         assert!(!excludes(root.as_raw_fd(), foreign_view, independent).unwrap());
         assert!(!excludes(root.as_raw_fd(), expected, foreign_view).unwrap());
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn unique_directory_parents(_fd: RawFd) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(not(target_os = "macos"))]
