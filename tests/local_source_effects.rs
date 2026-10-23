@@ -483,80 +483,81 @@ fn source_removal_follow_policy_keeps_regular_and_skipped_bindings_distinct() {
 #[cfg(target_os = "macos")]
 #[test]
 fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
-    for (target_alias, dots) in [(false, false), (true, false), (false, true), (true, true)] {
-        let fixture = tempfile::tempdir().unwrap();
-        let (source, destination) = directories(fixture.path());
-        for root in [&source, &destination] {
-            std::fs::create_dir_all(root.join("dir/deeper")).unwrap();
-        }
-        std::fs::write(source.join("dir/deeper/data"), b"SOURCE DATA").unwrap();
-        let target = if dots { "./dir/./bridge" } else { "dir/bridge" };
-        let bridge = if dots {
-            "./deeper/./data"
-        } else {
-            "deeper/data"
-        };
-        std::os::unix::fs::symlink(target, source.join("entry")).unwrap();
-        std::os::unix::fs::symlink(bridge, source.join("dir/bridge")).unwrap();
-        let names = ["entry", "dir/bridge", "dir/deeper/data"];
-        for name in names {
-            if target_alias && name == "entry" {
-                std::fs::hard_link(source.join("dir/deeper/data"), destination.join(name)).unwrap();
+    for (target, bridge) in [
+        ("dir/bridge", "deeper/data"),
+        ("./dir/./bridge", "./deeper/./data"),
+        (".//dir///.//bridge", ".//deeper///.//data"),
+    ] {
+        for target_alias in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let (source, destination) = directories(fixture.path());
+            for root in [&source, &destination] {
+                std::fs::create_dir_all(root.join("dir/deeper")).unwrap();
+            }
+            std::fs::write(source.join("dir/deeper/data"), b"SOURCE DATA").unwrap();
+            std::os::unix::fs::symlink(target, source.join("entry")).unwrap();
+            std::os::unix::fs::symlink(bridge, source.join("dir/bridge")).unwrap();
+            let names = ["entry", "dir/bridge", "dir/deeper/data"];
+            for name in names {
+                if target_alias && name == "entry" {
+                    std::fs::hard_link(source.join("dir/deeper/data"), destination.join(name))
+                        .unwrap();
+                } else {
+                    std::fs::write(destination.join(name), format!("OLD {name}")).unwrap();
+                }
+            }
+            let source_originals = names.map(|name| identity(&source.join(name)));
+            let old = names.map(|name| identity(&destination.join(name)));
+            let output = Command::new(env!("CARGO_BIN_EXE_sy"))
+                .arg(format!("{}/", source.display()))
+                .arg(&destination)
+                .args(["--copy-links", "--no-hooks", "--ignore-times", "--backup"])
+                .output()
+                .unwrap();
+            if target_alias {
+                refused(output);
+                assert_eq!(names.map(|name| identity(&destination.join(name))), old);
+                for name in names {
+                    assert!(!destination.join(format!("{name}~")).exists());
+                }
             } else {
-                std::fs::write(destination.join(name), format!("OLD {name}")).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                for name in names {
+                    assert_eq!(
+                        std::fs::read(destination.join(name)).unwrap(),
+                        b"SOURCE DATA"
+                    );
+                    assert!(!std::fs::symlink_metadata(destination.join(name))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink());
+                    assert_eq!(
+                        std::fs::read(destination.join(format!("{name}~"))).unwrap(),
+                        format!("OLD {name}").as_bytes()
+                    );
+                }
             }
-        }
-        let source_originals = names.map(|name| identity(&source.join(name)));
-        let old = names.map(|name| identity(&destination.join(name)));
-        let output = Command::new(env!("CARGO_BIN_EXE_sy"))
-            .arg(format!("{}/", source.display()))
-            .arg(&destination)
-            .args(["--copy-links", "--no-hooks", "--ignore-times", "--backup"])
-            .output()
-            .unwrap();
-        if target_alias {
-            refused(output);
-            assert_eq!(names.map(|name| identity(&destination.join(name))), old);
-            for name in names {
-                assert!(!destination.join(format!("{name}~")).exists());
-            }
-        } else {
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
+            assert_eq!(
+                names.map(|name| identity(&source.join(name))),
+                source_originals
             );
-            for name in names {
-                assert_eq!(
-                    std::fs::read(destination.join(name)).unwrap(),
-                    b"SOURCE DATA"
-                );
-                assert!(!std::fs::symlink_metadata(destination.join(name))
+            assert_eq!(
+                std::fs::read_link(source.join("entry"))
                     .unwrap()
-                    .file_type()
-                    .is_symlink());
-                assert_eq!(
-                    std::fs::read(destination.join(format!("{name}~"))).unwrap(),
-                    format!("OLD {name}").as_bytes()
-                );
-            }
+                    .as_os_str(),
+                Path::new(target).as_os_str()
+            );
+            assert_eq!(
+                std::fs::read_link(source.join("dir/bridge"))
+                    .unwrap()
+                    .as_os_str(),
+                Path::new(bridge).as_os_str()
+            );
         }
-        assert_eq!(
-            names.map(|name| identity(&source.join(name))),
-            source_originals
-        );
-        assert_eq!(
-            std::fs::read_link(source.join("entry"))
-                .unwrap()
-                .as_os_str(),
-            Path::new(target).as_os_str()
-        );
-        assert_eq!(
-            std::fs::read_link(source.join("dir/bridge"))
-                .unwrap()
-                .as_os_str(),
-            Path::new(bridge).as_os_str()
-        );
     }
 }
 

@@ -12,84 +12,84 @@ fn request() -> crate::engine::scan::ScanRequest {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn forward_file_and_nested_chain_keep_exact_physical_membership() {
-    for (rooted_scanner, dots) in [(false, false), (true, false), (false, true), (true, true)] {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("dir/deeper")).unwrap();
-        std::fs::write(root.path().join("dir/deeper/data"), b"original DATA").unwrap();
-        let target = if dots { "./dir/./bridge" } else { "dir/bridge" };
-        let bridge = if dots {
-            "./deeper/./data"
-        } else {
-            "deeper/data"
-        };
-        std::os::unix::fs::symlink(target, root.path().join("entry")).unwrap();
-        std::os::unix::fs::symlink(bridge, root.path().join("dir/bridge")).unwrap();
-        let source = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
-        let rooted = source.rooted();
-        let entries = if rooted_scanner {
-            rooted.source_entry_stream(request())
-        } else {
-            source.entries(request())
-        }
-        .try_collect::<Vec<_>>()
-        .await
-        .unwrap();
-        assert_eq!(entries.len(), 5);
-        for name in ["entry", "dir/bridge", "dir/deeper/data"] {
-            let entry = entries
-                .iter()
-                .find(|entry| entry.path.as_path() == Path::new(name))
-                .unwrap();
-            assert!(entry.is_file());
-            assert_eq!(entry.size, b"original DATA".len() as u64);
-            let mut file = rooted.open_source_following_blocking(&entry.path).unwrap();
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).unwrap();
-            assert_eq!(bytes, b"original DATA");
-            let metadata = rooted
-                .source_entry_metadata_blocking(&entry.path, request())
-                .unwrap();
-            assert_eq!(metadata.identity, entry.identity);
-        }
-        let inventory = rooted.seal_source_inventory_blocking().unwrap();
-        assert_eq!(
-            inventory.record_count(),
-            6,
-            "native dots must not invent physical members"
-        );
-        {
-            let mut owner = rooted.source_observations.lock().unwrap();
-            let original = owner.active().unwrap().require(Path::new("entry")).unwrap();
-            assert_eq!(original.target.unwrap().as_os_str(), OsStr::new(target));
-            assert_eq!(
-                original
-                    .resolution
+    for (target, bridge, dots) in [
+        ("dir/bridge", "deeper/data", 0),
+        ("./dir/./bridge", "./deeper/./data", 4),
+        (".//dir///.//bridge", ".//deeper///.//data", 4),
+    ] {
+        for rooted_scanner in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(root.path().join("dir/deeper")).unwrap();
+            std::fs::write(root.path().join("dir/deeper/data"), b"original DATA").unwrap();
+            std::os::unix::fs::symlink(target, root.path().join("entry")).unwrap();
+            std::os::unix::fs::symlink(bridge, root.path().join("dir/bridge")).unwrap();
+            let source = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
+            let rooted = source.rooted();
+            let entries = if rooted_scanner {
+                rooted.source_entry_stream(request())
+            } else {
+                source.entries(request())
+            }
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+            assert_eq!(entries.len(), 5);
+            for name in ["entry", "dir/bridge", "dir/deeper/data"] {
+                let entry = entries
                     .iter()
-                    .filter(|step| step.name == OsStr::new("."))
-                    .count(),
-                if dots { 4 } else { 0 }
+                    .find(|entry| entry.path.as_path() == Path::new(name))
+                    .unwrap();
+                assert!(entry.is_file());
+                assert_eq!(entry.size, b"original DATA".len() as u64);
+                let mut file = rooted.open_source_following_blocking(&entry.path).unwrap();
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"original DATA");
+                let metadata = rooted
+                    .source_entry_metadata_blocking(&entry.path, request())
+                    .unwrap();
+                assert_eq!(metadata.identity, entry.identity);
+            }
+            let inventory = rooted.seal_source_inventory_blocking().unwrap();
+            assert_eq!(
+                inventory.record_count(),
+                6,
+                "target resolution must not invent physical members"
             );
+            {
+                let mut owner = rooted.source_observations.lock().unwrap();
+                let original = owner.active().unwrap().require(Path::new("entry")).unwrap();
+                assert_eq!(original.target.unwrap().as_os_str(), OsStr::new(target));
+                assert_eq!(
+                    original
+                        .resolution
+                        .iter()
+                        .filter(|step| step.name == OsStr::new("."))
+                        .count(),
+                    dots
+                );
+            }
+            inventory.validate_originals_blocking().unwrap();
+            assert!(inventory.excludes_objects_blocking(&[]).unwrap());
+            for name in [
+                "entry",
+                "dir",
+                "dir/bridge",
+                "dir/deeper",
+                "dir/deeper/data",
+            ] {
+                let path = RelativePath::new(name).unwrap();
+                let (parent, leaf) = rooted.open_parent_blocking(path.as_path()).unwrap();
+                let protected = object_key(parent.as_raw_fd(), Some(&leaf))
+                    .unwrap()
+                    .unwrap();
+                assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+            }
+            assert!(matches!(
+                rooted.check_source_removal_support_blocking(&RelativePath::new("entry").unwrap()),
+                Err(RootedFsError::SourceFollowRemovalUnsupported(_))
+            ));
         }
-        inventory.validate_originals_blocking().unwrap();
-        assert!(inventory.excludes_objects_blocking(&[]).unwrap());
-        for name in [
-            "entry",
-            "dir",
-            "dir/bridge",
-            "dir/deeper",
-            "dir/deeper/data",
-        ] {
-            let path = RelativePath::new(name).unwrap();
-            let (parent, leaf) = rooted.open_parent_blocking(path.as_path()).unwrap();
-            let protected = object_key(parent.as_raw_fd(), Some(&leaf))
-                .unwrap()
-                .unwrap();
-            assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
-        }
-        assert!(matches!(
-            rooted.check_source_removal_support_blocking(&RelativePath::new("entry").unwrap()),
-            Err(RootedFsError::SourceFollowRemovalUnsupported(_))
-        ));
     }
 }
 
@@ -211,7 +211,7 @@ async fn forward_discovery_never_closes_an_opaque_target_directory() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("dir")).unwrap();
     std::fs::write(root.path().join("dir/data"), b"DATA").unwrap();
-    std::os::unix::fs::symlink("./dir/./data", root.path().join("entry")).unwrap();
+    std::os::unix::fs::symlink(".//dir///.//data", root.path().join("entry")).unwrap();
     let source = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
     let rooted = source.rooted();
     source
@@ -296,9 +296,11 @@ fn forward_file_resolution_refuses_directory_links_and_lexical_shortcuts() {
         "escape/data",
         "dir/../dir/data",
         "dir/data/.",
-        "dir//data",
+        "dir//../dir/data",
         "dir/data/",
+        "dir//data//",
         "/dir/data",
+        "//dir/data",
         "../data",
         "dir/data/extra",
     ] {

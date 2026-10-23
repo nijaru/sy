@@ -67,15 +67,23 @@ pub(super) fn same_resolution(left: &[ResolutionStep], right: &[ResolutionStep])
     left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.matches(b))
 }
 
-// Preserve literal bytes and explicit native dots. Parent components,
-// repeated/trailing separators, absolute targets and directory links refuse.
+// Separators are not native components, but dots are: never use Path::components
+// to erase them. LinkTarget independently authenticates the complete literal.
+// Trailing separators require a DIR terminal, outside this FILE-only lane.
 fn forward_components(target: &Path) -> io::Result<VecDeque<OsString>> {
     let bytes = target.as_os_str().as_bytes();
-    if bytes.len() > MAX_TARGET {
+    if bytes.is_empty()
+        || bytes.len() > MAX_TARGET
+        || bytes.starts_with(b"/")
+        || bytes.ends_with(b"/")
+    {
         return Err(invalid());
     }
     let mut components = VecDeque::new();
-    for name in bytes.split(|byte| *byte == b'/') {
+    for name in bytes
+        .split(|byte| *byte == b'/')
+        .filter(|name| !name.is_empty())
+    {
         if components.len() == MAX_FOLLOW_STEPS
             || (name != b"." && sibling_name(Path::new(OsStr::from_bytes(name))).is_none())
         {
@@ -315,7 +323,7 @@ mod tests {
 
     #[test]
     fn forward_components_preserve_raw_bytes_and_bound_active_depth() {
-        let raw = Path::new(OsStr::from_bytes(b"dir-\xff/file-\xfe"));
+        let raw = Path::new(OsStr::from_bytes(b"dir-\xff///file-\xfe"));
         assert_eq!(
             forward_components(raw).unwrap(),
             VecDeque::from([
@@ -323,7 +331,21 @@ mod tests {
                 OsString::from(OsStr::from_bytes(b"file-\xfe")),
             ])
         );
-        let bounded = vec!["d"; MAX_FOLLOW_STEPS].join("/");
+        assert_eq!(
+            forward_components(Path::new(".//dir///.//file")).unwrap(),
+            VecDeque::from([".", "dir", ".", "file"].map(OsString::from))
+        );
+        for invalid in [
+            "",
+            "/file",
+            "//file",
+            "dir//file/",
+            "dir//../file",
+            "dir//bad\0file",
+        ] {
+            assert!(forward_components(Path::new(invalid)).is_err());
+        }
+        let bounded = vec!["d"; MAX_FOLLOW_STEPS].join("//");
         assert_eq!(
             forward_components(Path::new(&bounded)).unwrap().len(),
             MAX_FOLLOW_STEPS
