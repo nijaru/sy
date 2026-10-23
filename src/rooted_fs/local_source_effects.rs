@@ -1,6 +1,7 @@
 //! LOCAL exclusion admission through original SOURCE and held native effects.
 use super::*;
 use source_observations::inventory::SourceInventory;
+pub(super) mod ancestry;
 pub(super) mod native_object;
 use native_object::object_key;
 #[cfg(test)]
@@ -17,6 +18,8 @@ pub enum SourceEffectKind {
     PrivateDirectoryMetadata,
     DirectoryNamespaceChange,
     InodeMetadata,
+    /// Directory access/inheritance policy needs physical ancestor exclusion.
+    DirectoryPolicy,
     /// Only target directory mtime/ctime, never access or inheritance policy.
     DirectoryTimestamp,
     LinkCountChange,
@@ -230,6 +233,33 @@ impl LocalSourceEffects {
                     }
                 }
                 candidates.push(named_key);
+            }
+            SourceEffectKind::DirectoryPolicy => {
+                let named = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;
+                let opened = if effect.object.is_none() {
+                    Some(source_observations::operator::directory_at(
+                        effect.parent,
+                        effect.name,
+                    )?)
+                } else {
+                    None
+                };
+                let fd = effect
+                    .object
+                    .or_else(|| opened.as_ref().map(AsRawFd::as_raw_fd))
+                    .ok_or_else(unknown)?;
+                let held = stat_fd(fd)?;
+                let object = object_key(fd, None)?.ok_or_else(unknown)?;
+                if held.st_mode & libc::S_IFMT != libc::S_IFDIR
+                    || !staging::same_inode(&held, &named)
+                    || object_key(effect.parent, Some(effect.name))? != Some(object)
+                    || !self
+                        .inventory
+                        .excludes_directory_ancestors_blocking(object)?
+                {
+                    return Err(unknown());
+                }
+                candidates.push(object);
             }
             SourceEffectKind::DirectoryTimestamp => {
                 let named = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;

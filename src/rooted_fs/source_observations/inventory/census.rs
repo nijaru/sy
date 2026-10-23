@@ -141,6 +141,46 @@ impl Catalogue {
 }
 
 impl SourceInventory {
+    /// Physical ancestor exclusion is additional to the complete object census,
+    /// not a replacement for it. Qualify only the original held ROOT's prefix.
+    pub(in crate::rooted_fs) fn excludes_directory_ancestors_blocking(
+        &self,
+        candidate: NativeObjectKey,
+    ) -> Result<bool> {
+        self.rooted.verify_source_root_path_blocking()?;
+        let mut owner = self
+            .rooted
+            .source_observations
+            .lock()
+            .map_err(|_| RootedFsError::SourceCatalogueTerminal)?;
+        let c = owner.active()?;
+        c.begin()?;
+        let result = (|| {
+            if !c.sealed || c.scanning || c.count != self.count {
+                return Err(RootedFsError::SourceInventoryIncomplete);
+            }
+            if c.scope != Some(SourceRootProtection::Tree) {
+                return Ok(false);
+            }
+            if !c.excludes_operator_ancestors(&self.rooted, candidate)? {
+                return Ok(false);
+            }
+            let root = c.require(Path::new(""))?;
+            let Some(expected) = root.object_key else {
+                return Ok(false);
+            };
+            crate::rooted_fs::local_source_effects::ancestry::excludes(
+                self.rooted.root_fd.as_raw_fd(),
+                expected,
+                candidate,
+            )
+        })();
+        if result.is_ok() {
+            c.healthy = true;
+        }
+        result
+    }
+
     /// No DATA reads, no outside-root candidate mount opens. Object absence is
     /// meaningful only in this complete original, single native APFS view.
     /// It certifies object absence, not directory retirement or independence

@@ -83,6 +83,11 @@ impl SyncPlan {
                         SyncOp::Create { .. } if operation.source().is_directory() => {
                             SourceEffectKind::DirectoryNamespaceChange
                         }
+                        SyncOp::Metadata { .. } | SyncOp::Unchanged { .. }
+                            if operation.source().is_directory() =>
+                        {
+                            SourceEffectKind::DirectoryPolicy
+                        }
                         SyncOp::Metadata { .. } | SyncOp::Unchanged { .. } => {
                             SourceEffectKind::InodeMetadata
                         }
@@ -130,10 +135,12 @@ impl SyncPlan {
                     .validate_effect(
                         destination_root,
                         metadata.path,
-                        if !extended_preservation && metadata.unix_mode.is_none() {
+                        if metadata.target == DirectoryTarget::Create {
+                            SourceEffectKind::DirectoryNamespaceChange
+                        } else if !extended_preservation && metadata.unix_mode.is_none() {
                             SourceEffectKind::DirectoryTimestamp
                         } else {
-                            SourceEffectKind::InodeMetadata
+                            SourceEffectKind::DirectoryPolicy
                         },
                     )
                     .await

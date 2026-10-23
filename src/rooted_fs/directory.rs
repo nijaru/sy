@@ -114,7 +114,7 @@ impl RootedFs {
                 kind: if timestamp_only {
                     SourceEffectKind::DirectoryTimestamp
                 } else {
-                    SourceEffectKind::InodeMetadata
+                    SourceEffectKind::DirectoryPolicy
                 },
                 parent: parent.as_raw_fd(),
                 name: &leaf,

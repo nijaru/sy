@@ -261,11 +261,55 @@ fn directory_setter_only_plan_is_admitted_before_finalization() {
     )
     .unwrap();
     let before = identity(&destination.join("dir"));
-    refused(sync(&source, &destination, &["-p"]));
-    assert_eq!(identity(&destination.join("dir")), before);
-    assert_eq!(
-        std::fs::metadata(destination.join("dir")).unwrap().mode() & 0o777,
-        0o755
+    let source_before = identity(&source.join("dir"));
+    let output = sync(&source, &destination, &["-p"]);
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after = identity(&destination.join("dir"));
+        assert_eq!((after.0, after.1, after.2), (before.0, before.1, before.2));
+        assert_eq!(
+            std::fs::metadata(destination.join("dir")).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        refused(output);
+        assert_eq!(identity(&destination.join("dir")), before);
+    }
+    assert_eq!(identity(&source.join("dir")), source_before);
+}
+
+#[test]
+fn directory_policy_cannot_change_an_off_path_original_operator_ancestor() {
+    let fixture = tempfile::tempdir().unwrap();
+    let physical = fixture.path().join("physical");
+    let source = physical.join("root");
+    let operator = fixture.path().join("operator");
+    std::fs::create_dir_all(source.join("operator")).unwrap();
+    std::fs::create_dir(&operator).unwrap();
+    std::fs::set_permissions(
+        source.join("operator"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    std::fs::set_permissions(&operator, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(source.join("a-file"), b"SOURCE").unwrap();
+    std::os::unix::fs::symlink(&physical, operator.join("alias")).unwrap();
+    let before = identity(&operator);
+    let source_before = identity(&source.join("a-file"));
+    refused(sync(&operator.join("alias/root"), fixture.path(), &["-p"]));
+    assert_eq!(identity(&operator), before);
+    assert_eq!(std::fs::metadata(&operator).unwrap().mode() & 0o777, 0o755);
+    assert_eq!(identity(&source.join("a-file")), source_before);
+    assert!(
+        !fixture.path().join("a-file").exists(),
+        "whole-plan admission must precede copies"
     );
 }
 

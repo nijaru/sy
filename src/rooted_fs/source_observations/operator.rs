@@ -34,6 +34,7 @@ enum LeafData {
 enum ReplayPurpose {
     Address(LeafData),
     Root,
+    DirectoryPolicy(NativeObjectKey),
 }
 
 enum ReplayedAddress {
@@ -59,7 +60,7 @@ fn record_key(ordinal: u64) -> [u8; 32] {
 
 /// Ancestors need search/metadata authority, not directory enumeration. The
 /// selected tree's read descriptor is acquired separately through this cursor.
-pub(super) fn directory_at(parent: RawFd, name: &OsStr) -> Result<OwnedFd> {
+pub(in crate::rooted_fs) fn directory_at(parent: RawFd, name: &OsStr) -> Result<OwnedFd> {
     let name = component_cstring(name)?;
     #[cfg(target_os = "linux")]
     let access = libc::O_PATH;
@@ -365,7 +366,7 @@ impl Catalogue {
     ) -> Result<ReplayedAddress> {
         let data = match purpose {
             ReplayPurpose::Address(data) => data,
-            ReplayPurpose::Root => LeafData::CurrentRun,
+            ReplayPurpose::Root | ReplayPurpose::DirectoryPolicy(_) => LeafData::CurrentRun,
         };
         let address = self
             .operator
@@ -623,7 +624,24 @@ impl Catalogue {
                     cursor = Some(next);
                 }
             }
-            if ordinal == root && matches!(purpose, ReplayPurpose::Root) {
+            if let ReplayPurpose::DirectoryPolicy(candidate) = purpose {
+                let fd = cursor.as_ref().ok_or_else(invalid)?.as_raw_fd();
+                let object = object_key(fd, None)?.ok_or_else(|| {
+                    RootedFsError::SourceEffectUnqualified(rooted.root_path.as_ref().clone())
+                })?;
+                // Logical operator ancestors may be outside the physical ROOT
+                // chain (e.g. before a symlink). Protect those actual objects
+                // too; a mixed view of the same real volume remains unknown.
+                if object.0[..16] == candidate.0[..16]
+                    && (object.0[16..24] != candidate.0[16..24]
+                        || object.0[24..] == candidate.0[24..])
+                {
+                    return Err(RootedFsError::SourceEffectUnqualified(
+                        rooted.root_path.as_ref().clone(),
+                    ));
+                }
+            }
+            if ordinal == root && !matches!(purpose, ReplayPurpose::Address(_)) {
                 if ordinal == count - 1 && offset != end {
                     return Err(invalid().into());
                 }
@@ -795,6 +813,23 @@ impl Catalogue {
             named: original.effective,
             object_key: expected_key,
         })
+    }
+
+    pub(super) fn excludes_operator_ancestors(
+        &mut self,
+        rooted: &RootedFs,
+        candidate: NativeObjectKey,
+    ) -> Result<bool> {
+        if self.operator.is_none() {
+            return Ok(false);
+        }
+        let result = self.walk_operator(rooted, ReplayPurpose::DirectoryPolicy(candidate));
+        match self.operator_result(rooted, result) {
+            Ok(_) => Ok(true),
+            // An overlapping/unqualified effect is not damaged SOURCE evidence.
+            Err(RootedFsError::SourceEffectUnqualified(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     fn operator_result<T>(&mut self, rooted: &RootedFs, result: Result<T>) -> Result<T> {
