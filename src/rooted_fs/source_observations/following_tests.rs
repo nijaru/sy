@@ -16,7 +16,12 @@ fn sibling_chain_bounds_cycles_and_unsupported_targets() {
             std::os::unix::fs::symlink(target, root.path().join(format!("link-{index}"))).unwrap();
         }
         let parent = File::open(root.path()).unwrap();
-        let result = inspect(parent.as_raw_fd(), Path::new("link-0"), true);
+        let result = inspect(
+            parent.as_raw_fd(),
+            parent.as_raw_fd(),
+            Path::new("link-0"),
+            true,
+        );
         if length <= MAX_FOLLOW_LINKS {
             let observation = result.unwrap();
             assert_eq!(observation.resolution.len(), length);
@@ -50,7 +55,7 @@ fn sibling_chain_bounds_cycles_and_unsupported_targets() {
         std::os::unix::fs::symlink(target, root.path().join("middle")).unwrap();
         let parent = File::open(root.path()).unwrap();
         assert!(matches!(
-            inspect(parent.as_raw_fd(), Path::new("first"), true),
+            inspect(parent.as_raw_fd(), parent.as_raw_fd(), Path::new("first"), true),
             Err(RootedFsError::SourceFollowUnsupported(path)) if path == Path::new("first")
         ));
     }
@@ -66,7 +71,13 @@ fn original_and_resolution_link_literals_compare_exact_raw_bytes() {
         let root = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(literal, root.path().join("link")).unwrap();
         let parent = File::open(root.path()).unwrap();
-        let original = inspect(parent.as_raw_fd(), Path::new("link"), false).unwrap();
+        let original = inspect(
+            parent.as_raw_fd(),
+            parent.as_raw_fd(),
+            Path::new("link"),
+            false,
+        )
+        .unwrap();
         let mut other = Observation::decode(&original.encode()).unwrap();
         assert_eq!(
             other.target.as_ref().unwrap().as_os_str(),
@@ -164,7 +175,13 @@ fn sibling_chain_codec_rejects_truncation_unbounded_and_disconnected_hops() {
     std::os::unix::fs::symlink("middle", root.path().join("first")).unwrap();
     std::os::unix::fs::symlink("data", root.path().join("middle")).unwrap();
     let parent = File::open(root.path()).unwrap();
-    let mut observation = inspect(parent.as_raw_fd(), Path::new("first"), true).unwrap();
+    let mut observation = inspect(
+        parent.as_raw_fd(),
+        parent.as_raw_fd(),
+        Path::new("first"),
+        true,
+    )
+    .unwrap();
     let bytes = observation.encode();
     for length in 0..bytes.len() {
         assert!(Observation::decode(&bytes[..length]).is_err());

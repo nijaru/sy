@@ -234,8 +234,13 @@ fn forward_resolver_replays_deep_targets_under_low_fd_limit() {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let parent = File::open(Path::new(&root)).unwrap();
         for _ in 0..8 {
-            let (observation, _, terminal) =
-                inspect_with_stat(parent.as_raw_fd(), Path::new("entry"), true).unwrap();
+            let (observation, _, terminal) = inspect_with_stat(
+                parent.as_raw_fd(),
+                parent.as_raw_fd(),
+                Path::new("entry"),
+                true,
+            )
+            .unwrap();
             assert_eq!(observation.resolution.len(), 65);
             assert!(observation.matches(&Observation::decode(&observation.encode()).unwrap(), true));
             let terminal = terminal.unwrap();
@@ -294,9 +299,9 @@ fn forward_file_resolution_refuses_directory_links_and_lexical_shortcuts() {
     let parent = File::open(root.path()).unwrap();
     for target in [
         "escape/data",
-        "dir/../dir/data",
+        "dir/../../dir/data",
         "dir/data/.",
-        "dir//../dir/data",
+        "dir//../../dir/data",
         "dir/data/",
         "dir//data//",
         "/dir/data",
@@ -306,7 +311,12 @@ fn forward_file_resolution_refuses_directory_links_and_lexical_shortcuts() {
     ] {
         std::os::unix::fs::symlink(target, root.path().join("entry")).unwrap();
         assert!(matches!(
-            inspect(parent.as_raw_fd(), Path::new("entry"), true),
+            inspect(
+                parent.as_raw_fd(),
+                parent.as_raw_fd(),
+                Path::new("entry"),
+                true
+            ),
             Err(RootedFsError::SourceFollowUnsupported(_))
         ));
         std::fs::remove_file(root.path().join("entry")).unwrap();

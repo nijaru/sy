@@ -20,11 +20,12 @@ const MAX_RECORD: usize = 32
     + MAX_TARGET
     + 4
     + MAX_FOLLOW_STEPS * (4 + 64 + 32 + 4)
-    + MAX_TARGET;
+    + MAX_TARGET
+    + 4;
 use super::local_source_effects::native_object::{object_key, NativeObjectKey};
 
 mod following;
-use following::{inspect_forward_file, same_resolution, ResolutionStep};
+use following::{inspect_relative_file, same_resolution, ResolutionStep};
 pub(super) mod inventory;
 pub(super) mod operator;
 use inventory::SourceRootProtection;
@@ -146,6 +147,7 @@ struct Observation {
     followed_object_key: Option<NativeObjectKey>,
     target: Option<LinkTarget>,
     // Followed DIR/LINK/FILE observations are provenance, not inventory members.
+    resolution_start: usize,
     resolution: Vec<ResolutionStep>,
 }
 impl Observation {
@@ -170,6 +172,7 @@ impl Observation {
                 bytes.extend_from_slice(target);
             }
         }
+        bytes.extend_from_slice(&(self.resolution_start as u32).to_le_bytes());
         bytes.extend_from_slice(&(self.resolution.len() as u32).to_le_bytes());
         for step in &self.resolution {
             step.encode(&mut bytes);
@@ -210,8 +213,9 @@ impl Observation {
                 length as usize,
             )?)))
         };
+        let resolution_start = u32::from_le_bytes(take(&mut bytes)?) as usize;
         let count = u32::from_le_bytes(take(&mut bytes)?) as usize;
-        if count > MAX_FOLLOW_STEPS {
+        if count > MAX_FOLLOW_STEPS || resolution_start > count {
             return Err(invalid());
         }
         let mut resolution = Vec::with_capacity(count);
@@ -230,6 +234,7 @@ impl Observation {
             object_key,
             followed_object_key,
             target,
+            resolution_start,
             resolution,
         };
         observation.validate_resolution()?;
@@ -244,6 +249,7 @@ impl Observation {
             && self.followed_object_key == current.followed_object_key
             && self.followed == current.followed
             && self.target == current.target
+            && self.resolution_start == current.resolution_start
             && same_resolution(&self.resolution, &current.resolution)
     }
 }
@@ -411,6 +417,7 @@ impl Catalogue {
                 object_key: object_key(root, None)?,
                 followed_object_key: None,
                 target: None,
+                resolution_start: 0,
                 resolution: Vec::new(),
             },
         )?;
@@ -566,11 +573,12 @@ fn observed_target_at(parent: RawFd, name: &OsStr, path: &Path) -> Result<LinkTa
     })
 }
 
-fn inspect(parent: RawFd, path: &Path, follow: bool) -> Result<Observation> {
-    inspect_with_stat(parent, path, follow).map(|(observation, _, _)| observation)
+fn inspect(root: RawFd, parent: RawFd, path: &Path, follow: bool) -> Result<Observation> {
+    inspect_with_stat(root, parent, path, follow).map(|(observation, _, _)| observation)
 }
 
 fn inspect_with_stat(
+    root: RawFd,
     parent: RawFd,
     path: &Path,
     follow: bool,
@@ -591,18 +599,20 @@ fn inspect_with_stat(
     } else {
         None
     };
-    let (effective, followed_object_key, stat, terminal, resolution) = if followed {
+    let (effective, followed_object_key, stat, terminal, resolution_start, resolution) = if followed
+    {
         let target = target.as_deref().ok_or_else(invalid)?;
-        let file = inspect_forward_file(parent, path, target)?;
+        let file = inspect_relative_file(root, parent, path, named, target)?;
         (
             NativeObservation::from_stat(&file.binding.stat)?,
             file.binding.object_key,
             file.binding.stat,
             Some(file.binding),
+            file.resolution_start,
             file.resolution,
         )
     } else {
-        (named, None, stat, None, Vec::new())
+        (named, None, stat, None, 0, Vec::new())
     };
     let object_key = finish_named_observation(parent, path, named)?;
     if let Some(original) = &target {
@@ -620,6 +630,7 @@ fn inspect_with_stat(
             object_key,
             followed_object_key,
             target,
+            resolution_start,
             resolution,
         },
         stat,
@@ -678,7 +689,7 @@ fn inspect_selected(
     effective: NativeObservation,
     followed_object_key: Option<NativeObjectKey>,
 ) -> Result<Observation> {
-    let mut observed = inspect(parent, path, false)?;
+    let mut observed = inspect(parent, parent, path, false)?;
     if observed.named.kind != libc::S_IFLNK as u64 {
         return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
     }
@@ -862,11 +873,11 @@ impl RootedFs {
                         terminal.object_key,
                     )
                 } else {
-                    inspect(parent, path, false)
+                    inspect(self.root_fd.as_raw_fd(), parent, path, false)
                 };
                 catalogue.original_link_result(self, path, result)
             }
-            None => inspect(parent, path, follow),
+            None => inspect(self.root_fd.as_raw_fd(), parent, path, follow),
         };
         let result = result.map_err(|error| match error {
             RootedFsError::SourceFollowUnsupported(_) if original.is_some() => {
@@ -1047,14 +1058,18 @@ impl Catalogue {
                     None,
                 )
             } else {
-                inspect_with_stat(directory.as_raw_fd(), &relative, original.followed).map_err(
-                    |error| match error {
-                        RootedFsError::SourceFollowUnsupported(_) if original.followed => {
-                            RootedFsError::SourceBindingChanged(relative.clone())
-                        }
-                        error => error,
-                    },
-                )?
+                inspect_with_stat(
+                    rooted.root_fd.as_raw_fd(),
+                    directory.as_raw_fd(),
+                    &relative,
+                    original.followed,
+                )
+                .map_err(|error| match error {
+                    RootedFsError::SourceFollowUnsupported(_) if original.followed => {
+                        RootedFsError::SourceBindingChanged(relative.clone())
+                    }
+                    error => error,
+                })?
             };
             // Own unlink continuation may change a file's ctime/nlink, never
             // its original binding or any link literal/ancestor observation.

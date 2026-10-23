@@ -20,7 +20,10 @@ impl Catalogue {
             if original.followed || original.named.kind != libc::S_IFDIR as u64 {
                 return Err(invalid().into());
             }
-            if !original.matches(&inspect(directory.as_raw_fd(), &relative, false)?, true) {
+            if !original.matches(
+                &inspect(root, directory.as_raw_fd(), &relative, false)?,
+                true,
+            ) {
                 return Err(RootedFsError::SourceBindingChanged(relative));
             }
             directory = open_dir_at(directory.as_raw_fd(), name)?;
@@ -39,11 +42,21 @@ impl Catalogue {
         {
             return Ok(false);
         }
-        let mut parent = original.parent;
+        let mut parent = [0; 32];
         for (index, step) in original.resolution.iter().enumerate() {
-            if step.name == OsStr::new(".") {
-                // Native `.` revisits the current physical directory. It is
-                // never a new named member, traversal EOF, or a ROOT lease.
+            if step.name == OsStr::new(".") || step.name == OsStr::new("..") {
+                // Native parent results must corroborate the original graph;
+                // neither dot creates membership, traversal EOF, or a ROOT lease.
+                if step.name == OsStr::new("..") {
+                    if parent == [0; 32] {
+                        return Err(invalid().into());
+                    }
+                    let current = self.get(parent)?.ok_or_else(invalid)?;
+                    if current.followed || current.named.kind != libc::S_IFDIR as u64 {
+                        return Ok(false);
+                    }
+                    parent = current.parent;
+                }
                 let member = self.get(parent)?.ok_or_else(invalid)?;
                 self.original_path(parent)?;
                 if step.named.kind != libc::S_IFDIR as u64
@@ -74,7 +87,10 @@ impl Catalogue {
                 if !member.followed
                     || member.effective != original.effective
                     || member.followed_object_key != original.followed_object_key
-                    || !same_resolution(&member.resolution, &original.resolution[index + 1..])
+                    || !same_resolution(
+                        &member.resolution[member.resolution_start..],
+                        &original.resolution[index + 1..],
+                    )
                 {
                     return Ok(false);
                 }
@@ -220,13 +236,18 @@ impl SourceInventory {
                     if c.original_at(ordinal)?.0 != child_key {
                         return Err(invalid().into());
                     }
-                    let current = inspect(directory.as_raw_fd(), &child_path, original.followed)
-                        .map_err(|error| match error {
-                            RootedFsError::SourceFollowUnsupported(_) if original.followed => {
-                                RootedFsError::SourceBindingChanged(child_path.clone())
-                            }
-                            error => error,
-                        })?;
+                    let current = inspect(
+                        self.rooted.root_fd.as_raw_fd(),
+                        directory.as_raw_fd(),
+                        &child_path,
+                        original.followed,
+                    )
+                    .map_err(|error| match error {
+                        RootedFsError::SourceFollowUnsupported(_) if original.followed => {
+                            RootedFsError::SourceBindingChanged(child_path.clone())
+                        }
+                        error => error,
+                    })?;
                     if !original.matches(&current, true) {
                         return Err(RootedFsError::SourceBindingChanged(child_path));
                     }

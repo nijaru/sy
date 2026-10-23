@@ -116,6 +116,7 @@ fn push(
         object_key: None,
         followed_object_key: None,
         target,
+        resolution_start: 0,
         resolution: Vec::new(),
     });
     Ok(())
@@ -184,7 +185,12 @@ pub(in crate::rooted_fs) fn acquire(
                 directory = selected.parent;
                 leaf = Some((selected.name, original));
             } else {
-                let original = inspect(directory.as_raw_fd(), Path::new(&name), false)?;
+                let original = inspect(
+                    directory.as_raw_fd(),
+                    directory.as_raw_fd(),
+                    Path::new(&name),
+                    false,
+                )?;
                 if !original.named.matches(named, true) {
                     return Err(RootedFsError::RootChanged(path));
                 }

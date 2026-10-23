@@ -483,10 +483,12 @@ fn source_removal_follow_policy_keeps_regular_and_skipped_bindings_distinct() {
 #[cfg(target_os = "macos")]
 #[test]
 fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
-    for (target, bridge) in [
-        ("dir/bridge", "deeper/data"),
-        ("./dir/./bridge", "./deeper/./data"),
-        (".//dir///.//bridge", ".//deeper///.//data"),
+    // Darwin BENEATH is not rename-safe; API presence is not parent support.
+    for (target, bridge, unsupported_parent) in [
+        ("dir/bridge", "deeper/data", false),
+        ("./dir/./bridge", "./deeper/./data", false),
+        (".//dir///.//bridge", ".//deeper///.//data", false),
+        ("dir/../dir/bridge", "../dir/deeper/data", true),
     ] {
         for target_alias in [false, true] {
             let fixture = tempfile::tempdir().unwrap();
@@ -514,8 +516,15 @@ fn forward_file_follow_copies_and_backs_up_without_adopting_physical_aliases() {
                 .args(["--copy-links", "--no-hooks", "--ignore-times", "--backup"])
                 .output()
                 .unwrap();
-            if target_alias {
-                refused(output);
+            if target_alias || unsupported_parent {
+                if unsupported_parent {
+                    assert!(
+                        !output.status.success(),
+                        "unqualified native parent traversal must refuse"
+                    );
+                } else {
+                    refused(output);
+                }
                 assert_eq!(names.map(|name| identity(&destination.join(name))), old);
                 for name in names {
                     assert!(!destination.join(format!("{name}~")).exists());

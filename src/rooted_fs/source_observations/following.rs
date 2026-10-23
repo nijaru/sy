@@ -1,4 +1,4 @@
-//! Forward relative FILE resolution through held no-follow directories. These
+//! ROOT-confined relative FILE resolution through held no-follow directories. These
 //! records are read provenance, never synthetic physical inventory or roots.
 use super::*;
 use std::collections::VecDeque;
@@ -67,10 +67,11 @@ pub(super) fn same_resolution(left: &[ResolutionStep], right: &[ResolutionStep])
     left.len() == right.len() && left.iter().zip(right).all(|(a, b)| a.matches(b))
 }
 
-// Separators are not native components, but dots are: never use Path::components
-// to erase them. LinkTarget independently authenticates the complete literal.
-// Trailing separators require a DIR terminal, outside this FILE-only lane.
-fn forward_components(target: &Path) -> io::Result<VecDeque<OsString>> {
+mod beneath;
+
+// Separator runs are not components; explicit dots and parents are. Authenticate
+// the original LinkTarget separately, never through Path's normalized equality.
+fn relative_components(target: &Path) -> io::Result<VecDeque<OsString>> {
     let bytes = target.as_os_str().as_bytes();
     if bytes.is_empty()
         || bytes.len() > MAX_TARGET
@@ -85,7 +86,9 @@ fn forward_components(target: &Path) -> io::Result<VecDeque<OsString>> {
         .filter(|name| !name.is_empty())
     {
         if components.len() == MAX_FOLLOW_STEPS
-            || (name != b"." && sibling_name(Path::new(OsStr::from_bytes(name))).is_none())
+            || (name != b"."
+                && name != b".."
+                && sibling_name(Path::new(OsStr::from_bytes(name))).is_none())
         {
             return Err(invalid());
         }
@@ -94,58 +97,115 @@ fn forward_components(target: &Path) -> io::Result<VecDeque<OsString>> {
     Ok(components)
 }
 
+type DirectoryStack = Vec<(usize, [u8; 32])>;
+
+fn add_bytes(size: &mut usize, count: usize) -> io::Result<()> {
+    *size = size
+        .checked_add(count)
+        .filter(|size| *size <= MAX_TARGET)
+        .ok_or_else(invalid)?;
+    Ok(())
+}
+
+// Indices identify authenticated edges, not FDs or native-parent certificates.
+fn enter_directory(
+    stack: &mut DirectoryStack,
+    parent: &mut [u8; 32],
+    steps: &[ResolutionStep],
+    index: usize,
+    step: &ResolutionStep,
+) -> io::Result<()> {
+    if step.name == OsStr::new("..") {
+        *parent = stack.pop().ok_or_else(invalid)?.1;
+    } else if step.name != OsStr::new(".") {
+        stack.push((index, *parent));
+        *parent = key(*parent, &step.name);
+        return Ok(());
+    }
+    if let Some((index, _)) = stack.last() {
+        let expected = steps.get(*index).ok_or_else(invalid)?;
+        if !expected.named.matches(step.named, true) || expected.object_key != step.object_key {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn visit_link(
+    visited: &mut Vec<([u8; 32], NativeObservation)>,
+    parent: [u8; 32],
+    named: NativeObservation,
+) -> io::Result<()> {
+    if visited.len() == MAX_FOLLOW_LINKS
+        || visited
+            .iter()
+            .any(|(scope, previous)| *scope == parent && previous.same_binding(named))
+    {
+        return Err(invalid());
+    }
+    visited.push((parent, named));
+    Ok(())
+}
+
 impl Observation {
     pub(super) fn validate_resolution(&self) -> io::Result<()> {
-        // Original operator-selected following has its own authenticated tape.
-        // It does not acquire descendant authority through an empty transcript.
+        // The original selected exception has its own authenticated operator tape.
         if self.resolution.is_empty() {
-            return Ok(());
+            return if self.resolution_start == 0 {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
         }
         if !self.followed
             || self.named.kind != libc::S_IFLNK as u64
             || self.effective.kind != libc::S_IFREG as u64
             || self.resolution.len() > MAX_FOLLOW_STEPS
+            || self.resolution_start >= self.resolution.len()
         {
             return Err(invalid());
         }
         let target = self.target.as_deref().ok_or_else(invalid)?;
-        let mut pending = forward_components(target)?;
+        let mut pending = relative_components(target)?;
         let mut size = target.as_os_str().len();
-        let mut links = 1;
-        let mut parent_start = 0;
-        for (index, step) in self.resolution.iter().enumerate() {
+        let mut parent = [0; 32];
+        let mut stack = Vec::new();
+        for (index, step) in self.resolution[..self.resolution_start].iter().enumerate() {
+            if sibling_name(Path::new(&step.name)).is_none()
+                || step.named.kind != libc::S_IFDIR as u64
+                || step.target.is_some()
+            {
+                return Err(invalid());
+            }
+            add_bytes(&mut size, step.name.len())?;
+            enter_directory(&mut stack, &mut parent, &self.resolution, index, step)?;
+        }
+        if parent != self.parent {
+            return Err(invalid());
+        }
+        let mut visited = vec![(parent, self.named)];
+        for (index, step) in self
+            .resolution
+            .iter()
+            .enumerate()
+            .skip(self.resolution_start)
+        {
             if pending.pop_front().as_ref() != Some(&step.name) {
                 return Err(invalid());
             }
-            size = size
-                .checked_add(step.name.len())
-                .filter(|size| *size <= MAX_TARGET)
-                .ok_or_else(invalid)?;
+            add_bytes(&mut size, step.name.len())?;
             match step.named.kind {
                 kind if kind == libc::S_IFDIR as u64
                     && !pending.is_empty()
                     && step.target.is_none() =>
                 {
-                    if step.name != OsStr::new(".") {
-                        parent_start = index + 1;
-                    }
+                    enter_directory(&mut stack, &mut parent, &self.resolution, index, step)?;
                 }
                 kind if kind == libc::S_IFLNK as u64 && pending.is_empty() => {
-                    links += 1;
-                    if links > MAX_FOLLOW_LINKS
-                        || (parent_start == 0 && step.name == self.name)
-                        || self.resolution[parent_start..index]
-                            .iter()
-                            .any(|previous| previous.named.same_binding(step.named))
-                    {
-                        return Err(invalid());
-                    }
+                    visit_link(&mut visited, parent, step.named)?;
                     let target = step.target.as_deref().ok_or_else(invalid)?;
-                    size = size
-                        .checked_add(target.as_os_str().len())
-                        .filter(|size| *size <= MAX_TARGET)
-                        .ok_or_else(invalid)?;
-                    pending = forward_components(target)?;
+                    add_bytes(&mut size, target.as_os_str().len())?;
+                    pending = relative_components(target)?;
                 }
                 kind if kind == libc::S_IFREG as u64
                     && pending.is_empty()
@@ -164,59 +224,118 @@ impl Observation {
 }
 
 pub(super) struct FollowedFile {
+    pub(super) resolution_start: usize,
     pub(super) binding: TerminalBinding,
     pub(super) resolution: Vec<ResolutionStep>,
 }
 
-pub(super) fn inspect_forward_file(
+pub(super) fn inspect_relative_file(
+    root: RawFd,
     parent: RawFd,
     path: &Path,
+    source: NativeObservation,
     target: &Path,
 ) -> Result<FollowedFile> {
     let unsupported = || RootedFsError::SourceFollowUnsupported(path.to_path_buf());
-    let mut pending = forward_components(target).map_err(|_| unsupported())?;
+    let mut pending = relative_components(target).map_err(|_| unsupported())?;
     let mut size = target.as_os_str().len();
-    let mut links = 1;
-    let mut resolution: Vec<ResolutionStep> = Vec::new();
-    let mut cursor = operator::directory_at(parent, OsStr::new("."))?;
-    let mut relative = path.parent().unwrap_or(Path::new("")).to_path_buf();
-    let mut parent_start = 0;
+    let mut resolution = Vec::new();
+    let mut cursor = operator::directory_at(root, OsStr::new("."))?;
+    let mut relative = PathBuf::new();
+    let mut raw = PathBuf::new();
+    let mut stack = Vec::new();
+    let mut parent_key = [0; 32];
+    for component in path.parent().unwrap_or(Path::new("")).components() {
+        let Component::Normal(name) = component else {
+            return Err(RootedFsError::InvalidRelativePath);
+        };
+        if resolution.len() == MAX_FOLLOW_STEPS {
+            return Err(unsupported());
+        }
+        add_bytes(&mut size, name.len()).map_err(|_| unsupported())?;
+        let stat = stat_at_no_follow(cursor.as_raw_fd(), name)
+            .map_err(|error| source_read_race(error, path))?;
+        let named = NativeObservation::from_stat(&stat)?;
+        if named.kind != libc::S_IFDIR as u64 {
+            return Err(unsupported());
+        }
+        let step = ResolutionStep {
+            name: name.to_os_string(),
+            named,
+            object_key: object_key(cursor.as_raw_fd(), Some(name))
+                .map_err(|error| source_read_race(error, path))?,
+            target: None,
+        };
+        cursor = open_recorded_directory(cursor.as_raw_fd(), path, &step)?;
+        relative.push(name);
+        raw.push(name);
+        enter_directory(
+            &mut stack,
+            &mut parent_key,
+            &resolution,
+            resolution.len(),
+            &step,
+        )?;
+        resolution.push(step);
+    }
+    if !NativeObservation::from_stat(&stat_fd(cursor.as_raw_fd())?)?
+        .same_binding(NativeObservation::from_stat(&stat_fd(parent)?)?)
+        || object_key(cursor.as_raw_fd(), None)? != object_key(parent, None)?
+    {
+        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
+    }
+    let resolution_start = resolution.len();
+    let mut visited = vec![(parent_key, source)];
     while let Some(name) = pending.pop_front() {
         if resolution.len() == MAX_FOLLOW_STEPS {
             return Err(unsupported());
         }
-        size = size
-            .checked_add(name.len())
-            .filter(|size| *size <= MAX_TARGET)
-            .ok_or_else(unsupported)?;
-        if name != OsStr::new(".") {
+        add_bytes(&mut size, name.len()).map_err(|_| unsupported())?;
+        let ascending = name == OsStr::new("..");
+        if ascending && stack.is_empty() {
+            return Err(unsupported());
+        }
+        if name != OsStr::new(".") && !ascending {
             inventory::validate_original_path(&relative.join(&name))?;
         }
-        let stat = stat_at_no_follow(cursor.as_raw_fd(), &name).map_err(|error| match error {
-            RootedFsError::Io(error) if error.raw_os_error() == Some(libc::ENOENT) => unsupported(),
-            error => error,
-        })?;
+        let returned_parent = if ascending {
+            Some(native_parent(
+                root,
+                path,
+                &resolution,
+                &stack,
+                cursor.as_raw_fd(),
+                &raw,
+            )?)
+        } else {
+            None
+        };
+        let (stat, object_key) = if let Some(parent) = &returned_parent {
+            (
+                stat_fd(parent.as_raw_fd())?,
+                object_key(parent.as_raw_fd(), None)?,
+            )
+        } else {
+            let stat =
+                stat_at_no_follow(cursor.as_raw_fd(), &name).map_err(|error| match error {
+                    RootedFsError::Io(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                        unsupported()
+                    }
+                    error => error,
+                })?;
+            let object_key = object_key(cursor.as_raw_fd(), Some(&name))
+                .map_err(|error| source_read_race(error, path))?;
+            (stat, object_key)
+        };
         let named = NativeObservation::from_stat(&stat)?;
-        let object_key = object_key(cursor.as_raw_fd(), Some(&name))
-            .map_err(|error| source_read_race(error, path))?;
         let target = match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR if !pending.is_empty() => None,
             libc::S_IFREG if pending.is_empty() => None,
-            libc::S_IFLNK if pending.is_empty() && links < MAX_FOLLOW_LINKS => {
-                if (parent_start == 0 && path.file_name() == Some(name.as_os_str()))
-                    || resolution[parent_start..]
-                        .iter()
-                        .any(|previous| previous.named.same_binding(named))
-                {
-                    return Err(unsupported());
-                }
+            libc::S_IFLNK if pending.is_empty() => {
+                visit_link(&mut visited, parent_key, named).map_err(|_| unsupported())?;
                 let target = observed_target_at(cursor.as_raw_fd(), &name, path)?;
-                size = size
-                    .checked_add(target.as_os_str().len())
-                    .filter(|size| *size <= MAX_TARGET)
-                    .ok_or_else(unsupported)?;
-                pending = forward_components(&target).map_err(|_| unsupported())?;
-                links += 1;
+                add_bytes(&mut size, target.as_os_str().len()).map_err(|_| unsupported())?;
+                pending = relative_components(&target).map_err(|_| unsupported())?;
                 Some(target)
             }
             _ => return Err(unsupported()),
@@ -227,22 +346,38 @@ pub(super) fn inspect_forward_file(
             object_key,
             target,
         };
-        validate_step(cursor.as_raw_fd(), path, &step)?;
-        if named.kind == libc::S_IFDIR as u64 {
-            let child = open_recorded_directory(cursor.as_raw_fd(), path, &step)?;
-            if step.name != OsStr::new(".") {
-                relative.push(&step.name);
-                parent_start = resolution.len() + 1;
+        if let Some(parent) = returned_parent {
+            // Keep the actual native BENEATH result, never the stack's guess.
+            validate_cursor(parent.as_raw_fd(), path, &step)?;
+            cursor = parent;
+        } else {
+            validate_step(cursor.as_raw_fd(), path, &step)?;
+            if named.kind == libc::S_IFDIR as u64 {
+                cursor = open_recorded_directory(cursor.as_raw_fd(), path, &step)?;
             }
-            cursor = child;
+        }
+        if named.kind == libc::S_IFDIR as u64 {
+            enter_directory(
+                &mut stack,
+                &mut parent_key,
+                &resolution,
+                resolution.len(),
+                &step,
+            )
+            .map_err(|_| unsupported())?;
+            raw.push(&step.name); // Includes every literal dot/parent; never cancel.
+            if ascending {
+                relative.pop();
+            } else if step.name != OsStr::new(".") {
+                relative.push(&step.name);
+            }
         }
         resolution.push(step);
         if named.kind == libc::S_IFREG as u64 {
-            // Replay authentic original bindings and return THAT actual cursor.
-            // Never discard the proof and reopen the terminal parent lexically.
             drop(cursor);
-            let binding = replay_resolution(parent, path, &resolution)?;
+            let binding = replay_resolution(root, path, &resolution)?;
             return Ok(FollowedFile {
+                resolution_start,
                 binding,
                 resolution,
             });
@@ -251,19 +386,22 @@ pub(super) fn inspect_forward_file(
     Err(unsupported())
 }
 
+fn validate_cursor(fd: RawFd, path: &Path, step: &ResolutionStep) -> Result<()> {
+    if !step
+        .named
+        .matches(NativeObservation::from_stat(&stat_fd(fd)?)?, true)
+        || object_key(fd, None)? != step.object_key
+    {
+        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
+    }
+    Ok(())
+}
+
 fn validate_step(parent: RawFd, path: &Path, step: &ResolutionStep) -> Result<libc::stat> {
     let stat =
         stat_at_no_follow(parent, &step.name).map_err(|error| source_read_race(error, path))?;
-    // A literal dot must name this actual held directory, not advance a
-    // projected path or acquire another parent/root authority.
-    if step.name == OsStr::new(".")
-        && (step.named.kind != libc::S_IFDIR as u64
-            || !step
-                .named
-                .matches(NativeObservation::from_stat(&stat_fd(parent)?)?, true)
-            || object_key(parent, None)? != step.object_key)
-    {
-        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
+    if step.name == OsStr::new(".") {
+        validate_cursor(parent, path, step)?;
     }
     if !step
         .named
@@ -284,27 +422,69 @@ fn validate_step(parent: RawFd, path: &Path, step: &ResolutionStep) -> Result<li
 fn open_recorded_directory(parent: RawFd, path: &Path, step: &ResolutionStep) -> Result<OwnedFd> {
     let child = operator::directory_at(parent, &step.name)
         .map_err(|error| source_read_race(error, path))?;
-    if !step.named.matches(
-        NativeObservation::from_stat(&stat_fd(child.as_raw_fd())?)?,
-        true,
-    ) || object_key(child.as_raw_fd(), None)? != step.object_key
-    {
-        return Err(RootedFsError::SourceBindingChanged(path.to_path_buf()));
-    }
+    validate_cursor(child.as_raw_fd(), path, step)?;
     validate_step(parent, path, step)?;
     Ok(child)
 }
 
+fn native_parent(
+    root: RawFd,
+    path: &Path,
+    steps: &[ResolutionStep],
+    stack: &DirectoryStack,
+    current: RawFd,
+    raw: &Path,
+) -> Result<OwnedFd> {
+    let (child, _) = stack
+        .last()
+        .ok_or_else(|| RootedFsError::SourceFollowUnsupported(path.to_path_buf()))?;
+    let parent = beneath::directory(root, &raw.join(".."), path)?;
+    let (expected, expected_key) = if stack.len() == 1 {
+        (
+            NativeObservation::from_stat(&stat_fd(root)?)?,
+            object_key(root, None)?,
+        )
+    } else {
+        let step = &steps[stack[stack.len() - 2].0];
+        (step.named, step.object_key)
+    };
+    if !expected.matches(
+        NativeObservation::from_stat(&stat_fd(parent.as_raw_fd())?)?,
+        true,
+    ) || expected_key != object_key(parent.as_raw_fd(), None)?
+    {
+        return Err(RootedFsError::SourceFollowUnsupported(path.to_path_buf()));
+    }
+    // Do not infer an inverse edge from object equality. The ROOT-bounded
+    // native replay above supplies parent semantics for THAT traversal.
+    let child = &steps[*child];
+    validate_cursor(current, path, child)?;
+    validate_step(parent.as_raw_fd(), path, child)?;
+    Ok(parent)
+}
+
 fn replay_resolution(
-    parent: RawFd,
+    root: RawFd,
     path: &Path,
     resolution: &[ResolutionStep],
 ) -> Result<TerminalBinding> {
-    let mut cursor = operator::directory_at(parent, OsStr::new("."))?;
-    for step in resolution {
+    let mut cursor = operator::directory_at(root, OsStr::new("."))?;
+    let mut raw = PathBuf::new();
+    let mut stack = Vec::new();
+    let mut parent_key = [0; 32];
+    for (index, step) in resolution.iter().enumerate() {
+        if step.name == OsStr::new("..") {
+            cursor = native_parent(root, path, resolution, &stack, cursor.as_raw_fd(), &raw)?;
+            validate_cursor(cursor.as_raw_fd(), path, step)?;
+            enter_directory(&mut stack, &mut parent_key, resolution, index, step)?;
+            raw.push(&step.name);
+            continue;
+        }
         let stat = validate_step(cursor.as_raw_fd(), path, step)?;
         if step.named.kind == libc::S_IFDIR as u64 {
             cursor = open_recorded_directory(cursor.as_raw_fd(), path, step)?;
+            enter_directory(&mut stack, &mut parent_key, resolution, index, step)?;
+            raw.push(&step.name);
         } else if step.named.kind == libc::S_IFREG as u64 {
             return Ok(TerminalBinding {
                 parent: cursor,
@@ -318,39 +498,34 @@ fn replay_resolution(
 }
 
 #[cfg(test)]
+mod parent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn forward_components_preserve_raw_bytes_and_bound_active_depth() {
+    fn relative_components_preserve_raw_bytes_and_bound_active_depth() {
         let raw = Path::new(OsStr::from_bytes(b"dir-\xff///file-\xfe"));
         assert_eq!(
-            forward_components(raw).unwrap(),
+            relative_components(raw).unwrap(),
             VecDeque::from([
                 OsString::from(OsStr::from_bytes(b"dir-\xff")),
-                OsString::from(OsStr::from_bytes(b"file-\xfe")),
+                OsString::from(OsStr::from_bytes(b"file-\xfe"))
             ])
         );
         assert_eq!(
-            forward_components(Path::new(".//dir///.//file")).unwrap(),
-            VecDeque::from([".", "dir", ".", "file"].map(OsString::from))
+            relative_components(Path::new(".//dir///..//file")).unwrap(),
+            VecDeque::from([".", "dir", "..", "file"].map(OsString::from))
         );
-        for invalid in [
-            "",
-            "/file",
-            "//file",
-            "dir//file/",
-            "dir//../file",
-            "dir//bad\0file",
-        ] {
-            assert!(forward_components(Path::new(invalid)).is_err());
+        for invalid in ["", "/file", "//file", "dir//file/", "dir//bad\0file"] {
+            assert!(relative_components(Path::new(invalid)).is_err());
         }
         let bounded = vec!["d"; MAX_FOLLOW_STEPS].join("//");
         assert_eq!(
-            forward_components(Path::new(&bounded)).unwrap().len(),
+            relative_components(Path::new(&bounded)).unwrap().len(),
             MAX_FOLLOW_STEPS
         );
-        assert!(forward_components(Path::new(&format!("{bounded}/d"))).is_err());
-        assert!(forward_components(Path::new(&"d".repeat(MAX_TARGET + 1))).is_err());
+        assert!(relative_components(Path::new(&format!("{bounded}/d"))).is_err());
+        assert!(relative_components(Path::new(&"d".repeat(MAX_TARGET + 1))).is_err());
     }
 }
