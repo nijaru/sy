@@ -69,7 +69,7 @@ impl LocalSourceEffects {
         .map_err(|error| RootedFsError::Worker(error.to_string()))?
     }
 
-    fn validate_originals_blocking(&self) -> Result<()> {
+    pub(super) fn validate_originals_blocking(&self) -> Result<()> {
         self.inventory
             .validate_originals_blocking()
             .map_err(|error| {
@@ -97,15 +97,15 @@ impl LocalSourceEffects {
                 rooted.verify_root_path_blocking()?;
                 effects.validate_declared_effect_blocking(&rooted, path.as_path(), kind)
             }
-            operand::DestinationRoot::Pending(_) => {
-                effects.refuse_native_effect_blocking(path.as_path())
+            operand::DestinationRoot::Pending(pending) => {
+                pending.declare_source_effect_blocking(&effects, path.as_path(), kind)
             }
         })
         .await
         .map_err(|error| RootedFsError::Worker(error.to_string()))?
     }
 
-    fn validate_declared_effect_blocking(
+    pub(super) fn validate_declared_effect_blocking(
         &self,
         rooted: &RootedFs,
         path: &Path,
@@ -326,7 +326,21 @@ impl LocalSourceEffects {
         Ok(parent)
     }
 
-    fn refuse_native_effect_blocking(&self, path: &Path) -> Result<()> {
+    pub(crate) fn complete_root_declarations(
+        &self,
+        destination: &operand::DestinationRoot,
+    ) -> Result<()> {
+        match destination {
+            operand::DestinationRoot::Present(_) => Ok(()),
+            operand::DestinationRoot::Pending(pending) => pending.complete_source_effects(self),
+        }
+    }
+
+    pub(super) fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inventory, &other.inventory)
+    }
+
+    pub(super) fn refuse_native_effect_blocking(&self, path: &Path) -> Result<()> {
         self.validate_originals_blocking()?;
         Err(RootedFsError::SourceEffectUnqualified(path.to_path_buf()))
     }

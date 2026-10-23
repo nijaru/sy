@@ -111,13 +111,17 @@ impl SyncPlan {
                     effects
                         .validate_effect(
                             destination_root,
-                            action.path,
+                            action.path.clone(),
                             SourceEffectKind::NamespaceRetirement,
                         )
                         .await
                         .map_err(|error| {
                             ControllerError::backend("LOCAL SOURCE delete effects", error)
-                        })
+                        })?;
+                    if action.kind == crate::engine::domain::EntryKind::File {
+                        validate_backup(effects, destination_root, backup, &action.path).await?;
+                    }
+                    Ok::<(), ControllerError>(())
                 })
                 .await?;
         }
@@ -149,6 +153,17 @@ impl SyncPlan {
                     })
             })
             .await?;
+        // No root can materialize on one declaration while a later member,
+        // backup, delete or directory policy remains unqualified.
+        effects
+            .complete_root_declarations(destination_root)
+            .map_err(|error| ControllerError::backend("LOCAL SOURCE root effects", error))?;
+        if let Some((_, Some(root))) = backup {
+            root.complete_local_source_effects(effects)
+                .map_err(|error| {
+                    ControllerError::backend("LOCAL SOURCE backup root effects", error)
+                })?;
+        }
         Ok(())
     }
 }
@@ -164,32 +179,41 @@ async fn validate_publication_and_backup(
         .validate_effect(destination_root, operation.path().clone(), kind)
         .await
         .map_err(|error| ControllerError::backend("LOCAL SOURCE effects", error))?;
+    if destination(operation).is_some_and(|old| old.is_file()) {
+        validate_backup(effects, destination_root, backup, operation.path()).await?;
+    }
+    Ok(())
+}
+
+async fn validate_backup(
+    effects: &LocalSourceEffects,
+    destination_root: &DestinationRoot,
+    backup: Option<&(BackupPolicy, Option<BackupRoot>)>,
+    path: &RelativePath,
+) -> Result<()> {
     if let Some((policy, root)) = backup {
-        if destination(operation).is_some_and(|old| old.is_file()) {
-            let address = policy
-                .destination(operation.path())
-                .map_err(|error| ControllerError::backend("LOCAL SOURCE backup address", error))?;
-            let result = match address {
-                BackupAddress::Main(path) => {
-                    effects
-                        .validate_effect(destination_root, path, SourceEffectKind::LeafPublication)
-                        .await
-                }
-                BackupAddress::FixedRoot(path) => {
-                    root.as_ref()
-                        .ok_or_else(|| {
-                            ControllerError::backend(
-                                "LOCAL SOURCE backup root",
-                                std::io::Error::other("missing original root"),
-                            )
-                        })?
-                        .validate_local_source_effect(effects, path)
-                        .await
-                }
-            };
-            result
-                .map_err(|error| ControllerError::backend("LOCAL SOURCE backup effects", error))?;
-        }
+        let address = policy
+            .destination(path)
+            .map_err(|error| ControllerError::backend("LOCAL SOURCE backup address", error))?;
+        let result = match address {
+            BackupAddress::Main(path) => {
+                effects
+                    .validate_effect(destination_root, path, SourceEffectKind::LeafPublication)
+                    .await
+            }
+            BackupAddress::FixedRoot(path) => {
+                root.as_ref()
+                    .ok_or_else(|| {
+                        ControllerError::backend(
+                            "LOCAL SOURCE backup root",
+                            std::io::Error::other("missing original root"),
+                        )
+                    })?
+                    .validate_local_source_effect(effects, path)
+                    .await
+            }
+        };
+        result.map_err(|error| ControllerError::backend("LOCAL SOURCE backup effects", error))?;
     }
     Ok(())
 }

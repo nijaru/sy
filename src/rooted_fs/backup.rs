@@ -45,6 +45,26 @@ impl BackupRoot {
             .await
     }
 
+    #[cfg(unix)]
+    pub(crate) fn complete_local_source_effects(
+        &self,
+        effects: &local_source_effects::LocalSourceEffects,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| RootedFsError::NamespaceCatalogueTerminal)?;
+        if !state.prepared {
+            // Unused backup capture errors are not effects of this plan.
+            return Ok(());
+        }
+        let original = state
+            .original
+            .as_ref()
+            .map_err(|error| RootedFsError::BackupRootCapture(Arc::clone(error)))?;
+        effects.complete_root_declarations(original)
+    }
+
     fn original(&self) -> Result<DestinationRoot> {
         let state = self
             .state

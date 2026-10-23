@@ -45,6 +45,94 @@ fn external_original_and_pending_backup_roots_publish_old_bytes() {
 }
 
 #[test]
+fn deletion_backups_are_admitted_even_without_an_updated_file() {
+    for pending in [false, true] {
+        for creates in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source = fixture.path().join("source");
+            let destination = fixture.path().join("destination");
+            let backup = fixture.path().join("backup/missing");
+            for root in [&source, &destination] {
+                std::fs::create_dir(root).unwrap();
+            }
+            if !pending {
+                std::fs::create_dir_all(&backup).unwrap();
+            }
+            if creates {
+                std::fs::write(source.join("a-new"), b"new bytes").unwrap();
+            }
+            std::fs::write(destination.join("z-stale"), b"retired bytes").unwrap();
+            let output = sync(
+                &source,
+                &destination,
+                &backup,
+                &["--delete", "--force-delete"],
+            );
+            assert!(
+                output.status.success(),
+                "pending={pending}, creates={creates}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!destination.join("z-stale").exists());
+            assert_eq!(
+                std::fs::read(backup.join("z-stale~")).unwrap(),
+                b"retired bytes"
+            );
+            assert_eq!(destination.join("a-new").exists(), creates);
+            if creates {
+                assert_eq!(
+                    std::fs::read(destination.join("a-new")).unwrap(),
+                    b"new bytes"
+                );
+                assert_eq!(std::fs::read(source.join("a-new")).unwrap(), b"new bytes");
+            }
+        }
+    }
+}
+
+#[test]
+fn deletion_backup_source_alias_refuses_before_earlier_publication() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    let destination = fixture.path().join("destination");
+    let backup = fixture.path().join("backup");
+    for root in [&source, &destination, &backup] {
+        std::fs::create_dir(root).unwrap();
+    }
+    std::fs::write(source.join("a-new"), b"new bytes").unwrap();
+    std::fs::write(source.join("protected"), b"original SOURCE").unwrap();
+    std::fs::write(destination.join("z-stale"), b"retired bytes").unwrap();
+    std::fs::hard_link(source.join("protected"), backup.join("z-stale~")).unwrap();
+    let identity = |path: &Path| {
+        let stat = std::fs::metadata(path).unwrap();
+        (stat.ino(), stat.nlink(), stat.ctime(), stat.ctime_nsec())
+    };
+    let before = identity(&source.join("protected"));
+    let output = sync(
+        &source,
+        &destination,
+        &backup,
+        &["--delete", "--force-delete", "--exclude=protected"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        !destination.join("a-new").exists(),
+        "failed complete admission published earlier work"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("z-stale")).unwrap(),
+        b"retired bytes"
+    );
+    assert_eq!(identity(&source.join("protected")), before);
+    assert_eq!(identity(&backup.join("z-stale~")), before);
+    assert_eq!(
+        std::fs::read(source.join("protected")).unwrap(),
+        b"original SOURCE"
+    );
+}
+
+#[test]
 fn unchanged_hardlink_topology_repair_keeps_backups_and_shared_retirement() {
     use std::os::unix::fs::MetadataExt;
     let fixture = tempfile::tempdir().unwrap();

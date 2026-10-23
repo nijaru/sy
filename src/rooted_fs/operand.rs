@@ -2,6 +2,9 @@
 use super::*;
 use crate::engine::domain::RelativePath;
 
+#[cfg(unix)]
+mod pending;
+
 #[derive(Debug, Clone)]
 pub enum SourceShape {
     Directory { basename: Option<RelativePath> },
@@ -34,6 +37,8 @@ pub struct PendingRoot {
     ancestor: RootedFs,
     path: PathBuf,
     missing: Vec<OsString>,
+    #[cfg(unix)]
+    source_creation: Arc<std::sync::Mutex<pending::CreationState>>,
 }
 
 impl PendingRoot {
@@ -120,6 +125,8 @@ impl DestinationRoot {
                 let prefix: PathBuf = pending.missing.iter().collect();
                 let (ancestor, proof) = pending.ancestor.with_namespace_prefix(prefix).await?;
                 pending.ancestor = ancestor;
+                // A new run's namespace proof cannot inherit old declarations.
+                pending.source_creation = Arc::default();
                 Ok((Self::Pending(pending), proof))
             }
         }
@@ -418,6 +425,7 @@ fn destination_root_blocking(path: PathBuf) -> Result<DestinationRoot> {
                     ancestor: rooted,
                     path,
                     missing,
+                    source_creation: Arc::default(),
                 }));
             }
             DestinationClassification::Leaf { present: true, .. } => {
@@ -438,6 +446,7 @@ fn destination_root_blocking(path: PathBuf) -> Result<DestinationRoot> {
                     ancestor,
                     path,
                     missing,
+                    source_creation: Arc::default(),
                 }));
             }
             DestinationClassification::MissingParent => {
@@ -454,92 +463,6 @@ fn destination_root_blocking(path: PathBuf) -> Result<DestinationRoot> {
                 candidate = parent(&candidate).to_path_buf();
             }
         }
-    }
-}
-
-#[cfg(unix)]
-impl PendingRoot {
-    fn acquire_blocking(self, local: bool) -> Result<RootedFs> {
-        self.acquire_checked(local, None)
-    }
-
-    fn acquire_checked(self, local: bool, backup_address: Option<&Path>) -> Result<RootedFs> {
-        self.ancestor.require_writable()?;
-        let mut fd = self.ancestor.root_fd.try_clone()?;
-        let mut prefix = PathBuf::new();
-        for name in &self.missing {
-            if local {
-                self.ancestor.verify_root_path_blocking()?;
-            }
-            prefix.push(name);
-            self.ancestor.verify_parent_binding_blocking(&prefix, &fd)?;
-            if stat_at_optional(fd.as_raw_fd(), name)?.is_some() {
-                return Err(RootedFsError::DestinationChanged(self.path));
-            }
-            let name_c = component_cstring(name)?;
-            self.ancestor
-                .namespace_predicts_absent(&prefix, fd.as_raw_fd())?;
-            if let Some(address) = backup_address {
-                self.ancestor.verify_backup_address_blocking(address)?;
-            }
-            // Pending root acquisition has not been admitted by LOCAL completed
-            // preflight. Ordinary in-root mkdir permission is not that contract.
-            let _permit = self.ancestor.admit_mutation_blocking(SourceEffect {
-                kind: SourceEffectKind::Unknown,
-                parent: fd.as_raw_fd(),
-                name,
-                object: None,
-                path: &prefix,
-            })?;
-            self.ancestor.verify_parent_binding_blocking(&prefix, &fd)?;
-            if let Some(address) = backup_address {
-                self.ancestor.verify_backup_address_blocking(address)?;
-            }
-            // SAFETY: fd is held, name_c is one live NUL-terminated component.
-            if unsafe { libc::mkdirat(fd.as_raw_fd(), name_c.as_ptr(), 0o777) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let observed = stat_at_optional(fd.as_raw_fd(), name)?
-                .ok_or_else(|| RootedFsError::DestinationChanged(self.path.clone()))?;
-            let child = open_dir_at(fd.as_raw_fd(), name)?;
-            let opened = stat_fd(child.as_raw_fd())?;
-            if observed.st_dev != opened.st_dev
-                || observed.st_ino != opened.st_ino
-                || observed.st_mode & libc::S_IFMT != libc::S_IFDIR
-            {
-                return Err(RootedFsError::DestinationChanged(self.path));
-            }
-            self.ancestor.advance_namespace_directory(
-                &prefix,
-                fd.as_raw_fd(),
-                child.as_raw_fd(),
-            )?;
-            fd = child;
-        }
-        if local {
-            self.ancestor.verify_root_path_blocking()?;
-        }
-        // Observational initial acquisition, not atomic creator ownership.
-        let (parent, leaf) = self.ancestor.open_parent_blocking(&prefix)?;
-        let current = open_dir_at(parent.as_raw_fd(), &leaf)?;
-        let observed = stat_fd(current.as_raw_fd())?;
-        let held = stat_fd(fd.as_raw_fd())?;
-        if observed.st_dev != held.st_dev || observed.st_ino != held.st_ino {
-            return Err(RootedFsError::DestinationChanged(self.path));
-        }
-        let mut rooted = RootedFs::from_operand_fd(self.path, fd);
-        rooted.mutation_admission = self.ancestor.mutation_admission;
-        rooted.run_admission = self.ancestor.run_admission;
-        rooted.local_source_effects = self.ancestor.local_source_effects;
-        rooted.retirement = self.ancestor.retirement;
-        #[cfg(test)]
-        {
-            rooted.mutation_pause = self.ancestor.mutation_pause;
-        }
-        rooted.destination_namespace = self.ancestor.destination_namespace;
-        rooted.namespace_qualification_required = self.ancestor.namespace_qualification_required;
-        rooted.namespace_prefix = self.ancestor.namespace_prefix.join(prefix);
-        Ok(rooted)
     }
 }
 

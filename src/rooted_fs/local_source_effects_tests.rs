@@ -408,6 +408,138 @@ async fn pending_root_guard_precedes_permanent_parent_creation() {
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
+async fn pending_root_admission_is_completed_and_bound_to_both_run_owners() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source_path = fixture.path().join("source");
+    std::fs::create_dir(&source_path).unwrap();
+    std::fs::write(source_path.join("original"), b"SOURCE").unwrap();
+    let source = SourceRoot::open(source_path.clone()).await.unwrap();
+    source
+        .entries(Default::default())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let effects = LocalSourceEffects::seal(&source).await.unwrap();
+    let foreign_effects = LocalSourceEffects::seal(&source).await.unwrap();
+    let missing = fixture.path().join("missing");
+    let bound = operand::BoundDestination::open(
+        missing.join("root"),
+        operand::SourceShape::Directory { basename: None },
+    )
+    .await
+    .unwrap();
+    let (bound, namespace) = bound.root.with_namespace_qualification().await.unwrap();
+    namespace.seal().await.unwrap();
+    effects
+        .validate_effect(
+            &bound,
+            RelativePath::new("file").unwrap(),
+            SourceEffectKind::LeafPublication,
+        )
+        .await
+        .unwrap();
+    let guarded = bound.with_local_source_effects(effects.clone());
+    assert!(
+        matches!(
+            guarded.clone().acquire_local().await,
+            Err(RootedFsError::SourceEffectUnqualified(_))
+        ),
+        "one declaration must not complete a plan"
+    );
+    assert!(!missing.exists());
+    assert!(matches!(
+        foreign_effects.complete_root_declarations(&guarded),
+        Err(RootedFsError::SourceEffectUnqualified(_))
+    ));
+    effects.complete_root_declarations(&guarded).unwrap();
+    assert!(
+        matches!(
+            guarded
+                .clone()
+                .with_local_source_effects(foreign_effects)
+                .acquire_local()
+                .await,
+            Err(RootedFsError::SourceEffectUnqualified(_))
+        ),
+        "equal observations do not transfer completed-plan authority"
+    );
+
+    let (fresh, namespace) = guarded
+        .clone()
+        .with_namespace_qualification()
+        .await
+        .unwrap();
+    namespace.seal().await.unwrap();
+    assert!(
+        matches!(
+            fresh.acquire_local().await,
+            Err(RootedFsError::SourceEffectUnqualified(_))
+        ),
+        "a new destination scope must not inherit old admission"
+    );
+    assert!(!missing.exists());
+
+    std::fs::write(source_path.join("original"), b"changed original SOURCE").unwrap();
+    assert!(
+        matches!(
+            guarded.acquire_local().await,
+            Err(RootedFsError::SourceBindingChanged(_))
+        ),
+        "completed preflight is not a lease on SOURCE"
+    );
+    assert!(!missing.exists());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn admitted_pending_root_does_not_adopt_a_late_source_alias() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source_path = fixture.path().join("source");
+    std::fs::create_dir(&source_path).unwrap();
+    std::fs::write(source_path.join("original"), b"SOURCE").unwrap();
+    let source = SourceRoot::open(source_path.clone()).await.unwrap();
+    source
+        .entries(Default::default())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let effects = LocalSourceEffects::seal(&source).await.unwrap();
+    let missing = fixture.path().join("missing");
+    let bound = operand::BoundDestination::open(
+        missing.join("root"),
+        operand::SourceShape::Directory { basename: None },
+    )
+    .await
+    .unwrap();
+    let (bound, namespace) = bound.root.with_namespace_qualification().await.unwrap();
+    namespace.seal().await.unwrap();
+    effects
+        .validate_effect(
+            &bound,
+            RelativePath::new("file").unwrap(),
+            SourceEffectKind::LeafPublication,
+        )
+        .await
+        .unwrap();
+    effects.complete_root_declarations(&bound).unwrap();
+    std::os::unix::fs::symlink(&source_path, &missing).unwrap();
+    assert!(matches!(
+        bound
+            .with_local_source_effects(effects)
+            .acquire_local()
+            .await,
+        Err(RootedFsError::DestinationChanged(_))
+    ));
+    assert!(!source_path.join("root").exists());
+    assert_eq!(
+        std::fs::read(source_path.join("original")).unwrap(),
+        b"SOURCE"
+    );
+    assert_eq!(std::fs::read_dir(&source_path).unwrap().count(), 1);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
 async fn regular_metadata_needs_both_object_absence_and_the_actual_named_fd() {
     let fixture = tempfile::tempdir().unwrap();
     let source_dir = fixture.path().join("source");
