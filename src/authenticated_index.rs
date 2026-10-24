@@ -6,7 +6,11 @@
 //! This is runtime authentication, not a crash-durability/recovery format.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(any(not(unix), test))]
+use std::io::Read;
+use std::io::{self, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 
 const LEVELS: usize = 64;
 const FANOUT: usize = 16;
@@ -143,16 +147,26 @@ impl<const N: usize> AuthenticatedIndex<N> {
 
     fn read(&mut self, locator: Locator) -> io::Result<Node<N>> {
         self.check_offset(locator.offset, 1)?;
-        self.file.seek(SeekFrom::Start(locator.offset))?;
         let mut bytes = [0; BRANCH_BYTES];
-        self.file.read_exact(&mut bytes[..1])?;
+        // Bound the read by the native-owned extent, not an untrusted tag. A
+        // packed leaf may include bytes from its neighbour in this one read;
+        // only its own authenticated frame is subsequently interpreted.
+        let available = (self.end - locator.offset).min(BRANCH_BYTES as u64);
+        let read_length = usize::try_from(available).map_err(|_| invalid(StateError::Offset))?;
+        #[cfg(unix)]
+        self.file
+            .read_exact_at(&mut bytes[..read_length], locator.offset)?;
+        #[cfg(not(unix))]
+        {
+            self.file.seek(SeekFrom::Start(locator.offset))?;
+            self.file.read_exact(&mut bytes[..read_length])?;
+        }
         let length = match bytes[0] {
             0 => BRANCH_BYTES,
             1 => Self::RECORD_BYTES,
             tag => return Err(invalid(StateError::Tag(tag))),
         };
         self.check_offset(locator.offset, length)?;
-        self.file.read_exact(&mut bytes[1..length])?;
         // Only the bounded framing tag/length is inspected before authentication.
         // Both mapping and payload must prove ancestry to the retained RAM root.
         if digest(&bytes[..length]) != locator.digest {

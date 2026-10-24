@@ -1,8 +1,10 @@
 //! Exact late membership, not a new scan/adoption or a subtree snapshot.
-//! One directory cursor and bounded ancestry descriptors; visited names spill
-//! into an authenticated radix so duplicate native records cannot hide removals.
+//! One directory cursor and bounded ancestry descriptors; exact visited ordinals
+//! use a bounded bitmap or spill into an authenticated radix.
 use super::*;
 use crate::fs_util::directory_stream::DirectoryStream;
+mod seen;
+use seen::SeenOriginals;
 
 impl Catalogue {
     pub(super) fn open_original_directory(&mut self, root: RawFd, path: &Path) -> Result<OwnedFd> {
@@ -277,7 +279,7 @@ impl SourceInventory {
                 return Ok(false);
             }
 
-            let mut seen = AuthenticatedIndex::<8>::new()?;
+            let mut seen = SeenOriginals::new(c.count)?;
             let mut total = 0u64;
             for ordinal in 0..c.count {
                 let (parent_key, parent) = c.original_at(ordinal)?;
@@ -315,10 +317,7 @@ impl SourceInventory {
                     let original = c
                         .get(child_key)?
                         .ok_or_else(|| RootedFsError::SourceBindingChanged(child_path.clone()))?;
-                    if original.parent != parent_key
-                        || original.name != name
-                        || seen.get_bytes(child_key)?.is_some()
-                    {
+                    if original.parent != parent_key || original.name != name {
                         return Err(RootedFsError::SourceBindingChanged(child_path));
                     }
                     // Authenticate ordinal membership too; a parent/name lookup
@@ -334,6 +333,9 @@ impl SourceInventory {
                         u64::from_le_bytes(position[..8].try_into().map_err(|_| invalid())?);
                     if c.original_at(ordinal)?.0 != child_key {
                         return Err(invalid().into());
+                    }
+                    if !seen.insert(child_key, ordinal)? {
+                        return Err(RootedFsError::SourceBindingChanged(child_path));
                     }
                     let current = inspect(
                         ResolutionRoot::Catalogued {
@@ -353,7 +355,6 @@ impl SourceInventory {
                     if !original.matches(&current, true) {
                         return Err(RootedFsError::SourceBindingChanged(child_path));
                     }
-                    seen.set_bytes(child_key, ordinal.to_le_bytes())?;
                     count = count.checked_add(1).ok_or_else(invalid)?;
                     if count > expected {
                         return Err(RootedFsError::SourceBindingChanged(path));
@@ -371,7 +372,7 @@ impl SourceInventory {
             // Exact exhaustion of every ORIGINAL, not merely an enumeration count.
             for ordinal in 1..c.count {
                 let (key, _) = c.original_at(ordinal)?;
-                if seen.get_bytes(key)? != Some(ordinal.to_le_bytes()) {
+                if !seen.contains(key, ordinal)? {
                     return Err(invalid().into());
                 }
             }
