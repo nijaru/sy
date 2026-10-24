@@ -572,6 +572,7 @@ pub(crate) enum PublicationPausePoint {
     AfterDestinationObservation,
     AfterSourceBinding,
     AfterSourceValidation,
+    AfterSourceCensus,
     AfterPrivateDirectoryCreation,
     AfterSymlinkCreation,
     BeforeSymlinkMetadata,

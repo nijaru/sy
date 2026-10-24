@@ -67,11 +67,15 @@ async fn absolute_resets_keep_original_physical_members_and_native_readers() {
             "ROOT resets cannot invent physical members"
         );
         inventory.validate_originals_blocking().unwrap();
-        assert!(inventory.excludes_objects_blocking(&[]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[], SourceExclusion::Objects)
+            .unwrap());
         let protected = object_key(rooted.root_fd.as_raw_fd(), None)
             .unwrap()
             .unwrap();
-        assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+        assert!(!inventory
+            .excludes_objects_blocking(&[protected], SourceExclusion::Objects)
+            .unwrap());
         let mut owner = rooted.source_observations.lock().unwrap();
         let original = owner.active().unwrap().require(Path::new("entry")).unwrap();
         assert_eq!(
@@ -197,7 +201,9 @@ async fn absolute_discovery_does_not_close_an_unreadable_physical_directory() {
         .unwrap();
     let inventory = source.rooted().seal_source_inventory_blocking().unwrap();
     assert_eq!(inventory.record_count(), 3);
-    assert!(!inventory.excludes_objects_blocking(&[]).unwrap());
+    assert!(!inventory
+        .excludes_objects_blocking(&[], SourceExclusion::Objects)
+        .unwrap());
     std::fs::set_permissions(
         fixture.path().join("dir"),
         std::fs::Permissions::from_mode(0o700),

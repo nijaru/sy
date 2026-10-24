@@ -86,17 +86,19 @@ async fn followed_selection_protects_both_objects_but_not_its_parent_anchor() {
     assert!(Some(keys[1]) == leaf.followed_object_key);
     assert!(keys[0] != keys[1]);
     for key in keys {
-        assert!(!inventory.excludes_objects_blocking(&[key]).unwrap());
+        assert!(!inventory
+            .excludes_objects_blocking(&[key], SourceExclusion::Objects)
+            .unwrap());
     }
     let (path, root, _, _) = details(&inventory, 0);
     assert!(path.as_os_str().is_empty());
     assert!(inventory
-        .excludes_objects_blocking(&[root.object_key.unwrap()])
+        .excludes_objects_blocking(&[root.object_key.unwrap()], SourceExclusion::Objects)
         .unwrap());
     let mut foreign_view = root.object_key.unwrap();
     foreign_view.0[16] ^= 1;
     assert!(!inventory
-        .excludes_objects_blocking(&[foreign_view])
+        .excludes_objects_blocking(&[foreign_view], SourceExclusion::Objects)
         .unwrap());
     inventory.validate_originals_blocking().unwrap();
 }
@@ -553,7 +555,9 @@ async fn low_fd_deep_wide_original_inventory_replay() {
                 let candidate_dir = tempfile::tempdir().unwrap();
                 let candidate = File::open(candidate_dir.path()).unwrap();
                 let key = object_key(candidate.as_raw_fd(), None).unwrap().unwrap();
-                assert!(inventory.excludes_objects_blocking(&[key]).unwrap());
+                assert!(inventory
+                    .excludes_objects_blocking(&[key], SourceExclusion::Objects)
+                    .unwrap());
             }
         }
         return;
@@ -607,7 +611,9 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
         let candidate_dir = tempfile::tempdir().unwrap();
         let candidate = File::open(candidate_dir.path()).unwrap();
         let candidate = object_key(candidate.as_raw_fd(), None).unwrap().unwrap();
-        assert!(inventory.excludes_objects_blocking(&[candidate]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .unwrap());
         {
             let mut owner = rooted.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
@@ -632,8 +638,12 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
                 c.index.file.write_at(&[0], (offset + 33) as u64).unwrap();
             }
         }
-        assert!(inventory.excludes_objects_blocking(&[candidate]).is_err());
+        assert!(inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .is_err());
         assert!(rooted.seal_source_inventory_blocking().is_err());
-        assert!(inventory.excludes_objects_blocking(&[candidate]).is_err());
+        assert!(inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .is_err());
     }
 }

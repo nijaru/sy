@@ -5,6 +5,9 @@ use super::*;
 use crate::authenticated_index::AuthenticatedIndex;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
+#[cfg(test)]
+use inventory::SourceExclusion;
+
 const MAX_TARGET: usize = 64 * 1024;
 const MAX_FOLLOW_LINKS: usize = 40;
 const MAX_FOLLOW_STEPS: usize = 4096;

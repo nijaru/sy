@@ -81,12 +81,16 @@ async fn sibling_file_follow_has_physical_membership_and_authenticated_data() {
         )
         .unwrap()
         .unwrap();
-        assert!(inventory.excludes_objects_blocking(&[independent]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[independent], SourceExclusion::Objects)
+            .unwrap());
         for name in &names {
             let protected = object_key(rooted.root_fd.as_raw_fd(), Some(name))
                 .unwrap()
                 .unwrap();
-            assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+            assert!(!inventory
+                .excludes_objects_blocking(&[protected], SourceExclusion::Objects)
+                .unwrap());
         }
         let mut reader = rooted
             .open_source_following_blocking(&followed.path)
@@ -204,10 +208,13 @@ async fn sibling_discovery_and_enumerated_target_must_agree_in_either_order() {
         // Authentic records and exact physical enumeration cannot repair
         // contradictory original DATA observations into a closed TREE proof.
         assert_eq!(inventory.record_count(), 3);
-        assert!(!inventory.excludes_objects_blocking(&[]).unwrap());
+        assert!(matches!(
+            inventory.excludes_objects_blocking(&[], SourceExclusion::Objects),
+            Err(RootedFsError::SourceBindingChanged(_))
+        ));
         assert!(matches!(
             inventory.validate_originals_blocking(),
-            Err(RootedFsError::SourceBindingChanged(_))
+            Err(RootedFsError::SourceRaceCutoff)
         ));
     }
 }

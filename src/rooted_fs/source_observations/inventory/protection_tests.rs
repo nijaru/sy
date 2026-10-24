@@ -145,7 +145,9 @@ async fn moved_original_deep_member_remains_protected_with_unchanged_scope_roots
         let source = SourceRoot::open(root.clone()).await.unwrap();
         scan(&source, local).await.unwrap();
         let inventory = source.rooted().seal_source_inventory_blocking().unwrap();
-        assert!(!inventory.excludes_objects_blocking(&[candidate]).unwrap());
+        assert!(!inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .unwrap());
         let before = [
             stat_fd(source.rooted().root_fd.as_raw_fd()).unwrap(),
             stat_at_no_follow(source.rooted().root_fd.as_raw_fd(), OsStr::new("pruned")).unwrap(),

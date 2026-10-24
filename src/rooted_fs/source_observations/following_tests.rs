@@ -287,12 +287,15 @@ async fn sibling_chain_discovery_must_match_physical_intermediate_in_either_orde
         let inventory = rooted.seal_source_inventory_blocking().unwrap();
         assert_eq!(inventory.record_count(), 5);
         assert!(
-            !inventory.excludes_objects_blocking(&[]).unwrap(),
+            matches!(
+                inventory.excludes_objects_blocking(&[], SourceExclusion::Objects),
+                Err(RootedFsError::SourceBindingChanged(_))
+            ),
             "equal DATA does not reconcile contradictory intermediate LINK originals"
         );
         assert!(matches!(
             inventory.validate_originals_blocking(),
-            Err(RootedFsError::SourceBindingChanged(_))
+            Err(RootedFsError::SourceRaceCutoff)
         ));
     }
 }

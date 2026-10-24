@@ -280,14 +280,18 @@ async fn root_prefix_discovery_requires_exact_physical_originals_in_both_scanner
             "prefixes and parent results are never synthetic members"
         );
         inventory.validate_originals_blocking().unwrap();
-        assert!(inventory.excludes_objects_blocking(&[]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[], SourceExclusion::Objects)
+            .unwrap());
         for name in ["entry", "dir", "dir/link", file] {
             let path = RelativePath::new(name).unwrap();
             let (parent, leaf) = rooted.open_parent_blocking(path.as_path()).unwrap();
             let protected = object_key(parent.as_raw_fd(), Some(&leaf))
                 .unwrap()
                 .unwrap();
-            assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+            assert!(!inventory
+                .excludes_objects_blocking(&[protected], SourceExclusion::Objects)
+                .unwrap());
         }
         let path = RelativePath::new("entry").unwrap();
         let foreign = tempfile::tempdir().unwrap();

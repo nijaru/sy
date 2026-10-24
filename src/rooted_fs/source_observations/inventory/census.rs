@@ -4,6 +4,8 @@
 use super::*;
 use crate::fs_util::directory_stream::DirectoryStream;
 mod seen;
+#[cfg(all(test, target_os = "macos"))]
+mod tests;
 use seen::SeenOriginals;
 
 impl Catalogue {
@@ -140,107 +142,78 @@ impl Catalogue {
         }
         Ok(())
     }
+
+    fn excludes_additional(
+        &mut self,
+        rooted: &RootedFs,
+        exclusion: SourceExclusion,
+    ) -> Result<bool> {
+        match exclusion {
+            SourceExclusion::Objects => Ok(true),
+            SourceExclusion::OperatorLinks(candidate) => {
+                self.excludes_operator_links(rooted, candidate)
+            }
+            SourceExclusion::DirectoryAncestors(candidate) => {
+                // Object absence cannot prove access-policy independence from
+                // an ancestor. Selected anchors also have possible outside DATA.
+                if self.scope != Some(SourceRootProtection::Tree)
+                    || !self.excludes_operator_ancestors(rooted, candidate)?
+                {
+                    return Ok(false);
+                }
+                let root = self.require(Path::new(""))?;
+                let Some(expected) = root.object_key else {
+                    return Ok(false);
+                };
+                crate::rooted_fs::local_source_effects::ancestry::excludes(
+                    rooted.root_fd.as_raw_fd(),
+                    expected,
+                    candidate,
+                )
+            }
+        }
+    }
 }
 
 impl SourceInventory {
-    /// Physical ancestor exclusion is additional to the complete object census,
-    /// not a replacement for it. Qualify only the original held ROOT's prefix.
-    pub(in crate::rooted_fs) fn excludes_directory_ancestors_blocking(
-        &self,
-        candidate: NativeObjectKey,
-    ) -> Result<bool> {
-        self.rooted.verify_source_root_path_blocking()?;
-        let mut owner = self
-            .rooted
-            .source_observations
-            .lock()
-            .map_err(|_| RootedFsError::SourceCatalogueTerminal)?;
-        let c = owner.active()?;
-        c.begin()?;
-        let result = (|| {
-            if !c.sealed || c.scanning || c.count != self.count {
-                return Err(RootedFsError::SourceInventoryIncomplete);
-            }
-            if c.scope != Some(SourceRootProtection::Tree) {
-                return Ok(false);
-            }
-            if !c.excludes_operator_ancestors(&self.rooted, candidate)? {
-                return Ok(false);
-            }
-            let root = c.require(Path::new(""))?;
-            let Some(expected) = root.object_key else {
-                return Ok(false);
-            };
-            crate::rooted_fs::local_source_effects::ancestry::excludes(
-                self.rooted.root_fd.as_raw_fd(),
-                expected,
-                candidate,
-            )
-        })();
-        if result.is_ok() {
-            c.healthy = true;
-        }
-        result
-    }
-
-    pub(in crate::rooted_fs) fn excludes_operator_links_blocking(
-        &self,
-        candidate: NativeObjectKey,
-    ) -> Result<bool> {
-        self.rooted.verify_source_root_path_blocking()?;
-        let mut owner = self
-            .rooted
-            .source_observations
-            .lock()
-            .map_err(|_| RootedFsError::SourceCatalogueTerminal)?;
-        let c = owner.active()?;
-        c.begin()?;
-        let result = (|| {
-            if !c.sealed || c.scanning || c.count != self.count {
-                return Err(RootedFsError::SourceInventoryIncomplete);
-            }
-            c.excludes_operator_links(&self.rooted, candidate)
-        })();
-        if result.is_ok() {
-            c.healthy = true;
-        }
-        result
-    }
-
-    /// No DATA reads, no outside-root candidate mount opens. Object absence is
-    /// meaningful only in this complete original, single native APFS view.
-    /// It certifies object absence, not directory retirement or independence
-    /// from an ancestor's access/inheritance policy.
+    /// Fresh exact native membership and the requested namespace exclusion,
+    /// within one original-address/ROOT batch and one qualified APFS view.
+    /// No DATA reads, outside-root candidate mount opens, or recursive retirement
+    /// authority. Object absence alone never proves access-policy independence.
     pub(in crate::rooted_fs) fn excludes_objects_blocking(
         &self,
         candidates: &[NativeObjectKey],
+        exclusion: SourceExclusion,
     ) -> Result<bool> {
-        if let Some(selected) = self.selected_leaf_keys_blocking()? {
-            return Ok(selected.iter().all(|source| {
-                candidates
-                    .iter()
-                    .all(|candidate| source.independent(*candidate))
-            }));
+        match exclusion {
+            SourceExclusion::OperatorLinks(object)
+            | SourceExclusion::DirectoryAncestors(object)
+                if !candidates.contains(&object) =>
+            {
+                return Err(invalid().into())
+            }
+            _ => {}
         }
-        self.rooted.verify_source_root_path_blocking()?;
-        let mut owner = self
-            .rooted
-            .source_observations
-            .lock()
-            .map_err(|_| RootedFsError::SourceCatalogueTerminal)?;
-        let c = owner.active()?;
-        c.begin()?;
-        let result = (|| {
-            if !c.sealed || c.scanning || c.count != self.count {
-                return Err(RootedFsError::SourceInventoryIncomplete);
+        let selected = self.selected_leaf_keys_blocking()?;
+        self.with_original_batch(|c| {
+            if let Some(selected) = selected {
+                c.validate_original_records(&self.rooted)?;
+                if !selected.iter().all(|source| {
+                    candidates
+                        .iter()
+                        .all(|candidate| source.independent(*candidate))
+                }) {
+                    return Ok(false);
+                }
+                return c.excludes_additional(&self.rooted, exclusion);
             }
             if c.scope != Some(SourceRootProtection::Tree) {
-                c.healthy = true;
+                c.validate_original_records(&self.rooted)?;
                 return Ok(false);
             }
             let (_, root) = c.original_at(0)?;
             let Some(view) = root.object_key else {
-                c.healthy = true;
+                c.validate_original_records(&self.rooted)?;
                 return Ok(false);
             };
             // Qualify ALL originals before any census. A followed FILE chain
@@ -250,6 +223,7 @@ impl SourceInventory {
             for ordinal in 0..c.count {
                 let (original_key, original) = c.original_at(ordinal)?;
                 c.original_path(original_key)?;
+                c.check_original_ordinal(ordinal, original_key)?;
                 let physical = if original.followed {
                     c.qualifies_follow_resolution(&original)?
                         && original.followed_object_key.is_some_and(|object| {
@@ -275,7 +249,7 @@ impl SourceInventory {
                 }
             }
             if !qualified {
-                c.healthy = true;
+                c.validate_original_records(&self.rooted)?;
                 return Ok(false);
             }
 
@@ -369,16 +343,23 @@ impl SourceInventory {
             if total != c.count - 1 {
                 return Err(invalid().into());
             }
+            #[cfg(test)]
+            self.rooted
+                .pause_mutation(PublicationPausePoint::AfterSourceCensus);
             // Exact exhaustion of every ORIGINAL, not merely an enumeration count.
+            // A held cursor must not hide a directory moved out during census:
+            // close its original parent/name binding after all enumeration too.
             for ordinal in 1..c.count {
-                let (key, _) = c.original_at(ordinal)?;
+                let (key, original) = c.original_at(ordinal)?;
                 if !seen.contains(key, ordinal)? {
                     return Err(invalid().into());
                 }
+                if original.named.kind == libc::S_IFDIR as u64 {
+                    let path = c.original_path(key)?;
+                    c.validate_native_binding(&self.rooted, &path, true)?;
+                }
             }
-            c.healthy = true;
-            Ok(true)
-        })();
-        c.native_result(result)
+            c.excludes_additional(&self.rooted, exclusion)
+        })
     }
 }

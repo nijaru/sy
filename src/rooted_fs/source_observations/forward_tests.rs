@@ -70,7 +70,9 @@ async fn forward_file_and_nested_chain_keep_exact_physical_membership() {
                 );
             }
             inventory.validate_originals_blocking().unwrap();
-            assert!(inventory.excludes_objects_blocking(&[]).unwrap());
+            assert!(inventory
+                .excludes_objects_blocking(&[], SourceExclusion::Objects)
+                .unwrap());
             for name in [
                 "entry",
                 "dir",
@@ -83,7 +85,9 @@ async fn forward_file_and_nested_chain_keep_exact_physical_membership() {
                 let protected = object_key(parent.as_raw_fd(), Some(&leaf))
                     .unwrap()
                     .unwrap();
-                assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+                assert!(!inventory
+                    .excludes_objects_blocking(&[protected], SourceExclusion::Objects)
+                    .unwrap());
             }
             assert!(matches!(
                 rooted.check_source_removal_support_blocking(&RelativePath::new("entry").unwrap()),
@@ -195,12 +199,15 @@ async fn forward_directory_discovery_and_physical_originals_must_agree_in_either
         let inventory = rooted.seal_source_inventory_blocking().unwrap();
         assert_eq!(inventory.record_count(), 4);
         assert!(
-            !inventory.excludes_objects_blocking(&[]).unwrap(),
+            matches!(
+                inventory.excludes_objects_blocking(&[], SourceExclusion::Objects),
+                Err(RootedFsError::SourceBindingChanged(_))
+            ),
             "same FILE inode does not reconcile foreign DIR provenance"
         );
         assert!(matches!(
             inventory.validate_originals_blocking(),
-            Err(RootedFsError::SourceBindingChanged(_))
+            Err(RootedFsError::SourceRaceCutoff)
         ));
     }
 }
@@ -232,7 +239,9 @@ async fn forward_discovery_never_closes_an_unreadable_target_directory() {
         3,
         "discovered DATA must not become an enumerated original"
     );
-    assert!(!inventory.excludes_objects_blocking(&[]).unwrap());
+    assert!(!inventory
+        .excludes_objects_blocking(&[], SourceExclusion::Objects)
+        .unwrap());
     std::fs::set_permissions(
         root.path().join("dir"),
         std::fs::Permissions::from_mode(0o700),

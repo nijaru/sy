@@ -23,6 +23,15 @@ pub(crate) enum SourceDirectoryDisposition {
     Opaque,
 }
 
+/// Additional namespace footprint; its object must also occur in the census
+/// candidates. These are requests for proof, never reusable effect permits.
+#[derive(Clone, Copy)]
+pub(in crate::rooted_fs) enum SourceExclusion {
+    Objects,
+    OperatorLinks(NativeObjectKey),
+    DirectoryAncestors(NativeObjectKey),
+}
+
 #[derive(Clone)]
 pub(crate) struct SourceInventory {
     rooted: RootedFs,
@@ -147,6 +156,44 @@ impl Catalogue {
             return Err(invalid().into());
         }
         Ok(names.into_iter().rev().collect())
+    }
+
+    fn check_inventory_root(&mut self, rooted: &RootedFs) -> Result<()> {
+        let (_, root) = self.original_at(0)?;
+        if !root
+            .effective
+            .same_binding(NativeObservation::from_stat(&stat_fd(
+                rooted.root_fd.as_raw_fd(),
+            )?)?)
+        {
+            return Err(RootedFsError::RootChanged(
+                rooted.root_path.as_ref().clone(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_original_ordinal(&mut self, ordinal: u64, key: [u8; 32]) -> Result<()> {
+        let mut expected = [0; 48];
+        expected[..8].copy_from_slice(&ordinal.to_le_bytes());
+        if self.index.get_bytes(state_key(b"ordinal", key))? != Some(expected) {
+            return Err(invalid().into());
+        }
+        self.disposition(key)?;
+        Ok(())
+    }
+
+    fn validate_original_records(&mut self, rooted: &RootedFs) -> Result<()> {
+        for ordinal in 0..self.count {
+            let (key, _) = self.original_at(ordinal)?;
+            let path = self.original_path(key)?;
+            self.check_original_ordinal(ordinal, key)?;
+            let result = self.validate_native_binding(rooted, &path, true);
+            self.native_result(result)?;
+            #[cfg(test)]
+            rooted.pause_mutation(PublicationPausePoint::AfterSourceValidation);
+        }
+        Ok(())
     }
 }
 
@@ -288,11 +335,18 @@ impl SourceInventory {
         self.count
     }
 
-    /// One locked native-binding batch, not a reusable lease or snapshot. No
-    /// SOURCE or destination effect occurs here. Operator changes persistent
-    /// through the batch are rejected by its end barrier before admission;
-    /// native relative checks still use every authenticated original ancestor.
+    /// One locked native-binding batch, not a reusable lease or snapshot.
     pub(in crate::rooted_fs) fn validate_originals_blocking(&self) -> Result<()> {
+        self.with_original_batch(|c| c.validate_original_records(&self.rooted))
+    }
+
+    /// Both ordinary replay and native exclusion own the same original-address,
+    /// ROOT, extent and run-state barriers. No partially checked catalogue is
+    /// exposed as healthy, and the result cannot be reused as an effect lease.
+    fn with_original_batch<T>(
+        &self,
+        validate: impl FnOnce(&mut Catalogue) -> Result<T>,
+    ) -> Result<T> {
         let mut owner = self
             .rooted
             .source_observations
@@ -307,54 +361,19 @@ impl SourceInventory {
             return Err(RootedFsError::SourceInventoryIncomplete);
         }
         c.scope.ok_or_else(invalid)?;
-        for ordinal in 0..self.count {
-            let (key, original) = c.original_at(ordinal)?;
-            let path = c.original_path(key)?;
-            let mut expected = [0; 48];
-            expected[..8].copy_from_slice(&ordinal.to_le_bytes());
-            if c.index.get_bytes(state_key(b"ordinal", key))? != Some(expected) {
-                return Err(invalid().into());
-            }
-            c.disposition(key)?;
-            if ordinal == 0
-                && !original
-                    .effective
-                    .same_binding(NativeObservation::from_stat(&stat_fd(
-                        self.rooted.root_fd.as_raw_fd(),
-                    )?)?)
-            {
-                return Err(RootedFsError::RootChanged(
-                    self.rooted.root_path.as_ref().clone(),
-                ));
-            }
-            let result = c.validate_native_binding(&self.rooted, &path, true);
-            c.native_result(result)?;
-            #[cfg(test)]
-            self.rooted
-                .pause_mutation(PublicationPausePoint::AfterSourceValidation);
-        }
-        // Exact trusted-count exhaustion and tape/index health remain mandatory,
-        // including repeated batches. Never rehash or adopt altered scratch.
+        c.check_inventory_root(&self.rooted)?;
+        let result = validate(c);
+        let value = c.native_result(result)?;
         if c.file.metadata()?.len() != c.end {
             return Err(invalid().into());
         }
-        let (_, root) = c.original_at(0)?;
-        if !root
-            .effective
-            .same_binding(NativeObservation::from_stat(&stat_fd(
-                self.rooted.root_fd.as_raw_fd(),
-            )?)?)
-        {
-            return Err(RootedFsError::RootChanged(
-                self.rooted.root_path.as_ref().clone(),
-            ));
-        }
+        c.check_inventory_root(&self.rooted)?;
         if self.rooted.source_path_continuity {
             owner.validate_original_operator(&self.rooted)?;
         }
-        // Until the final original-address check succeeds, no partially checked
-        // catalogue is exposed as healthy, even on native/authentication errors.
-        owner.active()?.healthy = true;
-        Ok(())
+        let c = owner.active()?;
+        c.check_run()?;
+        c.healthy = true;
+        Ok(value)
     }
 }

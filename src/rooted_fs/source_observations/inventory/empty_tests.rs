@@ -35,7 +35,9 @@ async fn native_empty_root_and_unreadable_pruned_directory_need_no_enumeration()
         let inventory = scan(&source, usize::from(!root_only)).await;
         let candidate = File::create(fixture.path().join("independent")).unwrap();
         let candidate = object_key(candidate.as_raw_fd(), None).unwrap().unwrap();
-        assert!(inventory.excludes_objects_blocking(&[candidate]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .unwrap());
         let relative = if root_only {
             Path::new("")
         } else {
@@ -53,7 +55,9 @@ async fn native_empty_root_and_unreadable_pruned_directory_need_no_enumeration()
             assert!(c.empty_directory_stamp(key).unwrap().is_some());
             c.require(relative).unwrap().object_key.unwrap()
         };
-        assert!(!inventory.excludes_objects_blocking(&[protected]).unwrap());
+        assert!(!inventory
+            .excludes_objects_blocking(&[protected], SourceExclusion::Objects)
+            .unwrap());
         std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
@@ -73,13 +77,17 @@ async fn empty_certificate_rejects_late_aliases_and_empty_again_directories() {
             .await
             .unwrap();
         let inventory = scan(&source, 1).await;
-        assert!(inventory.excludes_objects_blocking(&[candidate]).unwrap());
+        assert!(inventory
+            .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+            .unwrap());
         std::fs::hard_link(&candidate_path, opaque.join("late-source-alias")).unwrap();
         if remove_alias {
             std::fs::remove_file(opaque.join("late-source-alias")).unwrap();
         }
-        assert!(matches!(inventory.excludes_objects_blocking(&[candidate]),
-            Err(RootedFsError::SourceBindingChanged(path)) if path == Path::new("opaque")));
+        assert!(
+            matches!(inventory.excludes_objects_blocking(&[candidate], SourceExclusion::Objects),
+            Err(RootedFsError::SourceBindingChanged(path)) if path == Path::new("opaque"))
+        );
         assert_eq!(std::fs::read(&candidate_path).unwrap(), b"unaltered");
     }
 }
@@ -98,15 +106,19 @@ async fn replay_cannot_close_originally_nonempty_directory_but_new_run_can() {
         .await
         .unwrap();
     let inventory = scan(&source, 1).await;
-    assert!(!inventory.excludes_objects_blocking(&[candidate]).unwrap());
+    assert!(!inventory
+        .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+        .unwrap());
     std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::remove_file(opaque.join("original-hidden")).unwrap();
     let replayed = scan(&source, 1).await;
-    assert!(!replayed.excludes_objects_blocking(&[candidate]).unwrap());
+    assert!(!replayed
+        .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
+        .unwrap());
     let next = source.rooted().next_source_run_blocking().unwrap();
     let next = crate::endpoint::source_root::SourceRoot::from_rooted(next).unwrap();
     assert!(scan(&next, 1)
         .await
-        .excludes_objects_blocking(&[candidate])
+        .excludes_objects_blocking(&[candidate], SourceExclusion::Objects)
         .unwrap());
 }
