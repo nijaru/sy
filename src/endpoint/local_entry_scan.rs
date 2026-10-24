@@ -127,7 +127,7 @@ pub(crate) fn source_entry_stream(
             root.validate_blocking()?;
         }
         #[cfg(unix)]
-        attempt.finish(result.is_ok() && !sender.is_closed())?;
+        attempt.finish(result.is_ok(), || !sender.is_closed())?;
         result
     })
 }
@@ -155,7 +155,7 @@ pub(crate) fn selected_source_stream(
             root.validate_blocking()?;
         }
         #[cfg(unix)]
-        attempt.finish(result.is_ok() && !sender.is_closed())?;
+        attempt.finish(result.is_ok(), || !sender.is_closed())?;
         result
     })
 }

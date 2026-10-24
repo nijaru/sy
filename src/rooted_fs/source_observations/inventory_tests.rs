@@ -176,7 +176,17 @@ async fn inventory_records_omission_and_actual_directory_completion() {
             let (path, original, _, directory) = details(&inventory, ordinal);
             let expected = match path.to_str().unwrap() {
                 "" | "depth" | "empty" => Some(SourceDirectoryDisposition::Traversed),
-                ".git" | "ignored" | "depth/pruned" => Some(SourceDirectoryDisposition::Opaque),
+                ".git" => {
+                    assert!(matches!(
+                        directory,
+                        Some(
+                            SourceDirectoryDisposition::Opaque
+                                | SourceDirectoryDisposition::Protected
+                        )
+                    ));
+                    directory
+                }
+                "ignored" | "depth/pruned" => Some(SourceDirectoryDisposition::Protected),
                 _ => None,
             };
             assert_eq!(directory, expected);
@@ -190,8 +200,8 @@ async fn inventory_records_omission_and_actual_directory_completion() {
         }
         assert_eq!(paths.len() as u64, inventory.record_count());
         assert!(paths.contains(&PathBuf::from("ignored")));
-        assert!(!paths.contains(&PathBuf::from("ignored/unseen")));
-        assert!(!paths.contains(&PathBuf::from("depth/pruned/unseen")));
+        assert!(paths.contains(&PathBuf::from("ignored/unseen")));
+        assert!(paths.contains(&PathBuf::from("depth/pruned/unseen")));
         inventory.validate_originals_blocking().unwrap();
     }
 }
@@ -212,11 +222,11 @@ async fn depth_zero_tree_and_selected_parent_anchor_are_distinct() {
         )
         .await;
         let inventory = tree.seal_source_inventory_blocking().unwrap();
-        assert_eq!(inventory.record_count(), 1);
+        assert_eq!(inventory.record_count(), 3);
         inventory.validate_originals_blocking().unwrap();
         let (_, _, protection, directory) = details(&inventory, 0);
         assert_eq!(protection, Some(SourceRootProtection::Tree));
-        assert_eq!(directory, Some(SourceDirectoryDisposition::Opaque));
+        assert_eq!(directory, Some(SourceDirectoryDisposition::Protected));
 
         let source = crate::endpoint::source_root::SourceRoot::open(root.path().to_path_buf())
             .await
@@ -517,6 +527,23 @@ async fn batch_rejects_substituted_ordinal_and_inverse_mapping() {
 async fn low_fd_deep_wide_original_inventory_replay() {
     if let Some(root) = std::env::var_os("SY_TEST_SOURCE_INVENTORY_ROOT") {
         for local in [false, true] {
+            // Also exercise the new queue without scanner descent: every
+            // descendant must be protection-only under the same FD limit.
+            let protected = source_scan(
+                Path::new(&root),
+                local,
+                crate::engine::scan::ScanRequest {
+                    max_depth: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let protected = protected.seal_source_inventory_blocking().unwrap();
+            assert_eq!(protected.record_count(), 1 + 48 + 1200);
+            assert_eq!(
+                details(&protected, 0).3,
+                Some(SourceDirectoryDisposition::Protected)
+            );
             let rooted = source_scan(Path::new(&root), local, Default::default()).await;
             let inventory = rooted.seal_source_inventory_blocking().unwrap();
             assert_eq!(inventory.record_count(), 1 + 48 + 1200);

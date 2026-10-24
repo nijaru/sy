@@ -318,8 +318,8 @@ pub(crate) struct SourceScanAttempt {
     successful: bool,
 }
 impl SourceScanAttempt {
-    pub(crate) fn finish(mut self, successful: bool) -> Result<()> {
-        if !successful {
+    pub(crate) fn finish(mut self, successful: bool, active: impl Fn() -> bool) -> Result<()> {
+        if !successful || !active() {
             // Preserve the producer's original error (or ordinary close result).
             // Drop still makes cancelled/failed authority terminal.
             return Ok(());
@@ -333,13 +333,26 @@ impl SourceScanAttempt {
         catalogue.begin()?;
         let expected = match catalogue.selected {
             Some(key) => u64::from(catalogue.index.get_bytes(key)?.is_some()),
-            None => catalogue.count - 1,
+            None => catalogue
+                .count
+                .checked_sub(1)
+                .and_then(|count| count.checked_sub(catalogue.protected_count))
+                .ok_or_else(invalid)?,
         };
         if !catalogue.scanning || catalogue.seen != expected {
             return Err(invalid().into());
         }
         if catalogue.selected.is_none() {
             catalogue.check_completed_traversal()?;
+            if catalogue.scope == Some(SourceRootProtection::Tree) {
+                let result = catalogue.census_protection_metadata(&self.rooted, &active);
+                if !catalogue.native_result(result)? {
+                    return Ok(());
+                }
+            }
+        }
+        if !active() {
+            return Ok(());
         }
         catalogue.scanning = false;
         catalogue.completed = true;
@@ -373,6 +386,8 @@ pub(super) struct Catalogue {
     // Shared by successors and earlier clones; original binding failure is sticky.
     lifetime: Arc<std::sync::Mutex<Option<PathBuf>>>,
     count: u64,
+    // Original names captured only for exclusion, never emitted by the scanner.
+    protected_count: u64,
     seen: u64,
     epoch: u64,
     scanning: bool,
@@ -393,6 +408,7 @@ impl Catalogue {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifetime: Arc::new(std::sync::Mutex::new(None)),
             count: 0,
+            protected_count: 0,
             seen: 0,
             epoch: 0,
             scanning: false,

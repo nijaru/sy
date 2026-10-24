@@ -68,14 +68,14 @@ async fn original_scan_parent_is_required_before_first_data_open_and_for_every_h
 }
 
 #[tokio::test]
-async fn omitted_names_remain_original_and_pruned_directories_do_not_enumerate_descendants() {
+async fn omitted_special_descendants_are_protected_metadata_not_sync_candidates() {
     let root = tempfile::tempdir().unwrap();
     for name in [".git", "ignored", "depth"] {
         std::fs::create_dir(root.path().join(name)).unwrap();
     }
     std::fs::write(root.path().join(".ignore"), b"ignored/\n").unwrap();
-    // A considered special entry is an error; these children must never be
-    // considered because their containing directory was excluded/pruned.
+    // Special entries cannot become transfer work. Protection-only metadata
+    // still records their physical bindings without opening their contents.
     for name in [".git/socket", "ignored/socket", "depth/socket"] {
         let _socket = std::os::unix::net::UnixListener::bind(root.path().join(name)).unwrap();
     }
@@ -102,7 +102,12 @@ async fn omitted_names_remain_original_and_pruned_directories_do_not_enumerate_d
     let catalogue = owner.active().unwrap();
     catalogue.begin().unwrap();
     for name in [".git/socket", "ignored/socket", "depth/socket"] {
-        assert!(catalogue.get(path_key(Path::new(name))).unwrap().is_none());
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.path.as_path() == Path::new(name)));
+        let observed = catalogue.get(path_key(Path::new(name))).unwrap().unwrap();
+        assert_eq!(observed.named.kind, libc::S_IFSOCK as u64);
+        assert!(!observed.followed);
     }
     catalogue.healthy = true;
     drop(owner);

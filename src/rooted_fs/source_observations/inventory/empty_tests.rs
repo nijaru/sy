@@ -91,6 +91,7 @@ async fn replay_cannot_close_originally_nonempty_directory_but_new_run_can() {
     let opaque = path.join("opaque");
     std::fs::create_dir_all(&opaque).unwrap();
     std::fs::write(opaque.join("original-hidden"), b"SOURCE").unwrap();
+    std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o111)).unwrap();
     let file = File::create(fixture.path().join("independent")).unwrap();
     let candidate = object_key(file.as_raw_fd(), None).unwrap().unwrap();
     let source = crate::endpoint::source_root::SourceRoot::open(path)
@@ -98,6 +99,7 @@ async fn replay_cannot_close_originally_nonempty_directory_but_new_run_can() {
         .unwrap();
     let inventory = scan(&source, 1).await;
     assert!(!inventory.excludes_objects_blocking(&[candidate]).unwrap());
+    std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::remove_file(opaque.join("original-hidden")).unwrap();
     let replayed = scan(&source, 1).await;
     assert!(!replayed.excludes_objects_blocking(&[candidate]).unwrap());

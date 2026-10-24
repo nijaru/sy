@@ -191,7 +191,7 @@ async fn forward_directory_discovery_and_physical_originals_must_agree_in_either
         rooted
             .complete_source_directory_blocking(Path::new(""))
             .unwrap();
-        attempt.finish(true).unwrap();
+        attempt.finish(true, || true).unwrap();
         let inventory = rooted.seal_source_inventory_blocking().unwrap();
         assert_eq!(inventory.record_count(), 4);
         assert!(
@@ -207,11 +207,18 @@ async fn forward_directory_discovery_and_physical_originals_must_agree_in_either
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
-async fn forward_discovery_never_closes_an_opaque_target_directory() {
+async fn forward_discovery_never_closes_an_unreadable_target_directory() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("dir")).unwrap();
     std::fs::write(root.path().join("dir/data"), b"DATA").unwrap();
     std::os::unix::fs::symlink(".//dir///.//data", root.path().join("entry")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    // Search permits FILE discovery, but read denial prevents a protection census.
+    std::fs::set_permissions(
+        root.path().join("dir"),
+        std::fs::Permissions::from_mode(0o111),
+    )
+    .unwrap();
     let source = SourceRoot::open(root.path().to_path_buf()).await.unwrap();
     let rooted = source.rooted();
     source
@@ -226,6 +233,11 @@ async fn forward_discovery_never_closes_an_opaque_target_directory() {
         "discovered DATA must not become an enumerated original"
     );
     assert!(!inventory.excludes_objects_blocking(&[]).unwrap());
+    std::fs::set_permissions(
+        root.path().join("dir"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 
 #[test]

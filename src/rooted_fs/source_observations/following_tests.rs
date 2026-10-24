@@ -283,7 +283,7 @@ async fn sibling_chain_discovery_must_match_physical_intermediate_in_either_orde
         rooted
             .complete_source_directory_blocking(Path::new(""))
             .unwrap();
-        attempt.finish(true).unwrap();
+        attempt.finish(true, || true).unwrap();
         let inventory = rooted.seal_source_inventory_blocking().unwrap();
         assert_eq!(inventory.record_count(), 5);
         assert!(

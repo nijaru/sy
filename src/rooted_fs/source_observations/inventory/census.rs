@@ -5,7 +5,7 @@ use super::*;
 use crate::fs_util::directory_stream::DirectoryStream;
 
 impl Catalogue {
-    fn open_original_directory(&mut self, root: RawFd, path: &Path) -> Result<OwnedFd> {
+    pub(super) fn open_original_directory(&mut self, root: RawFd, path: &Path) -> Result<OwnedFd> {
         let original = self.require(Path::new(""))?;
         let mut directory = open_dir_at(root, OsStr::new("."))?;
         self.check_directory(&original, directory.as_raw_fd(), Path::new(""))?;
@@ -268,8 +268,7 @@ impl SourceInventory {
                     });
                 if original.named.kind == libc::S_IFDIR as u64 {
                     let children = c.child_count(original_key)?;
-                    qualified &= c.disposition(original_key)?
-                        == SourceDirectoryDisposition::Traversed
+                    qualified &= c.disposition(original_key)? != SourceDirectoryDisposition::Opaque
                         || (children == 0 && c.empty_directory_stamp(original_key)?.is_some());
                 }
             }

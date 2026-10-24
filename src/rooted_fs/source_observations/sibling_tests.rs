@@ -199,7 +199,7 @@ async fn sibling_discovery_and_enumerated_target_must_agree_in_either_order() {
         rooted
             .complete_source_directory_blocking(Path::new(""))
             .unwrap();
-        attempt.finish(true).unwrap();
+        attempt.finish(true, || true).unwrap();
         let inventory = rooted.seal_source_inventory_blocking().unwrap();
         // Authentic records and exact physical enumeration cannot repair
         // contradictory original DATA observations into a closed TREE proof.

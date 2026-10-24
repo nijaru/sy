@@ -86,7 +86,7 @@ impl RootedFs {
         EntryStream::spawn_blocking(CHANNEL_CAPACITY, move |sender| {
             let attempt = rooted.start_source_scan_blocking()?;
             let result = scan_worker(rooted, request, sender.clone(), true);
-            attempt.finish(result.is_ok() && !sender.is_closed())?;
+            attempt.finish(result.is_ok(), || !sender.is_closed())?;
             result
         })
     }
@@ -185,7 +185,7 @@ impl RootedFs {
                 Ok(())
             })();
             if let Some(attempt) = attempt {
-                attempt.finish(result.is_ok() && !sender.is_closed())?;
+                attempt.finish(result.is_ok(), || !sender.is_closed())?;
             }
             result
         })

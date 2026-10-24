@@ -171,13 +171,20 @@ async fn absolute_targets_cannot_escape_reenter_or_follow_directory_aliases() {
 }
 
 #[tokio::test]
-async fn absolute_discovery_does_not_close_a_pruned_physical_directory() {
+async fn absolute_discovery_does_not_close_an_unreadable_physical_directory() {
     let fixture = tempfile::tempdir().unwrap();
     std::fs::create_dir(fixture.path().join("dir")).unwrap();
     std::fs::write(fixture.path().join("dir/data"), b"DATA").unwrap();
     std::os::unix::fs::symlink(
         fixture.path().join("dir/data"),
         fixture.path().join("entry"),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    // Search permits FILE discovery, but read denial prevents a protection census.
+    std::fs::set_permissions(
+        fixture.path().join("dir"),
+        std::fs::Permissions::from_mode(0o111),
     )
     .unwrap();
     let source = SourceRoot::open(fixture.path().to_path_buf())
@@ -191,6 +198,11 @@ async fn absolute_discovery_does_not_close_a_pruned_physical_directory() {
     let inventory = source.rooted().seal_source_inventory_blocking().unwrap();
     assert_eq!(inventory.record_count(), 3);
     assert!(!inventory.excludes_objects_blocking(&[]).unwrap());
+    std::fs::set_permissions(
+        fixture.path().join("dir"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 
 #[tokio::test]

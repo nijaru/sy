@@ -4,6 +4,7 @@
 use super::*;
 mod census;
 mod empty;
+mod protection;
 #[cfg(test)]
 #[path = "inventory_tests.rs"]
 mod tests;
@@ -17,6 +18,8 @@ pub(crate) enum SourceRootProtection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceDirectoryDisposition {
     Traversed,
+    /// Metadata-only census reached EOF; these entries are not sync candidates.
+    Protected,
     Opaque,
 }
 
@@ -91,6 +94,7 @@ impl Catalogue {
         match self.index.get_bytes(state_key(b"directory", key))? {
             None => Ok(SourceDirectoryDisposition::Opaque),
             Some(bytes) if bytes == [1; 48] => Ok(SourceDirectoryDisposition::Traversed),
+            Some(bytes) if bytes == [2; 48] => Ok(SourceDirectoryDisposition::Protected),
             Some(_) => Err(invalid().into()),
         }
     }

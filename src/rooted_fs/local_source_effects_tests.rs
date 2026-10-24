@@ -71,10 +71,16 @@ async fn native_staging_repeats_original_validation_without_preflight_permission
     let source = SourceRoot::open(source_dir.path().to_path_buf())
         .await
         .unwrap();
-    // Nonempty opaque originals have no closure certificate; native-empty
-    // directories and fully enumerated trees have distinct positive lanes.
+    // An unreadable nonempty directory has neither an empty certificate nor
+    // a protection census. It must not become an admission permission.
     std::fs::create_dir(source_dir.path().join("opaque")).unwrap();
     std::fs::write(source_dir.path().join("opaque/hidden"), b"protected").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        source_dir.path().join("opaque"),
+        std::fs::Permissions::from_mode(0o111),
+    )
+    .unwrap();
     source
         .entries(crate::engine::scan::ScanRequest {
             max_depth: Some(1),
@@ -110,6 +116,11 @@ async fn native_staging_repeats_original_validation_without_preflight_permission
         std::fs::read_dir(destination_dir.path()).unwrap().count(),
         0
     );
+    std::fs::set_permissions(
+        source_dir.path().join("opaque"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
 }
 
 #[cfg(target_os = "macos")]
