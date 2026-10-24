@@ -4,6 +4,8 @@ use source_observations::inventory::SourceInventory;
 pub(super) mod ancestry;
 pub(super) mod native_object;
 use native_object::object_key;
+#[cfg(all(test, target_os = "macos"))]
+mod symlink_tests;
 #[cfg(test)]
 #[path = "local_source_effects_tests.rs"]
 mod tests;
@@ -14,10 +16,11 @@ mod tests;
 #[derive(Clone, Copy)]
 pub enum SourceEffectKind {
     LeafPublication,
-    PrivateFileMetadata,
+    PrivateLeafMetadata,
     PrivateDirectoryMetadata,
     DirectoryNamespaceChange,
     InodeMetadata,
+    SymlinkMetadata,
     /// Directory access/inheritance policy needs physical ancestor exclusion.
     DirectoryPolicy,
     /// Only target directory mtime/ctime, never access or inheritance policy.
@@ -183,19 +186,53 @@ impl LocalSourceEffects {
         match effect.kind {
             SourceEffectKind::LeafPublication => {
                 if let Some(stat) = stat_at_optional(effect.parent, effect.name)? {
-                    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    if !matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
                         return Err(unknown());
                     }
                     let old = object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?;
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+                        && !self.inventory.excludes_operator_links_blocking(old)?
+                    {
+                        return Err(unknown());
+                    }
                     candidates.push(old);
                 }
             }
-            SourceEffectKind::PrivateFileMetadata => {
+            SourceEffectKind::PrivateLeafMetadata => {
                 let fd = effect.object.ok_or_else(unknown)?;
-                if stat_fd(fd)?.st_mode & libc::S_IFMT != libc::S_IFREG {
+                let kind = stat_fd(fd)?.st_mode & libc::S_IFMT;
+                if !matches!(kind, libc::S_IFREG | libc::S_IFLNK) {
                     return Err(unknown());
                 }
-                candidates.push(object_key(fd, None)?.ok_or_else(unknown)?);
+                let object = object_key(fd, None)?.ok_or_else(unknown)?;
+                if kind == libc::S_IFLNK
+                    && !self.inventory.excludes_operator_links_blocking(object)?
+                {
+                    return Err(unknown());
+                }
+                candidates.push(object);
+            }
+            SourceEffectKind::SymlinkMetadata => {
+                let opened = if effect.object.is_none() {
+                    Some(open_symlink_at(effect.parent, effect.name)?)
+                } else {
+                    None
+                };
+                let fd = effect
+                    .object
+                    .or_else(|| opened.as_ref().map(AsRawFd::as_raw_fd))
+                    .ok_or_else(unknown)?;
+                let held = stat_fd(fd)?;
+                let named = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;
+                let object = object_key(fd, None)?.ok_or_else(unknown)?;
+                if held.st_mode & libc::S_IFMT != libc::S_IFLNK
+                    || !staging::same_observation(&held, &named)
+                    || object_key(effect.parent, Some(effect.name))? != Some(object)
+                    || !self.inventory.excludes_operator_links_blocking(object)?
+                {
+                    return Err(unknown());
+                }
+                candidates.push(object);
             }
             SourceEffectKind::PrivateDirectoryMetadata => {
                 let fd = effect.object.ok_or_else(unknown)?;
@@ -223,12 +260,18 @@ impl LocalSourceEffects {
             }
             SourceEffectKind::NamespaceRetirement => {
                 let stat = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;
-                // No recursive/ancestor closure follows from object absence.
-                // Only ordinary regular-leaf retirement is admitted here.
-                if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+                // Neither leaf kind contains a subtree. A LINK can still be
+                // original operator provenance outside the physical inventory.
+                if !matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
                     return Err(unknown());
                 }
-                candidates.push(object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?);
+                let object = object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?;
+                if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
+                    && !self.inventory.excludes_operator_links_blocking(object)?
+                {
+                    return Err(unknown());
+                }
+                candidates.push(object);
             }
             SourceEffectKind::InodeMetadata => {
                 let named = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;

@@ -254,7 +254,10 @@ impl SourceInventory {
                     return Err(catalogue.changed(path));
                 }
                 leaf.object_key.zip(terminal.object_key)
-            } else if !leaf.followed && leaf.named.kind == libc::S_IFREG as u64 {
+            } else if !leaf.followed
+                && (leaf.named.kind == libc::S_IFREG as u64
+                    || leaf.named.kind == libc::S_IFLNK as u64)
+            {
                 leaf.object_key.map(|object| (object, object))
             } else {
                 None

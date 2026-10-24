@@ -28,6 +28,9 @@ mod publication;
 mod source_observations;
 mod source_policy;
 mod staging;
+mod symlink;
+#[cfg(unix)]
+use symlink::open_symlink_at;
 #[cfg(all(test, unix))]
 pub(crate) mod test_source;
 pub use publication::{PublishedEntryProof, PublishedFileProof, RootedPublishedFile};
@@ -570,6 +573,8 @@ pub(crate) enum PublicationPausePoint {
     AfterSourceBinding,
     AfterSourceValidation,
     AfterPrivateDirectoryCreation,
+    AfterSymlinkCreation,
+    BeforeSymlinkMetadata,
     BeforeAdmission,
     AfterAdmission,
 }
@@ -2308,115 +2313,6 @@ impl RootedFs {
         }
     }
 
-    /// Privately stage a symlink and publish through the common namespace
-    /// transaction. Empty directories require atomic exchange; nonempty ones
-    /// are refused. The resolved parent stays pinned. The target is stored as
-    /// opaque native path data and is never resolved by this operation.
-    ///
-    /// This is a blocking syscall API and must run on a blocking worker.
-    pub fn replace_symlink_blocking(
-        &self,
-        relative: &RelativePath,
-        target: &Path,
-        expected: ExpectedDestination,
-        modified: Option<Timestamp>,
-    ) -> Result<()> {
-        self.publish_symlink_blocking(relative, target, expected, modified)
-            .map(|_| ())
-    }
-
-    pub fn publish_symlink_blocking(
-        &self,
-        relative: &RelativePath,
-        target: &Path,
-        expected: ExpectedDestination,
-        modified: Option<Timestamp>,
-    ) -> Result<PublishedEntryProof> {
-        #[cfg(unix)]
-        {
-            let staged =
-                self.begin_staged_symlink_blocking(relative, target, expected, modified)?;
-            let observed = staged.commit()?;
-            let identity = identity_from_stat(&observed.stat).ok_or_else(|| {
-                RootedFsError::CommittedFinalizationFailed {
-                    path: relative.as_path().to_path_buf(),
-                    reason: "published symlink has no identity".into(),
-                }
-            })?;
-            let proof = PublishedEntryProof {
-                path: relative.clone(),
-                kind: EntryKind::Symlink,
-                identity,
-            };
-            proof.revalidate_blocking(self).map_err(|error| {
-                RootedFsError::CommittedFinalizationFailed {
-                    path: relative.as_path().to_path_buf(),
-                    reason: error.to_string(),
-                }
-            })?;
-            Ok(proof)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (relative, target, expected, modified);
-            Err(RootedFsError::UnsupportedPlatform)
-        }
-    }
-
-    fn begin_staged_symlink_blocking(
-        &self,
-        relative: &RelativePath,
-        target: &Path,
-        expected: ExpectedDestination,
-        modified: Option<Timestamp>,
-    ) -> Result<RootedNamespaceTransaction> {
-        #[cfg(unix)]
-        {
-            let mut namespace = self.begin_namespace_blocking(
-                relative.as_path(),
-                expected,
-                StagingOrigin::Created,
-            )?;
-            let mut prepare = || -> Result<()> {
-                let target = CString::new(target.as_os_str().as_bytes())
-                    .map_err(|_| RootedFsError::PathContainsNul)?;
-                let name = component_cstring(&namespace.temp_name)?;
-                let result = unsafe {
-                    // SAFETY: both strings are live and NUL terminated; the held
-                    // private directory owns the new leaf, target is not resolved.
-                    libc::symlinkat(
-                        target.as_ptr(),
-                        namespace.staging_dir_fd.as_raw_fd(),
-                        name.as_ptr(),
-                    )
-                };
-                if result < 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                let held =
-                    open_symlink_at(namespace.staging_dir_fd.as_raw_fd(), &namespace.temp_name)?;
-                namespace.register_staging(&held)?;
-                if let Some(modified) = modified {
-                    set_symlink_mtime_at(
-                        namespace.staging_dir_fd.as_raw_fd(),
-                        &namespace.temp_name,
-                        modified,
-                    )?;
-                }
-                Ok(())
-            };
-            if let Err(error) = prepare() {
-                return Err(namespace.abort_after(error));
-            }
-            Ok(namespace)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (relative, target, expected, modified);
-            Err(RootedFsError::UnsupportedPlatform)
-        }
-    }
-
     /// Remove one file-like or directory leaf beneath the pinned root. Parent
     /// components are opened with no-follow semantics and `unlinkat` never
     /// follows the destination leaf.
@@ -3883,35 +3779,6 @@ fn after_own_link(before: HardlinkSourceState, after: HardlinkSourceState) -> bo
 }
 
 #[cfg(unix)]
-fn open_symlink_at(parent: RawFd, component: &OsStr) -> Result<File> {
-    let name = component_cstring(component)?;
-    #[cfg(target_os = "linux")]
-    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    #[cfg(target_os = "macos")]
-    let flags = libc::O_SYMLINK | libc::O_CLOEXEC;
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    return Err(RootedFsError::UnsupportedPlatform);
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        // SAFETY: the parent and NUL-terminated name are live; these native flags
-        // hold the symlink inode itself, never its target.
-        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: successful openat transferred one owned descriptor.
-        let file = unsafe { File::from_raw_fd(fd) };
-        if stat_fd(file.as_raw_fd())?.st_mode & libc::S_IFMT != libc::S_IFLNK {
-            return Err(RootedFsError::EntryKindMismatch {
-                path: PathBuf::from(component),
-                expected: EntryKind::Symlink,
-            });
-        }
-        Ok(file)
-    }
-}
-
-#[cfg(unix)]
 fn after_own_unlink(before: HardlinkSourceState, after: HardlinkSourceState) -> bool {
     same_hardlink_preserved_state(before, after) && before.nlink.checked_sub(1) == Some(after.nlink)
 }
@@ -4318,7 +4185,7 @@ fn ensure_symlink_at(parent: RawFd, component: &OsStr, relative: &Path) -> Resul
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn set_symlink_mtime_at(parent: RawFd, component: &OsStr, modified: Timestamp) -> Result<()> {
     let component = component_cstring(component)?;
     let times = modified_timespecs(modified)?;

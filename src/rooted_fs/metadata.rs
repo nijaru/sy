@@ -340,28 +340,71 @@ impl RootedFs {
                         relative.as_path().to_path_buf(),
                     ));
                 }
-                if let Some(modified) = modified {
+                #[cfg(target_os = "macos")]
+                let held = modified
+                    .map(|_| open_symlink_at(parent.as_raw_fd(), &leaf))
+                    .transpose()?;
+                let current = if let Some(modified) = modified {
+                    #[cfg(target_os = "macos")]
+                    let file = held.as_ref().ok_or_else(|| {
+                        RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+                    })?;
+                    #[cfg(target_os = "macos")]
+                    if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected) {
+                        return Err(RootedFsError::DestinationChanged(
+                            relative.as_path().to_path_buf(),
+                        ));
+                    }
                     self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
                     let _permit = self.admit_mutation_blocking(SourceEffect {
-                        kind: SourceEffectKind::InodeMetadata,
+                        kind: SourceEffectKind::SymlinkMetadata,
                         parent: parent.as_raw_fd(),
                         name: &leaf,
+                        #[cfg(target_os = "macos")]
+                        object: Some(file.as_raw_fd()),
+                        #[cfg(not(target_os = "macos"))]
                         object: None,
                         path: relative.as_path(),
                     })?;
-                    // Portable symlink time is a no-follow parent-relative
-                    // syscall, not an atomic identity-conditional mutation.
-                    set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
-                }
-                let current = stat_at_optional(parent.as_raw_fd(), &leaf)?
-                    .as_ref()
-                    .and_then(identity_from_stat)
-                    .ok_or_else(|| {
-                        RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
-                    })?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Census/admission can outlive the observed name or
+                        // its parent. Neither is a lease on SOURCE independence.
+                        if self.local_source_effects.is_some() {
+                            self.verify_root_path_blocking()?;
+                        }
+                        self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
+                        if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected)
+                            || stat_at_optional(parent.as_raw_fd(), &leaf)?
+                                .as_ref()
+                                .and_then(identity_from_stat)
+                                != Some(expected)
+                        {
+                            return Err(RootedFsError::DestinationChanged(
+                                relative.as_path().to_path_buf(),
+                            ));
+                        }
+                        apply_fd_metadata(file.as_raw_fd(), None, Some(modified))?;
+                        identity_from_stat(&stat_fd(file.as_raw_fd())?).ok_or_else(|| {
+                            RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+                        })?
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        // Other Unix backends retain their no-follow, name-based
+                        // operation; this is not qualified LOCAL SOURCE admission.
+                        set_symlink_mtime_at(parent.as_raw_fd(), &leaf, modified)?;
+                        stat_at_optional(parent.as_raw_fd(), &leaf)?
+                            .as_ref()
+                            .and_then(identity_from_stat)
+                            .ok_or_else(|| {
+                                RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
+                            })?
+                    }
+                } else {
+                    expected
+                };
                 self.verify_parent_binding_blocking(relative.as_path(), &parent)?;
-                // The no-follow time syscall cannot redirect to a link target;
-                // portable Unix still cannot offer identity-conditional mutation.
                 if self.path_identity_blocking(relative)? != Some((kind, current)) {
                     return Err(RootedFsError::DestinationChanged(
                         relative.as_path().to_path_buf(),

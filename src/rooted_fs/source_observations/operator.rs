@@ -35,6 +35,7 @@ enum ReplayPurpose {
     Address(LeafData),
     Root,
     DirectoryPolicy(NativeObjectKey),
+    SymlinkEffect(NativeObjectKey),
 }
 
 enum ReplayedAddress {
@@ -366,7 +367,9 @@ impl Catalogue {
     ) -> Result<ReplayedAddress> {
         let data = match purpose {
             ReplayPurpose::Address(data) => data,
-            ReplayPurpose::Root | ReplayPurpose::DirectoryPolicy(_) => LeafData::CurrentRun,
+            ReplayPurpose::Root
+            | ReplayPurpose::DirectoryPolicy(_)
+            | ReplayPurpose::SymlinkEffect(_) => LeafData::CurrentRun,
         };
         let address = self
             .operator
@@ -543,6 +546,22 @@ impl Catalogue {
                         return Err(RootedFsError::RootChanged(
                             rooted.root_path.as_ref().clone(),
                         ));
+                    }
+                    if let ReplayPurpose::SymlinkEffect(candidate) = purpose {
+                        let object = object_key(directory.as_raw_fd(), Some(&record.name))?
+                            .ok_or_else(|| {
+                                RootedFsError::SourceEffectUnqualified(
+                                    rooted.root_path.as_ref().clone(),
+                                )
+                            })?;
+                        if object.0[..16] == candidate.0[..16]
+                            && (object.0[16..24] != candidate.0[16..24]
+                                || object.0[24..] == candidate.0[24..])
+                        {
+                            return Err(RootedFsError::SourceEffectUnqualified(
+                                rooted.root_path.as_ref().clone(),
+                            ));
+                        }
                     }
                 } else if target == Some(ordinal) {
                     let original = original_leaf.as_ref().ok_or_else(invalid)?;
@@ -827,6 +846,23 @@ impl Catalogue {
         match self.operator_result(rooted, result) {
             Ok(_) => Ok(true),
             // An overlapping/unqualified effect is not damaged SOURCE evidence.
+            Err(RootedFsError::SourceEffectUnqualified(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn excludes_operator_links(
+        &mut self,
+        rooted: &RootedFs,
+        candidate: NativeObjectKey,
+    ) -> Result<bool> {
+        if self.operator.is_none() {
+            // Held-only roots have no original operator-prefix LINK bindings.
+            return Ok(true);
+        }
+        let result = self.walk_operator(rooted, ReplayPurpose::SymlinkEffect(candidate));
+        match self.operator_result(rooted, result) {
+            Ok(_) => Ok(true),
             Err(RootedFsError::SourceEffectUnqualified(_)) => Ok(false),
             Err(error) => Err(error),
         }

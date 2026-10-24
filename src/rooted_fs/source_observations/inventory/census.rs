@@ -181,6 +181,30 @@ impl SourceInventory {
         result
     }
 
+    pub(in crate::rooted_fs) fn excludes_operator_links_blocking(
+        &self,
+        candidate: NativeObjectKey,
+    ) -> Result<bool> {
+        self.rooted.verify_source_root_path_blocking()?;
+        let mut owner = self
+            .rooted
+            .source_observations
+            .lock()
+            .map_err(|_| RootedFsError::SourceCatalogueTerminal)?;
+        let c = owner.active()?;
+        c.begin()?;
+        let result = (|| {
+            if !c.sealed || c.scanning || c.count != self.count {
+                return Err(RootedFsError::SourceInventoryIncomplete);
+            }
+            c.excludes_operator_links(&self.rooted, candidate)
+        })();
+        if result.is_ok() {
+            c.healthy = true;
+        }
+        result
+    }
+
     /// No DATA reads, no outside-root candidate mount opens. Object absence is
     /// meaningful only in this complete original, single native APFS view.
     /// It certifies object absence, not directory retirement or independence

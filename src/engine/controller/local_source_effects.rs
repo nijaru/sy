@@ -74,8 +74,11 @@ impl SyncPlan {
                 }
             }
             if lowers_effect(operation.clone(), self.execution_policy)? {
-                let kind = if operation.source().is_file()
-                    && matches!(operation, SyncOp::Create { .. } | SyncOp::Update { .. })
+                let kind = if (operation.source().is_file() || operation.source().is_symlink())
+                    && (matches!(operation, SyncOp::Create { .. } | SyncOp::Update { .. })
+                        || (matches!(operation, SyncOp::Replace { .. })
+                            && destination(&operation)
+                                .is_some_and(|old| old.is_file() || old.is_symlink())))
                 {
                     SourceEffectKind::LeafPublication
                 } else {
@@ -87,6 +90,11 @@ impl SyncPlan {
                             if operation.source().is_directory() =>
                         {
                             SourceEffectKind::DirectoryPolicy
+                        }
+                        SyncOp::Metadata { .. } | SyncOp::Unchanged { .. }
+                            if operation.source().is_symlink() =>
+                        {
+                            SourceEffectKind::SymlinkMetadata
                         }
                         SyncOp::Metadata { .. } | SyncOp::Unchanged { .. } => {
                             SourceEffectKind::InodeMetadata

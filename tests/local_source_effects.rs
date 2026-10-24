@@ -14,6 +14,59 @@ fn sync(source: &Path, destination: &Path, flags: &[&str]) -> Output {
 }
 #[cfg(target_os = "macos")]
 #[test]
+fn off_path_operator_links_are_protected_from_replacement_deletion_and_timestamps() {
+    for effect in ["replace", "delete", "timestamp"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("physical");
+        let destination = fixture.path().join("operator");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(source.join("a-first"), b"SOURCE").unwrap();
+        let original = destination.join("link");
+        std::os::unix::fs::symlink(&source, &original).unwrap();
+        let flags = match effect {
+            "replace" => {
+                std::fs::write(source.join("link"), b"replacement").unwrap();
+                vec!["-j1"]
+            }
+            "delete" => vec!["-j1", "--delete", "--force-delete"],
+            "timestamp" => {
+                std::os::unix::fs::symlink(&source, source.join("link")).unwrap();
+                let time = filetime::FileTime::from_unix_time(100, 123);
+                filetime::set_symlink_file_times(source.join("link"), time, time).unwrap();
+                vec!["-j1", "-t"]
+            }
+            _ => unreachable!(),
+        };
+        let state = || {
+            let stat = std::fs::symlink_metadata(&original).unwrap();
+            (
+                stat.ino(),
+                stat.nlink(),
+                stat.mtime(),
+                stat.mtime_nsec(),
+                stat.ctime(),
+                stat.ctime_nsec(),
+            )
+        };
+        let before = state();
+        let output = sync(&original, &destination, &flags);
+        assert!(
+            !output.status.success(),
+            "{effect} modified original operator LINK"
+        );
+        assert!(
+            !destination.join("a-first").exists(),
+            "{effect} escaped complete preflight"
+        );
+        assert_eq!(state(), before);
+        assert_eq!(std::fs::read_link(&original).unwrap(), source);
+        assert_eq!(std::fs::read(source.join("a-first")).unwrap(), b"SOURCE");
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn guarded_hardlink_groups_fit_low_fd_budget_without_per_member_pins() {
     use std::os::unix::process::CommandExt;
 

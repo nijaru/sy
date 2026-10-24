@@ -55,7 +55,7 @@ impl RootedStagedFile {
         self.namespace
             .rooted
             .require_source_effect_blocking(SourceEffect {
-                kind: SourceEffectKind::PrivateFileMetadata,
+                kind: SourceEffectKind::PrivateLeafMetadata,
                 parent: self.namespace.staging_dir_fd.as_raw_fd(),
                 name: &self.namespace.temp_name,
                 object: Some(self.file.as_raw_fd()),
@@ -79,7 +79,17 @@ impl RootedNamespaceTransaction {
     /// An absent owner is never a wildcard permitting cleanup of a named entry.
     #[cfg(unix)]
     pub(super) fn register_staging(&mut self, file: &File) -> Result<()> {
-        let created = stat_fd(file.as_raw_fd())?;
+        self.register_observed_staging(file, stat_fd(file.as_raw_fd())?)
+    }
+
+    /// Preserve a checked creation observation rather than adopting later
+    /// link-count changes while retaining the genuine descriptor pin.
+    #[cfg(unix)]
+    pub(super) fn register_observed_staging(
+        &mut self,
+        file: &File,
+        created: libc::stat,
+    ) -> Result<()> {
         // Cached inode numbers authorize cleanup only while a descriptor pins
         // that inode against reuse, including descriptor-exhaustion failures.
         let retained = file.try_clone()?;
