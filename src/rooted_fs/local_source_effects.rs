@@ -2,6 +2,7 @@
 use super::*;
 use source_observations::inventory::SourceInventory;
 pub(super) mod ancestry;
+mod empty_directory;
 pub(super) mod native_object;
 use native_object::object_key;
 #[cfg(all(test, target_os = "macos"))]
@@ -10,7 +11,7 @@ mod symlink_tests;
 #[path = "local_source_effects_tests.rs"]
 mod tests;
 
-/// Unknown declarations remain explicit, including directory retirement.
+/// Directory retirement is nonrecursive and requires a genuinely empty OLD.
 /// A leaf publication includes OLD inode retirement; group link deltas require
 /// the actual named regular FD, never a declaration-only grant.
 #[derive(Clone, Copy)]
@@ -183,19 +184,31 @@ impl LocalSourceEffects {
         // Selected-leaf parent anchors remain neutral. Object absence is not
         // ancestry closure for recursive retirement or directory policy setters.
         let mut candidates = vec![parent];
+        let mut empty_directory = None;
         match effect.kind {
-            SourceEffectKind::LeafPublication => {
+            SourceEffectKind::LeafPublication | SourceEffectKind::NamespaceRetirement => {
                 if let Some(stat) = stat_at_optional(effect.parent, effect.name)? {
-                    if !matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
-                        return Err(unknown());
-                    }
-                    let old = object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?;
+                    let old = match stat.st_mode & libc::S_IFMT {
+                        libc::S_IFREG | libc::S_IFLNK => {
+                            object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?
+                        }
+                        libc::S_IFDIR => {
+                            let directory =
+                                empty_directory::EmptyDirectory::capture(&effect, stat)?;
+                            let object = directory.object;
+                            empty_directory = Some(directory);
+                            object
+                        }
+                        _ => return Err(unknown()),
+                    };
                     if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
                         && !self.inventory.excludes_operator_links_blocking(old)?
                     {
                         return Err(unknown());
                     }
                     candidates.push(old);
+                } else if matches!(effect.kind, SourceEffectKind::NamespaceRetirement) {
+                    return Err(unknown());
                 }
             }
             SourceEffectKind::PrivateLeafMetadata => {
@@ -257,21 +270,6 @@ impl LocalSourceEffects {
                 if stat_at_optional(effect.parent, effect.name)?.is_some() {
                     return Err(unknown());
                 }
-            }
-            SourceEffectKind::NamespaceRetirement => {
-                let stat = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;
-                // Neither leaf kind contains a subtree. A LINK can still be
-                // original operator provenance outside the physical inventory.
-                if !matches!(stat.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFLNK) {
-                    return Err(unknown());
-                }
-                let object = object_key(effect.parent, Some(effect.name))?.ok_or_else(unknown)?;
-                if stat.st_mode & libc::S_IFMT == libc::S_IFLNK
-                    && !self.inventory.excludes_operator_links_blocking(object)?
-                {
-                    return Err(unknown());
-                }
-                candidates.push(object);
             }
             SourceEffectKind::InodeMetadata => {
                 let named = stat_at_optional(effect.parent, effect.name)?.ok_or_else(unknown)?;
@@ -366,6 +364,9 @@ impl LocalSourceEffects {
         // Recheck original bindings after census; held directory identity
         // alone must not hide a relocation during enumeration.
         self.validate_originals_blocking()?;
+        if let Some(directory) = empty_directory {
+            directory.verify(&effect)?;
+        }
         Ok(parent)
     }
 
