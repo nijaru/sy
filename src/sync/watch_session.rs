@@ -366,16 +366,15 @@ mod tests {
                     dirs_only,
                 },
             );
-            let (stop, stopped) = oneshot::channel();
-            let producer = async {
-                wait_for(&destination.path().join("initial")).await;
-                stop.send(()).unwrap();
-            };
-            let (result, ()) = tokio::join!(
-                watch.watch_until(async { stopped.await.map_err(io::Error::other) }),
-                producer
-            );
-            result.unwrap();
+            // A failed initial sync must surface its cause, not leave an
+            // independent producer waiting until the publication timeout.
+            watch
+                .watch_until(async {
+                    wait_for(&destination.path().join("initial")).await;
+                    Ok(())
+                })
+                .await
+                .unwrap();
             assert!(!destination.path().join("ignored").exists());
             assert!(!destination.path().join("excluded").exists());
             assert!(!destination.path().join(".git").exists());
