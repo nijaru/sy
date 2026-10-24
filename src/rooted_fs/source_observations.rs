@@ -801,6 +801,11 @@ impl RootedFs {
             return Err(invalid().into());
         }
         if catalogue.scope.is_none() {
+            if scope == SourceRootProtection::Tree {
+                let root = catalogue.require(Path::new(""))?;
+                let fd = self.root_fd.as_raw_fd();
+                catalogue.capture_empty_directory(Path::new(""), fd, None, &root, &stat_fd(fd)?)?;
+            }
             catalogue.scope = Some(scope);
         }
         catalogue.selected = selected;
@@ -885,9 +890,11 @@ impl RootedFs {
                         false,
                     )
                 };
-                catalogue.original_link_result(self, path, result)
+                catalogue
+                    .original_link_result(self, path, result)
+                    .map(|observed| (observed, None))
             }
-            None => inspect(
+            None => inspect_with_stat(
                 ResolutionRoot::Catalogued {
                     rooted: self,
                     catalogue,
@@ -895,7 +902,8 @@ impl RootedFs {
                 parent,
                 path,
                 follow,
-            ),
+            )
+            .map(|(observed, stat, _)| (observed, Some(stat))),
         };
         let result = result.map_err(|error| match error {
             RootedFsError::SourceFollowUnsupported(_) if original.is_some() => {
@@ -903,7 +911,7 @@ impl RootedFs {
             }
             error => error,
         });
-        let observed = catalogue.native_result(result)?;
+        let (observed, stat) = catalogue.native_result(result)?;
         if let Some(original) = original {
             if !original.matches(&observed, true) {
                 return Err(catalogue.changed(path.to_path_buf()));
@@ -915,6 +923,15 @@ impl RootedFs {
                 return Err(catalogue.changed(path.to_path_buf()));
             }
             catalogue.insert(path_key(path), &observed)?;
+            if let Some(stat) = stat {
+                catalogue.capture_empty_directory(
+                    path,
+                    parent,
+                    path.file_name(),
+                    &observed,
+                    &stat,
+                )?;
+            }
         }
         if !catalogue.scanning {
             return Err(invalid().into());

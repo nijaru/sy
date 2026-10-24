@@ -267,9 +267,10 @@ impl SourceInventory {
                                 .all(|candidate| object.independent(*candidate))
                     });
                 if original.named.kind == libc::S_IFDIR as u64 {
-                    qualified &=
-                        c.disposition(original_key)? == SourceDirectoryDisposition::Traversed;
-                    c.child_count(original_key)?;
+                    let children = c.child_count(original_key)?;
+                    qualified &= c.disposition(original_key)?
+                        == SourceDirectoryDisposition::Traversed
+                        || (children == 0 && c.empty_directory_stamp(original_key)?.is_some());
                 }
             }
             if !qualified {
@@ -286,6 +287,23 @@ impl SourceInventory {
                 }
                 let path = c.original_path(parent_key)?;
                 let expected = c.child_count(parent_key)?;
+                if c.disposition(parent_key)? == SourceDirectoryDisposition::Opaque {
+                    // Native attributes do not require opening the omitted
+                    // directory for search/read access, or listing its names.
+                    let directory = match path.parent() {
+                        Some(parent) => {
+                            c.open_original_directory(self.rooted.root_fd.as_raw_fd(), parent)?
+                        }
+                        None => self.rooted.root_fd.try_clone()?,
+                    };
+                    c.check_empty_directory(
+                        parent_key,
+                        directory.as_raw_fd(),
+                        path.file_name(),
+                        &path,
+                    )?;
+                    continue;
+                }
                 let directory =
                     c.open_original_directory(self.rooted.root_fd.as_raw_fd(), &path)?;
                 let mut directory = DirectoryStream::from_directory(directory)?;

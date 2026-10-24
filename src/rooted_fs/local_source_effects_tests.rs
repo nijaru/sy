@@ -71,9 +71,10 @@ async fn native_staging_repeats_original_validation_without_preflight_permission
     let source = SourceRoot::open(source_dir.path().to_path_buf())
         .await
         .unwrap();
-    // Preserve the unqualified staging regression with a genuinely opaque
-    // original scope; a fully enumerated native TREE now has a positive lane.
+    // Nonempty opaque originals have no closure certificate; native-empty
+    // directories and fully enumerated trees have distinct positive lanes.
     std::fs::create_dir(source_dir.path().join("opaque")).unwrap();
+    std::fs::write(source_dir.path().join("opaque/hidden"), b"protected").unwrap();
     source
         .entries(crate::engine::scan::ScanRequest {
             max_depth: Some(1),

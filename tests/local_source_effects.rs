@@ -14,6 +14,81 @@ fn sync(source: &Path, destination: &Path, flags: &[&str]) -> Output {
 }
 #[cfg(target_os = "macos")]
 #[test]
+fn empty_pruned_source_admits_copy_update_and_deletion_backups_without_reading_it() {
+    let fixture = tempfile::tempdir().unwrap();
+    let (source, destination) = directories(fixture.path());
+    let opaque = source.join(".git");
+    std::fs::create_dir(&opaque).unwrap();
+    std::fs::set_permissions(&opaque, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let before = std::fs::symlink_metadata(&opaque).unwrap();
+    std::fs::write(source.join("new"), b"new file").unwrap();
+    std::fs::write(source.join("updated"), b"new replacement bytes").unwrap();
+    std::fs::write(destination.join("updated"), b"old bytes").unwrap();
+    std::fs::write(destination.join("deleted"), b"deleted OLD").unwrap();
+    let backup = fixture.path().join("backup");
+    let output = sync(
+        &source,
+        &destination,
+        &[
+            "--delete",
+            "--force-delete",
+            "--backup",
+            "--backup-dir",
+            backup.to_str().unwrap(),
+            "--exclude-vcs",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(destination.join("new")).unwrap(), b"new file");
+    assert_eq!(
+        std::fs::read(destination.join("updated")).unwrap(),
+        b"new replacement bytes"
+    );
+    assert!(!destination.join("deleted").exists());
+    assert!(!destination.join(".git").exists());
+    assert_eq!(
+        std::fs::read(backup.join("updated~")).unwrap(),
+        b"old bytes"
+    );
+    assert_eq!(
+        std::fs::read(backup.join("deleted~")).unwrap(),
+        b"deleted OLD"
+    );
+    let after = std::fs::symlink_metadata(&opaque).unwrap();
+    assert_eq!(
+        (
+            after.ino(),
+            after.nlink(),
+            after.mode(),
+            after.mtime(),
+            after.mtime_nsec(),
+            after.ctime(),
+            after.ctime_nsec()
+        ),
+        (
+            before.ino(),
+            before.nlink(),
+            before.mode(),
+            before.mtime(),
+            before.mtime_nsec(),
+            before.ctime(),
+            before.ctime_nsec()
+        )
+    );
+    assert_eq!(std::fs::read(source.join("new")).unwrap(), b"new file");
+    assert_eq!(
+        std::fs::read(source.join("updated")).unwrap(),
+        b"new replacement bytes"
+    );
+    std::fs::set_permissions(opaque, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn off_path_operator_links_are_protected_from_replacement_deletion_and_timestamps() {
     for effect in ["replace", "delete", "timestamp"] {
         let fixture = tempfile::tempdir().unwrap();

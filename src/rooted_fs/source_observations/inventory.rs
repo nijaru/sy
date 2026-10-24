@@ -3,6 +3,7 @@
 //! observation owner or per-entry resident state is introduced.
 use super::*;
 mod census;
+mod empty;
 #[cfg(test)]
 #[path = "inventory_tests.rs"]
 mod tests;
