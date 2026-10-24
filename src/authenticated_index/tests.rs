@@ -120,6 +120,57 @@ fn payload_index_and_truncation_fail_terminally_before_decode_or_absence() {
 }
 
 #[test]
+fn authenticated_child_edges_cannot_become_false_absence_or_update_paths() {
+    for fault in 0..3 {
+        for update in [false, true] {
+            let mut index = Index::new().unwrap();
+            index.set_bytes([0; 32], state(1)).unwrap();
+            index.set_bytes([0x0f; 32], state(2)).unwrap();
+            let root = index.root.unwrap();
+            let Node::Branch(mut branch) = index.read(root).unwrap() else {
+                panic!("two distinct keys require a branch");
+            };
+            assert_eq!(branch.depth, 1);
+            let malformed = if fault == 2 {
+                // A locally valid child branch must still advance its parent's
+                // depth, even if it has matching routing bits and valid leaves.
+                Node::Branch(branch)
+            } else {
+                let mut key = [0; 32];
+                key[0] = if fault == 0 { 0x10 } else { 1 };
+                // Independently violate the shared prefix or selected nibble.
+                Node::Leaf {
+                    key,
+                    state: state(3),
+                }
+            };
+            // Re-sign a structurally inconsistent edge in this native-owned
+            // fixture. Scratch attackers cannot replace the retained digest.
+            let mut end = index.end;
+            branch.children[0] = Some(index.write(end, malformed, &mut end).unwrap());
+            index.root = Some(
+                index
+                    .write(root.offset, Node::Branch(branch), &mut end)
+                    .unwrap(),
+            );
+            index.end = end;
+            let error = if update {
+                index.set_bytes([0; 32], state(4)).unwrap_err()
+            } else {
+                index.get_bytes([0; 32]).unwrap_err()
+            };
+            assert!(matches!(
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<StateError>()),
+                Some(StateError::Path)
+            ));
+            assert_terminal(&mut index);
+        }
+    }
+}
+
+#[test]
 fn failed_state_write_retains_old_root_and_poisons_all_operations() {
     let mut index = Index::new().unwrap();
     index.set_bytes([0; 32], state(1)).unwrap();

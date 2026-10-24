@@ -219,49 +219,59 @@ impl<const N: usize> AuthenticatedIndex<N> {
         Ok(Node::Branch(branch))
     }
 
-    fn proof(&mut self, key: [u8; 32]) -> io::Result<Proof<N>> {
-        let mut proof = Proof {
-            path: [None; LEVELS],
-            len: 0,
-            terminal: None,
-        };
+    /// Authenticate every edge, retaining only the previous routing boundary.
+    /// Reads need no update path; writers collect the same authenticated steps.
+    fn walk(
+        &mut self,
+        key: [u8; 32],
+        mut visit: impl FnMut(Step),
+    ) -> io::Result<Option<(Locator, Node<N>)>> {
+        let mut parent: Option<(u8, [u8; 32])> = None;
+        let mut steps = 0;
         let mut cursor = self.root;
         while let Some(locator) = cursor {
             let node = self.read(locator)?;
-            if proof.len > 0 {
-                let parent = proof.path[proof.len - 1]
-                    .ok_or_else(|| invalid(StateError::Path))?
-                    .branch;
-                let depth = usize::from(parent.depth);
-                if prefix(node.key(), depth) != parent.prefix
-                    || nibble(&node.key(), depth) != nibble(&key, depth)
-                    || matches!(node, Node::Branch(branch) if branch.depth <= parent.depth)
+            if let Some((depth, expected_prefix)) = parent {
+                if prefix(node.key(), usize::from(depth)) != expected_prefix
+                    || nibble(&node.key(), usize::from(depth)) != nibble(&key, usize::from(depth))
+                    || matches!(node, Node::Branch(branch) if branch.depth <= depth)
                 {
                     return Err(invalid(StateError::Path));
                 }
             }
             match node {
                 Node::Branch(branch) if prefix(key, usize::from(branch.depth)) == branch.prefix => {
-                    if proof.len == LEVELS {
+                    if steps == LEVELS {
                         return Err(invalid(StateError::Path));
                     }
-                    proof.path[proof.len] = Some(Step { locator, branch });
-                    proof.len += 1;
+                    steps += 1;
+                    visit(Step { locator, branch });
+                    parent = Some((branch.depth, branch.prefix));
                     cursor = branch.children[nibble(&key, usize::from(branch.depth))];
                 }
-                _ => {
-                    proof.terminal = Some((locator, node));
-                    break;
-                }
+                _ => return Ok(Some((locator, node))),
             }
         }
+        Ok(None)
+    }
+
+    fn proof(&mut self, key: [u8; 32]) -> io::Result<Proof<N>> {
+        let mut proof = Proof {
+            path: [None; LEVELS],
+            len: 0,
+            terminal: None,
+        };
+        proof.terminal = self.walk(key, |step| {
+            proof.path[proof.len] = Some(step);
+            proof.len += 1;
+        })?;
         Ok(proof)
     }
 
     pub(crate) fn get_bytes(&mut self, key: [u8; 32]) -> io::Result<Option<[u8; N]>> {
         self.begin()?;
-        let proof = self.proof(key)?;
-        let state = match proof.terminal {
+        let terminal = self.walk(key, |_| {})?;
+        let state = match terminal {
             Some((_, Node::Leaf { key: found, state })) if key == found => Some(state),
             _ => None,
         };

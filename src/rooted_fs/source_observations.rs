@@ -3,7 +3,10 @@
 //! Only scanner capture inserts records. Readers can only validate them.
 use super::*;
 use crate::authenticated_index::AuthenticatedIndex;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 
 #[cfg(test)]
 use inventory::SourceExclusion;
@@ -493,7 +496,7 @@ impl Catalogue {
         };
         self.read_locator(locator).map(Some)
     }
-    fn read_locator(&mut self, locator: [u8; 48]) -> Result<Observation> {
+    fn read_locator(&self, locator: [u8; 48]) -> Result<Observation> {
         let offset = u64::from_le_bytes(locator[..8].try_into().map_err(|_| invalid())?);
         let length = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| invalid())?);
         if length > MAX_RECORD as u64 || offset.checked_add(length).is_none_or(|end| end > self.end)
@@ -501,8 +504,7 @@ impl Catalogue {
             return Err(invalid().into());
         }
         let mut bytes = vec![0; length as usize];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut bytes)?;
+        self.file.read_exact_at(&mut bytes, offset)?;
         if blake3::hash(&bytes).as_bytes() != &locator[16..] {
             return Err(invalid().into());
         }
