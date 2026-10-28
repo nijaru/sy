@@ -1,4 +1,4 @@
-//! Native destination facts for one immediate SOURCE exclusion check.
+//! Native destination facts for SOURCE exclusion, never effect permission.
 //! Capturing these facts performs no SOURCE validation and grants no effect.
 use super::*;
 

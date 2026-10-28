@@ -424,6 +424,7 @@ fn controller_source_race(error: &ControllerError) -> bool {
         ControllerError::Backend {
             phase:
                 "LOCAL SOURCE effects"
+                | "LOCAL SOURCE preflight"
                 | "LOCAL SOURCE delete effects"
                 | "LOCAL SOURCE directory effects"
                 | "LOCAL SOURCE backup effects",
@@ -471,6 +472,14 @@ mod tests {
         assert!(is_drained_source_race(&map_controller_error(scan(
             Side::Source
         ))));
+        for error in [
+            RootedFsError::SourceBindingChanged("file".into()),
+            RootedFsError::SourceRaceCutoff,
+        ] {
+            assert!(is_drained_source_race(&map_controller_error(
+                ControllerError::backend("LOCAL SOURCE preflight", error)
+            )));
+        }
         let cutoff = || {
             ControllerError::backend(
                 "execution",
@@ -487,6 +496,21 @@ mod tests {
         }
         let fatal = [
             scan(Side::Destination),
+            ControllerError::backend(
+                "LOCAL SOURCE preflight",
+                RootedFsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scratch authentication",
+                )),
+            ),
+            ControllerError::backend(
+                "LOCAL SOURCE preflight",
+                RootedFsError::SourceCatalogueTerminal,
+            ),
+            ControllerError::backend(
+                "LOCAL SOURCE preflight",
+                RootedFsError::Worker("native worker".into()),
+            ),
             ControllerError::backend(
                 "execution",
                 LocalSyncError::Rooted(RootedFsError::SourceCatalogueTerminal),

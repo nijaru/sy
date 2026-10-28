@@ -6,7 +6,44 @@ use crate::fs_util::directory_stream::DirectoryStream;
 mod seen;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
+use crate::rooted_fs::local_source_effects::preflight::Declarations;
 use seen::SeenOriginals;
+
+enum Candidates<'a> {
+    Immediate(&'a [NativeObjectKey], SourceExclusion),
+    Declared(&'a mut Declarations),
+}
+
+impl Candidates<'_> {
+    fn independent(&mut self, source: NativeObjectKey) -> Result<bool> {
+        match self {
+            Self::Immediate(objects, _) => {
+                Ok(objects.iter().all(|object| source.independent(*object)))
+            }
+            Self::Declared(declarations) => declarations.independent(source),
+        }
+    }
+
+    fn excludes_additional(
+        &mut self,
+        catalogue: &mut Catalogue,
+        rooted: &RootedFs,
+    ) -> Result<bool> {
+        match self {
+            Self::Immediate(_, exclusion) => catalogue.excludes_additional(rooted, *exclusion),
+            Self::Declared(declarations) => {
+                for ordinal in 0..declarations.count {
+                    catalogue.check_run()?;
+                    if !catalogue.excludes_additional(rooted, declarations.exclusion(ordinal)?)? {
+                        declarations.refused = Some(ordinal);
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+}
 
 impl Catalogue {
     pub(super) fn open_original_directory(&mut self, root: RawFd, path: &Path) -> Result<OwnedFd> {
@@ -194,18 +231,26 @@ impl SourceInventory {
             }
             _ => {}
         }
+        self.excludes_candidates_blocking(Candidates::Immediate(candidates, exclusion))
+    }
+
+    pub(in crate::rooted_fs) fn excludes_declarations_blocking(
+        &self,
+        declarations: &mut Declarations,
+    ) -> Result<bool> {
+        self.excludes_candidates_blocking(Candidates::Declared(declarations))
+    }
+
+    fn excludes_candidates_blocking(&self, mut candidates: Candidates<'_>) -> Result<bool> {
         let selected = self.selected_leaf_keys_blocking()?;
         self.with_original_batch(|c| {
             if let Some(selected) = selected {
                 c.validate_original_records(&self.rooted)?;
-                if !selected.iter().all(|source| {
-                    candidates
-                        .iter()
-                        .all(|candidate| source.independent(*candidate))
-                }) {
-                    return Ok(false);
+                let mut qualified = true;
+                for source in selected {
+                    qualified &= candidates.independent(source)?;
                 }
-                return c.excludes_additional(&self.rooted, exclusion);
+                return Ok(qualified && candidates.excludes_additional(c, &self.rooted)?);
             }
             if c.scope != Some(SourceRootProtection::Tree) {
                 c.validate_original_records(&self.rooted)?;
@@ -226,22 +271,22 @@ impl SourceInventory {
                 c.check_original_ordinal(ordinal, original_key)?;
                 let physical = if original.followed {
                     c.qualifies_follow_resolution(&original)?
-                        && original.followed_object_key.is_some_and(|object| {
-                            view.0[..24] == object.0[..24]
-                                && candidates
-                                    .iter()
-                                    .all(|candidate| object.independent(*candidate))
-                        })
+                        && match original.followed_object_key {
+                            Some(object) => {
+                                view.0[..24] == object.0[..24] && candidates.independent(object)?
+                            }
+                            None => false,
+                        }
                 } else {
                     original.named == original.effective
                 };
                 qualified &= physical
-                    && original.object_key.is_some_and(|object| {
-                        view.0[..24] == object.0[..24]
-                            && candidates
-                                .iter()
-                                .all(|candidate| object.independent(*candidate))
-                    });
+                    && match original.object_key {
+                        Some(object) => {
+                            view.0[..24] == object.0[..24] && candidates.independent(object)?
+                        }
+                        None => false,
+                    };
                 if original.named.kind == libc::S_IFDIR as u64 {
                     let children = c.child_count(original_key)?;
                     qualified &= c.disposition(original_key)? != SourceDirectoryDisposition::Opaque
@@ -359,7 +404,7 @@ impl SourceInventory {
                     c.validate_native_binding(&self.rooted, &path, true)?;
                 }
             }
-            c.excludes_additional(&self.rooted, exclusion)
+            candidates.excludes_additional(c, &self.rooted)
         })
     }
 }

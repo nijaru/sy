@@ -31,21 +31,6 @@ impl BackupRoot {
     }
 
     #[cfg(unix)]
-    pub(crate) async fn validate_local_source_effect(
-        &self,
-        effects: &local_source_effects::LocalSourceEffects,
-        path: RelativePath,
-    ) -> Result<()> {
-        effects
-            .validate_effect(
-                &self.original()?,
-                path,
-                local_source_effects::SourceEffectKind::LeafPublication,
-            )
-            .await
-    }
-
-    #[cfg(unix)]
     pub(crate) fn complete_local_source_effects(
         &self,
         effects: &local_source_effects::LocalSourceEffects,
@@ -65,7 +50,7 @@ impl BackupRoot {
         effects.complete_root_declarations(original)
     }
 
-    fn original(&self) -> Result<DestinationRoot> {
+    pub(in crate::rooted_fs) fn original(&self) -> Result<DestinationRoot> {
         let state = self
             .state
             .lock()

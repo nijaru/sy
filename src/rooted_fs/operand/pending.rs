@@ -37,23 +37,28 @@ impl CreationProof {
 }
 
 impl PendingRoot {
-    pub(in crate::rooted_fs) fn declare_source_effect_blocking(
+    pub(in crate::rooted_fs) fn with_declared_source_effect_blocking<T>(
         &self,
         effects: &LocalSourceEffects,
         path: &Path,
         kind: SourceEffectKind,
-    ) -> Result<()> {
+        validate: impl FnOnce(SourceEffect<'_>) -> Result<T>,
+    ) -> Result<T> {
         self.ancestor.verify_root_path_blocking()?;
         if !matches!(
             kind,
             SourceEffectKind::LeafPublication | SourceEffectKind::DirectoryNamespaceChange
         ) {
-            return effects.refuse_native_effect_blocking(path);
+            return Err(RootedFsError::SourceEffectUnqualified(path.to_path_buf()));
         }
         let prefix: PathBuf = self.missing.iter().collect();
         // The authenticated first absent edge qualifies new-only descendants.
         // No OLD, parent object identity or name profile is projected below it.
-        effects.validate_declared_effect_blocking(&self.ancestor, &prefix.join(path), kind)?;
+        let result = self.ancestor.with_declared_source_effect_blocking(
+            &prefix.join(path),
+            kind,
+            validate,
+        )?;
         let ancestor = native_object::object_key(self.ancestor.root_fd.as_raw_fd(), None)?
             .ok_or_else(|| RootedFsError::SourceEffectUnqualified(self.path.clone()))?;
         let namespace = self
@@ -77,7 +82,7 @@ impl PendingRoot {
                 if proof.same_scope(effects, &self.ancestor) && proof.ancestor == ancestor => {}
             _ => return Err(RootedFsError::SourceEffectUnqualified(self.path.clone())),
         }
-        Ok(())
+        Ok(result)
     }
 
     pub(in crate::rooted_fs) fn complete_source_effects(

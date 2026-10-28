@@ -25,7 +25,7 @@ pub(crate) enum SourceDirectoryDisposition {
 
 /// Additional namespace footprint; its object must also occur in the census
 /// candidates. These are requests for proof, never reusable effect permits.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::rooted_fs) enum SourceExclusion {
     Objects,
     OperatorLinks(NativeObjectKey),
@@ -338,6 +338,13 @@ impl SourceInventory {
     /// One locked native-binding batch, not a reusable lease or snapshot.
     pub(in crate::rooted_fs) fn validate_originals_blocking(&self) -> Result<()> {
         self.with_original_batch(|c| c.validate_original_records(&self.rooted))
+    }
+
+    pub(in crate::rooted_fs) fn validate_preflight_scratch_blocking(&self) -> Result<()> {
+        self.validate_lifetime_blocking()?;
+        let root = File::from(self.rooted.root_fd.try_clone()?);
+        crate::engine::scan_sort::validate_scratch_root(&root, &tempfile::env::temp_dir())?;
+        Ok(())
     }
 
     /// Allocation can record the current sealed owner, never an effect permit.

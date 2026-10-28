@@ -5,6 +5,7 @@ pub(super) mod ancestry;
 mod empty_directory;
 mod footprint;
 pub(super) mod native_object;
+pub(crate) mod preflight;
 use native_object::object_key;
 #[cfg(all(test, target_os = "macos"))]
 mod private_file_tests;
@@ -94,85 +95,18 @@ impl LocalSourceEffects {
             .map_err(source_error)
     }
 
-    pub async fn validate_effect(
+    #[cfg(test)]
+    async fn validate_effect(
         &self,
         destination: &operand::DestinationRoot,
         path: RelativePath,
         kind: SourceEffectKind,
     ) -> Result<()> {
-        let effects = self.clone();
-        let destination = destination.clone();
-        tokio::task::spawn_blocking(move || match destination {
-            operand::DestinationRoot::Present(rooted) => {
-                rooted.verify_root_path_blocking()?;
-                effects.validate_declared_effect_blocking(&rooted, path.as_path(), kind)
-            }
-            operand::DestinationRoot::Pending(pending) => {
-                pending.declare_source_effect_blocking(&effects, path.as_path(), kind)
-            }
-        })
-        .await
-        .map_err(|error| RootedFsError::Worker(error.to_string()))?
-    }
-
-    pub(super) fn validate_declared_effect_blocking(
-        &self,
-        rooted: &RootedFs,
-        path: &Path,
-        kind: SourceEffectKind,
-    ) -> Result<()> {
-        let parent_path = path.parent().ok_or(RootedFsError::InvalidRelativePath)?;
-        let mut directory = rooted.root_fd.try_clone()?;
-        let mut prefix = PathBuf::new();
-        for component in parent_path.components() {
-            let Component::Normal(name) = component else {
-                return Err(RootedFsError::InvalidRelativePath);
-            };
-            prefix.push(name);
-            let absent = rooted.namespace_predicts_absent(&prefix, directory.as_raw_fd())?;
-            match open_dir_at(directory.as_raw_fd(), name) {
-                Ok(_) if absent => return Err(RootedFsError::DestinationChanged(prefix)),
-                Ok(fd) => directory = fd,
-                Err(RootedFsError::Io(error))
-                    if absent
-                        && error.raw_os_error() == Some(libc::ENOENT)
-                        && matches!(
-                            kind,
-                            SourceEffectKind::LeafPublication
-                                | SourceEffectKind::DirectoryNamespaceChange
-                        ) =>
-                {
-                    // Only new-only descendants can exist below this original
-                    // absent slot. Admit its actual namespace effect, not a
-                    // projected identity or name profile for future parents.
-                    self.admit_native_effect_blocking(SourceEffect {
-                        kind: SourceEffectKind::DirectoryNamespaceChange,
-                        parent: directory.as_raw_fd(),
-                        name,
-                        object: None,
-                        path: &prefix,
-                    })?;
-                    // Admission above qualifies this actual APFS volume. Plain
-                    // mkdir allocates new directory objects, not directory
-                    // aliases. Every materialized parent still needs its own
-                    // namespace binding and native SOURCE admission at use.
-                    if !ancestry::unique_directory_parents(directory.as_raw_fd())? {
-                        return self.refuse_native_effect_blocking(path);
-                    }
-                    return Ok(());
-                }
-                Err(error) => return Err(error),
-            }
-            rooted.verify_namespace_directory(&prefix, directory.as_raw_fd())?;
-        }
-        rooted.verify_namespace_directory(parent_path, directory.as_raw_fd())?;
-        self.admit_native_effect_blocking(SourceEffect {
-            kind,
-            parent: directory.as_raw_fd(),
-            name: path.file_name().ok_or(RootedFsError::InvalidRelativePath)?,
-            object: None,
-            path,
-        })
+        let preflight = preflight::EffectPreflight::new(self, destination, None).await?;
+        preflight
+            .declare(preflight::EffectRoot::Main, path, kind)
+            .await?;
+        preflight.finish().await
     }
 
     pub(super) fn admit_native_effect_blocking(&self, effect: SourceEffect<'_>) -> Result<()> {
@@ -183,7 +117,6 @@ impl LocalSourceEffects {
         &self,
         effect: SourceEffect<'_>,
     ) -> Result<native_object::NativeObjectKey> {
-        let unknown = || RootedFsError::SourceEffectUnqualified(effect.path.to_path_buf());
         let footprint = match effect.capture_footprint() {
             Ok(footprint) => footprint,
             Err(error) => {
@@ -194,17 +127,28 @@ impl LocalSourceEffects {
                 return Err(error);
             }
         };
+        self.validate_footprint_blocking(&effect, &footprint)?;
+        Ok(footprint.parent)
+    }
+
+    fn validate_footprint_blocking(
+        &self,
+        effect: &SourceEffect<'_>,
+        footprint: &footprint::NativeFootprint,
+    ) -> Result<()> {
         let independent = self
             .inventory
             .excludes_objects_blocking(&footprint.candidates, footprint.additional)
             .map_err(source_error)?;
         if !independent {
-            return Err(unknown());
+            return Err(RootedFsError::SourceEffectUnqualified(
+                effect.path.to_path_buf(),
+            ));
         }
-        if let Some(directory) = footprint.empty_directory {
-            directory.verify(&effect)?;
+        if let Some(directory) = &footprint.empty_directory {
+            directory.verify(effect)?;
         }
-        Ok(footprint.parent)
+        Ok(())
     }
 
     pub(crate) fn complete_root_declarations(
@@ -219,11 +163,6 @@ impl LocalSourceEffects {
 
     pub(super) fn same_source(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inventory, &other.inventory)
-    }
-
-    pub(super) fn refuse_native_effect_blocking(&self, path: &Path) -> Result<()> {
-        self.validate_originals_blocking()?;
-        Err(RootedFsError::SourceEffectUnqualified(path.to_path_buf()))
     }
 }
 
@@ -246,6 +185,65 @@ impl PrivateCreationAdmission {
 }
 
 impl RootedFs {
+    pub(super) fn with_declared_source_effect_blocking<T>(
+        &self,
+        path: &Path,
+        kind: SourceEffectKind,
+        validate: impl FnOnce(SourceEffect<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let parent_path = path.parent().ok_or(RootedFsError::InvalidRelativePath)?;
+        let mut directory = self.root_fd.try_clone()?;
+        let mut prefix = PathBuf::new();
+        for component in parent_path.components() {
+            let Component::Normal(name) = component else {
+                return Err(RootedFsError::InvalidRelativePath);
+            };
+            prefix.push(name);
+            let absent = self.namespace_predicts_absent(&prefix, directory.as_raw_fd())?;
+            match open_dir_at(directory.as_raw_fd(), name) {
+                Ok(_) if absent => return Err(RootedFsError::DestinationChanged(prefix)),
+                Ok(fd) => directory = fd,
+                Err(RootedFsError::Io(error))
+                    if absent
+                        && error.raw_os_error() == Some(libc::ENOENT)
+                        && matches!(
+                            kind,
+                            SourceEffectKind::LeafPublication
+                                | SourceEffectKind::DirectoryNamespaceChange
+                        ) =>
+                {
+                    // Only new-only descendants can exist below this original
+                    // absent slot. Capture its actual namespace effect, not a
+                    // projected identity or name profile for future parents.
+                    let result = validate(SourceEffect {
+                        kind: SourceEffectKind::DirectoryNamespaceChange,
+                        parent: directory.as_raw_fd(),
+                        name,
+                        object: None,
+                        path: &prefix,
+                    })?;
+                    // Qualify native unique parentage before predicting
+                    // new-only descendants. SOURCE exclusion still belongs to
+                    // completed preflight and each materialized parent at use.
+                    if !ancestry::unique_directory_parents(directory.as_raw_fd())? {
+                        return Err(RootedFsError::SourceEffectUnqualified(path.to_path_buf()));
+                    }
+                    return Ok(result);
+                }
+                Err(error) => return Err(error),
+            }
+            self.verify_namespace_directory(&prefix, directory.as_raw_fd())?;
+        }
+        self.verify_namespace_directory(parent_path, directory.as_raw_fd())?;
+        validate(SourceEffect {
+            kind,
+            parent: directory.as_raw_fd(),
+            name: path.file_name().ok_or(RootedFsError::InvalidRelativePath)?,
+            object: None,
+            path,
+        })
+    }
+
     pub(super) fn admit_private_creation_blocking(
         &self,
         effect: SourceEffect<'_>,

@@ -4,6 +4,7 @@ use super::*;
 use crate::engine::backup::{BackupAddress, BackupPolicy};
 use crate::engine::hardlink_runtime::intent::{destination, GroupIntent};
 use crate::rooted_fs::backup::BackupRoot;
+use crate::rooted_fs::local_source_effects::preflight::{EffectPreflight, EffectRoot};
 use crate::rooted_fs::local_source_effects::{LocalSourceEffects, SourceEffectKind};
 use crate::rooted_fs::operand::DestinationRoot;
 
@@ -24,6 +25,14 @@ impl SyncPlan {
         F: FnMut(SyncOp, ExecutionPolicy) -> Result<bool>,
     {
         self.hardlinks.revalidate(&self.reader).await?;
+        let preflight = EffectPreflight::new(
+            effects,
+            destination_root,
+            backup.and_then(|(_, root)| root.as_ref()),
+        )
+        .await
+        .map_err(|error| ControllerError::backend("LOCAL SOURCE preflight", error))?;
+        let declarations = &preflight;
         while let Some(record) = self.reader.next_record().await? {
             let operation = record.operation;
             if !matches!(operation, SyncOp::Skip { .. }) {
@@ -59,9 +68,8 @@ impl SyncPlan {
                             // does not grant native created-inode link authority.
                             let mut members = group.members().await?;
                             while let Some(member) = members.next().await? {
-                                validate_publication_and_backup(
-                                    effects,
-                                    destination_root,
+                                declare_publication_and_backup(
+                                    declarations,
                                     backup,
                                     &member,
                                     SourceEffectKind::LeafPublication,
@@ -101,23 +109,16 @@ impl SyncPlan {
                         _ => SourceEffectKind::Unknown,
                     }
                 };
-                validate_publication_and_backup(
-                    effects,
-                    destination_root,
-                    backup,
-                    &operation,
-                    kind,
-                )
-                .await?;
+                declare_publication_and_backup(declarations, backup, &operation, kind).await?;
             }
         }
         self.reader.rewind()?;
         if let Some(delete) = &mut self.delete {
             delete
                 .validate_actions(|action| async move {
-                    effects
-                        .validate_effect(
-                            destination_root,
+                    declarations
+                        .declare(
+                            EffectRoot::Main,
                             action.path.clone(),
                             SourceEffectKind::NamespaceRetirement,
                         )
@@ -126,7 +127,7 @@ impl SyncPlan {
                             ControllerError::backend("LOCAL SOURCE delete effects", error)
                         })?;
                     if action.kind == crate::engine::domain::EntryKind::File {
-                        validate_backup(effects, destination_root, backup, &action.path).await?;
+                        declare_backup(declarations, backup, &action.path).await?;
                     }
                     Ok::<(), ControllerError>(())
                 })
@@ -142,9 +143,9 @@ impl SyncPlan {
                     // work. Its existence is not a directory setter.
                     return Ok(());
                 }
-                effects
-                    .validate_effect(
-                        destination_root,
+                declarations
+                    .declare(
+                        EffectRoot::Main,
                         metadata.path,
                         if metadata.target == DirectoryTarget::Create {
                             SourceEffectKind::DirectoryNamespaceChange
@@ -160,6 +161,10 @@ impl SyncPlan {
                     })
             })
             .await?;
+        preflight
+            .finish()
+            .await
+            .map_err(|error| ControllerError::backend("LOCAL SOURCE preflight", error))?;
         // No root can materialize on one declaration while a later member,
         // backup, delete or directory policy remains unqualified.
         effects
@@ -175,26 +180,24 @@ impl SyncPlan {
     }
 }
 
-async fn validate_publication_and_backup(
-    effects: &LocalSourceEffects,
-    destination_root: &DestinationRoot,
+async fn declare_publication_and_backup(
+    declarations: &EffectPreflight,
     backup: Option<&(BackupPolicy, Option<BackupRoot>)>,
     operation: &SyncOp,
     kind: SourceEffectKind,
 ) -> Result<()> {
-    effects
-        .validate_effect(destination_root, operation.path().clone(), kind)
+    declarations
+        .declare(EffectRoot::Main, operation.path().clone(), kind)
         .await
         .map_err(|error| ControllerError::backend("LOCAL SOURCE effects", error))?;
     if destination(operation).is_some_and(|old| old.is_file()) {
-        validate_backup(effects, destination_root, backup, operation.path()).await?;
+        declare_backup(declarations, backup, operation.path()).await?;
     }
     Ok(())
 }
 
-async fn validate_backup(
-    effects: &LocalSourceEffects,
-    destination_root: &DestinationRoot,
+async fn declare_backup(
+    declarations: &EffectPreflight,
     backup: Option<&(BackupPolicy, Option<BackupRoot>)>,
     path: &RelativePath,
 ) -> Result<()> {
@@ -204,19 +207,19 @@ async fn validate_backup(
             .map_err(|error| ControllerError::backend("LOCAL SOURCE backup address", error))?;
         let result = match address {
             BackupAddress::Main(path) => {
-                effects
-                    .validate_effect(destination_root, path, SourceEffectKind::LeafPublication)
+                declarations
+                    .declare(EffectRoot::Main, path, SourceEffectKind::LeafPublication)
                     .await
             }
             BackupAddress::FixedRoot(path) => {
-                root.as_ref()
-                    .ok_or_else(|| {
-                        ControllerError::backend(
-                            "LOCAL SOURCE backup root",
-                            std::io::Error::other("missing original root"),
-                        )
-                    })?
-                    .validate_local_source_effect(effects, path)
+                root.as_ref().ok_or_else(|| {
+                    ControllerError::backend(
+                        "LOCAL SOURCE backup root",
+                        std::io::Error::other("missing original root"),
+                    )
+                })?;
+                declarations
+                    .declare(EffectRoot::Backup, path, SourceEffectKind::LeafPublication)
                     .await
             }
         };
