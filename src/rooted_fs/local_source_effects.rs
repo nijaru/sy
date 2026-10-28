@@ -7,6 +7,8 @@ mod footprint;
 pub(super) mod native_object;
 use native_object::object_key;
 #[cfg(all(test, target_os = "macos"))]
+mod private_file_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod symlink_tests;
 #[cfg(test)]
 #[path = "local_source_effects_tests.rs"]
@@ -77,6 +79,18 @@ impl LocalSourceEffects {
     pub(super) fn validate_originals_blocking(&self) -> Result<()> {
         self.inventory
             .validate_originals_blocking()
+            .map_err(source_error)
+    }
+
+    pub(super) fn validate_lifetime_blocking(&self) -> Result<()> {
+        self.inventory
+            .validate_lifetime_blocking()
+            .map_err(source_error)
+    }
+
+    pub(super) fn excludes_private_creator_blocking(&self, creator: RawFd) -> Result<bool> {
+        self.inventory
+            .excludes_private_creator_blocking(creator)
             .map_err(source_error)
     }
 

@@ -574,6 +574,7 @@ pub(crate) enum PublicationPausePoint {
     AfterSourceValidation,
     AfterSourceCensus,
     AfterPrivateDirectoryCreation,
+    AfterPrivateFileCreation,
     AfterSymlinkCreation,
     BeforeSymlinkMetadata,
     BeforeAdmission,
@@ -2718,14 +2719,7 @@ impl RootedFs {
     ) -> Result<RootedStagedFile> {
         let mut namespace =
             self.begin_namespace_blocking(relative, expected, StagingOrigin::Created)?;
-        let file = match create_staging_file_at(
-            namespace.staging_dir_fd.as_raw_fd(),
-            &namespace.temp_name,
-        ) {
-            Ok(file) => file,
-            Err(error) => return Err(namespace.abort_after(error)),
-        };
-        let file = match namespace.register_created_staging(file) {
+        let file = match namespace.create_regular_staging_file_blocking() {
             Ok(file) => file,
             Err(error) => return Err(namespace.abort_after(error)),
         };

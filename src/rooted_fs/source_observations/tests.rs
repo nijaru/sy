@@ -12,6 +12,33 @@ async fn scanned(root: &Path) -> (RootedFs, Vec<crate::engine::domain::Entry>) {
 }
 
 #[tokio::test]
+async fn cancellation_between_active_and_begin_irrevocably_ends_the_owner() {
+    let root = tempfile::tempdir().unwrap();
+    let (rooted, _) = scanned(root.path()).await;
+    let inventory = rooted.seal_source_inventory_blocking().unwrap();
+    let cancelled = rooted.source_run_cancellation(false).unwrap();
+    {
+        let mut owner = rooted.source_observations.lock().unwrap();
+        let c = owner.active().unwrap();
+        cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            c.begin(),
+            Err(RootedFsError::SourceCatalogueTerminal)
+        ));
+        assert!(c.healthy, "the failed begin did not enter a batch");
+        cancelled.store(false, Ordering::Release);
+    }
+    assert!(matches!(
+        inventory.validate_lifetime_blocking(),
+        Err(RootedFsError::SourceCatalogueTerminal)
+    ));
+    assert!(matches!(
+        rooted.seal_source_inventory_blocking(),
+        Err(RootedFsError::SourceCatalogueTerminal)
+    ));
+}
+
+#[tokio::test]
 async fn original_scan_parent_is_required_before_first_data_open_and_for_every_hardlink_member() {
     for representative in [true, false] {
         let root = tempfile::tempdir().unwrap();

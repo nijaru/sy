@@ -468,9 +468,12 @@ impl Catalogue {
         }
         result
     }
-    fn check_run(&self) -> Result<()> {
+    fn check_run(&mut self) -> Result<()> {
         self.check_lifetime()?;
         if self.cancelled.load(Ordering::Acquire) {
+            // Cancellation can arrive between active() and begin(), before
+            // the batch becomes unhealthy. Never let clearing a flag revive it.
+            self.run = RunState::Terminal;
             return Err(RootedFsError::SourceCatalogueTerminal);
         }
         match self.run {

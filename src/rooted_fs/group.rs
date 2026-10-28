@@ -143,6 +143,7 @@ impl RootedStagedGroup {
                     .file,
             ),
             created: observed.stat,
+            origin: staging::StagingObjectOrigin::Borrowed,
         });
         alias.cleanup_owned = Some(observed.stat);
         alias.sealed = Some(observed);

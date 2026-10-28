@@ -1,5 +1,6 @@
 //! Separate private-entry cleanup ownership from its prepared publication seal.
 use super::*;
+use local_source_effects::LocalSourceEffects;
 
 #[derive(Clone, Copy)]
 pub(super) struct VerifiedObservation {
@@ -11,6 +12,15 @@ pub(super) struct VerifiedObservation {
 pub(super) struct OwnedStagingEntry {
     pub(super) file: Arc<File>,
     pub(super) created: libc::stat,
+    pub(super) origin: StagingObjectOrigin,
+}
+
+/// Only the allocation-owning helper can mint this fact. In particular,
+/// registration and a private hardlink do not establish exclusive allocation.
+#[cfg(unix)]
+pub(super) enum StagingObjectOrigin {
+    Allocated { source: Option<LocalSourceEffects> },
+    Borrowed,
 }
 
 #[cfg(unix)]
@@ -48,24 +58,63 @@ pub(super) fn same_observation(before: &libc::stat, after: &libc::stat) -> bool 
 impl RootedStagedFile {
     #[cfg(unix)]
     pub(super) fn validate_private_source_effect_blocking(&self) -> Result<()> {
-        if self.namespace.rooted.local_source_effects.is_none() {
+        let Some(effects) = &self.namespace.rooted.local_source_effects else {
             return Ok(());
+        };
+        let observed = self.observe_original_file()?;
+        let owned = self
+            .namespace
+            .staged
+            .as_ref()
+            .ok_or_else(|| self.namespace.staging_changed())?;
+        let independent = match &owned.origin {
+            StagingObjectOrigin::Allocated {
+                source: Some(birth),
+            } if birth.same_source(effects) && self.namespace.group_links.is_none() => {
+                effects.validate_lifetime_blocking()?;
+                self.verify_single_allocated_link(&observed)?;
+                #[cfg(test)]
+                self.namespace
+                    .rooted
+                    .pause_mutation(PublicationPausePoint::AfterSourceValidation);
+                effects
+                    .excludes_private_creator_blocking(self.namespace.staging_dir_fd.as_raw_fd())?
+            }
+            _ => false,
+        };
+        if !independent {
+            self.namespace
+                .rooted
+                .require_source_effect_blocking(SourceEffect {
+                    kind: SourceEffectKind::PrivateLeafMetadata,
+                    parent: self.namespace.staging_dir_fd.as_raw_fd(),
+                    name: &self.namespace.temp_name,
+                    object: Some(self.file.as_raw_fd()),
+                    path: &self.namespace.destination_path,
+                })?;
         }
-        self.observe_original_file()?;
-        self.namespace
-            .rooted
-            .require_source_effect_blocking(SourceEffect {
-                kind: SourceEffectKind::PrivateLeafMetadata,
-                parent: self.namespace.staging_dir_fd.as_raw_fd(),
-                name: &self.namespace.temp_name,
-                object: Some(self.file.as_raw_fd()),
-                path: &self.namespace.destination_path,
-            })?;
-        // Census can outlive the original private-DIR binding while FILE stat
-        // remains unchanged. A setter needs the same late namespace proof.
+        // Either SOURCE proof can outlive the original private-DIR binding.
         self.namespace.verify_group_links_blocking()?;
         self.namespace.verify_private_cleanup_directory_blocking()?;
-        self.observe_original_file().map(|_| ())
+        self.verify_single_allocated_link(&self.observe_original_file()?)
+    }
+
+    #[cfg(unix)]
+    fn verify_single_allocated_link(&self, observed: &VerifiedObservation) -> Result<()> {
+        let owned = self
+            .namespace
+            .staged
+            .as_ref()
+            .ok_or_else(|| self.namespace.staging_changed())?;
+        if matches!(owned.origin, StagingObjectOrigin::Allocated { .. })
+            && self.namespace.group_links.is_none()
+            && (owned.created.st_nlink != 1
+                || observed.stat.st_nlink != 1
+                || observed.stat.st_mode & libc::S_IFMT != libc::S_IFREG)
+        {
+            return Err(self.namespace.staging_changed());
+        }
+        Ok(())
     }
 }
 
@@ -96,23 +145,36 @@ impl RootedNamespaceTransaction {
         self.staged = Some(OwnedStagingEntry {
             file: Arc::new(retained),
             created,
+            origin: StagingObjectOrigin::Borrowed,
         });
         self.cleanup_owned = Some(created);
         self.observe_staging()?;
         Ok(())
     }
 
-    /// Move the genuine creation FD into the owner before duplication. A failed
-    /// writer-FD clone must not discard the only pin needed for abort cleanup.
+    /// Mint allocation evidence at O_EXCL, under the current sealed SOURCE
+    /// owner. Retain the genuine FD before a fallible writer-FD duplication.
     #[cfg(unix)]
-    pub(super) fn register_created_staging(&mut self, file: File) -> Result<File> {
+    pub(super) fn create_regular_staging_file_blocking(&mut self) -> Result<File> {
+        let source = self.rooted.local_source_effects.clone();
+        if let Some(source) = &source {
+            source.validate_lifetime_blocking()?;
+        }
+        let file = create_staging_file_at(self.staging_dir_fd.as_raw_fd(), &self.temp_name)?;
+        #[cfg(test)]
+        self.rooted
+            .pause_mutation(PublicationPausePoint::AfterPrivateFileCreation);
         let created = stat_fd(file.as_raw_fd())?;
         self.staged = Some(OwnedStagingEntry {
             file: Arc::new(file),
             created,
+            origin: StagingObjectOrigin::Allocated { source },
         });
         self.cleanup_owned = Some(created);
         self.observe_staging()?;
+        if created.st_nlink != 1 {
+            return Err(self.staging_changed());
+        }
         Ok(self
             .staged
             .as_ref()
@@ -253,7 +315,11 @@ impl RootedNamespaceTransaction {
                 || !same_observation(&held, &named)
                 || (!self.strict_cleanup
                     && !self.committed
-                    && held.st_nlink != owned.created.st_nlink)
+                    && held.st_nlink
+                        != match owned.origin {
+                            StagingObjectOrigin::Allocated { .. } => 1,
+                            StagingObjectOrigin::Borrowed => owned.created.st_nlink,
+                        })
             {
                 // An unexpected outside alias can be in SOURCE; unlink would
                 // change its nlink/ctime. Groups instead use their full seal

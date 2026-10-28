@@ -647,3 +647,105 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
             .is_err());
     }
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn allocation_and_private_metadata_authenticate_root_state_and_tape_extent() {
+    use crate::endpoint::source_root::SourceRoot;
+    use crate::engine::namespace::NamespaceQualification;
+    use crate::rooted_fs::local_source_effects::LocalSourceEffects;
+    for allocation in [true, false] {
+        for inverse in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let source_path = fixture.path().join("source");
+            let destination = fixture.path().join("destination");
+            std::fs::create_dir(&source_path).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(source_path.join("file"), b"SOURCE").unwrap();
+            let source = SourceRoot::open(source_path.clone()).await.unwrap();
+            source
+                .entries(Default::default())
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let effects = LocalSourceEffects::seal(&source).await.unwrap();
+            let rooted = RootedFs::open(destination.clone()).await.unwrap();
+            let (mut rooted, namespace) = rooted.with_namespace_qualification().await.unwrap();
+            namespace.seal().await.unwrap();
+            rooted.local_source_effects = Some(effects.clone());
+            let mut staged = if allocation {
+                None
+            } else {
+                Some(
+                    rooted
+                        .begin_staged_file_blocking(&RelativePath::new("target").unwrap())
+                        .unwrap(),
+                )
+            };
+            let mut transaction = if allocation {
+                Some(
+                    rooted
+                        .begin_namespace_blocking(
+                            Path::new("target"),
+                            ExpectedDestination::Absent,
+                            StagingOrigin::Created,
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let source_rooted = source.rooted();
+            {
+                let mut owner = source_rooted.source_observations.lock().unwrap();
+                let c = owner.active().unwrap();
+                if inverse {
+                    c.index
+                        .set_bytes(state_key(b"ordinal", [0; 32]), [42; 48])
+                        .unwrap();
+                } else {
+                    c.file.set_len(c.end + 1).unwrap();
+                }
+            }
+            let before = staged
+                .as_ref()
+                .map(|s| stat_fd(s.file.as_raw_fd()).unwrap());
+            let result = if let Some(transaction) = &mut transaction {
+                transaction
+                    .create_regular_staging_file_blocking()
+                    .map(|_| ())
+            } else {
+                staged
+                    .as_mut()
+                    .unwrap()
+                    .apply_metadata_blocking(Some(0o400), None)
+            };
+            assert!(
+                matches!(result, Err(RootedFsError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData),
+                "{result:?}"
+            );
+            assert!(matches!(
+                effects.validate_lifetime_blocking(),
+                Err(RootedFsError::SourceCatalogueTerminal)
+            ));
+            if let Some(staged) = staged {
+                assert!(staging::same_observation(
+                    &before.unwrap(),
+                    &stat_fd(staged.file.as_raw_fd()).unwrap()
+                ));
+                staged.abort().unwrap();
+            }
+            if let Some(transaction) = transaction {
+                assert!(stat_at_optional(
+                    transaction.staging_dir_fd.as_raw_fd(),
+                    &transaction.temp_name
+                )
+                .unwrap()
+                .is_none());
+                transaction.abort().unwrap();
+            }
+            assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+            assert_eq!(std::fs::read(source_path.join("file")).unwrap(), b"SOURCE");
+        }
+    }
+}

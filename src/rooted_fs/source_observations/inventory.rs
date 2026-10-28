@@ -340,6 +340,37 @@ impl SourceInventory {
         self.with_original_batch(|c| c.validate_original_records(&self.rooted))
     }
 
+    /// Allocation can record the current sealed owner, never an effect permit.
+    pub(in crate::rooted_fs) fn validate_lifetime_blocking(&self) -> Result<()> {
+        self.with_original_batch(|c| c.check_original_ordinal(0, [0; 32]))
+    }
+
+    /// Used only with independent evidence of exclusive FILE allocation after
+    /// this owner was sealed. Certify the creator's current physical prefix;
+    /// birth alone does not keep a relocated destination outside SOURCE.
+    pub(in crate::rooted_fs) fn excludes_private_creator_blocking(
+        &self,
+        creator: RawFd,
+    ) -> Result<bool> {
+        self.with_original_batch(|c| {
+            c.check_original_ordinal(0, [0; 32])?;
+            if c.scope != Some(SourceRootProtection::Tree) {
+                return Ok(false);
+            }
+            let (_, root) = c.original_at(0)?;
+            let Some(source) = root.object_key else {
+                return Ok(false);
+            };
+            if object_key(self.rooted.root_fd.as_raw_fd(), None)? != Some(source) {
+                return Ok(false);
+            }
+            let Some(creator_key) = object_key(creator, None)? else {
+                return Ok(false);
+            };
+            super::super::local_source_effects::ancestry::excludes(creator, creator_key, source)
+        })
+    }
+
     /// Both ordinary replay and native exclusion own the same original-address,
     /// ROOT, extent and run-state barriers. No partially checked catalogue is
     /// exposed as healthy, and the result cannot be reused as an effect lease.

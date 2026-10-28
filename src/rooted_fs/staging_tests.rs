@@ -275,11 +275,6 @@ fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
         )
         .unwrap();
     let created_private = root.path().join(&created_namespace.staging_dir_name);
-    let created_file = create_staging_file_at(
-        created_namespace.staging_dir_fd.as_raw_fd(),
-        &created_namespace.temp_name,
-    )
-    .unwrap();
     let mut limits = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -306,8 +301,10 @@ fn failed_staging_descriptor_duplication_does_not_authorize_cleanup() {
     assert!(
         matches!(namespace.register_staging(&held), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
     );
+    // Leave exactly one slot for O_EXCL; duplicating its genuine FD must fail.
+    drop(occupied.pop().unwrap());
     assert!(
-        matches!(created_namespace.register_created_staging(created_file), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
+        matches!(created_namespace.create_regular_staging_file_blocking(), Err(RootedFsError::Io(error)) if error.raw_os_error() == Some(libc::EMFILE))
     );
     drop(occupied);
     drop(held);
