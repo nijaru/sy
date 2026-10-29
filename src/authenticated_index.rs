@@ -14,7 +14,9 @@ use std::os::unix::fs::FileExt;
 
 const LEVELS: usize = 64;
 const FANOUT: usize = 16;
-const BRANCH_BYTES: usize = 2 + 32 + FANOUT * 40;
+const BRANCH_HEADER_BYTES: usize = 2 + 32;
+const CHILD_BYTES: usize = 8 + 32;
+const BRANCH_BYTES: usize = BRANCH_HEADER_BYTES + FANOUT * CHILD_BYTES;
 const EMPTY_OFFSET: u64 = u64::MAX;
 
 #[derive(Debug, thiserror::Error)]
@@ -104,11 +106,40 @@ fn prefix(key: [u8; 32], depth: usize) -> [u8; 32] {
     result
 }
 
-fn digest(bytes: &[u8]) -> [u8; 32] {
+fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
     let mut hash = blake3::Hasher::new();
     hash.update(b"sy/authenticated-index/v1\0");
-    hash.update(bytes);
-    *hash.finalize().as_bytes()
+    if bytes[0] == 0 {
+        // Empty slots have exactly one valid encoding. Authenticate their
+        // positions with a bitmap instead of hashing their constant bytes.
+        // No child offset is used until the caller verifies this digest.
+        let mut compact = [0; BRANCH_BYTES + 2];
+        compact[..BRANCH_HEADER_BYTES].copy_from_slice(&bytes[..BRANCH_HEADER_BYTES]);
+        let mut occupied = 0u16;
+        let mut end = BRANCH_HEADER_BYTES + 2;
+        for (position, slot) in bytes[BRANCH_HEADER_BYTES..]
+            .as_chunks::<CHILD_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            if slot[..8] == EMPTY_OFFSET.to_le_bytes() {
+                if slot[8..] != [0; 32] {
+                    return Err(invalid(StateError::Child));
+                }
+            } else {
+                occupied |= 1 << position;
+                compact[end..end + CHILD_BYTES].copy_from_slice(slot);
+                end += CHILD_BYTES;
+            }
+        }
+        compact[BRANCH_HEADER_BYTES..BRANCH_HEADER_BYTES + 2]
+            .copy_from_slice(&occupied.to_le_bytes());
+        hash.update(&compact[..end]);
+    } else {
+        hash.update(bytes);
+    }
+    Ok(*hash.finalize().as_bytes())
 }
 
 impl<const N: usize> AuthenticatedIndex<N> {
@@ -167,9 +198,10 @@ impl<const N: usize> AuthenticatedIndex<N> {
             tag => return Err(invalid(StateError::Tag(tag))),
         };
         self.check_offset(locator.offset, length)?;
-        // Only the bounded framing tag/length is inspected before authentication.
-        // Both mapping and payload must prove ancestry to the retained RAM root.
-        if digest(&bytes[..length]) != locator.digest {
+        // Framing and canonical empty slots are checked without following any
+        // child offset. Mapping and payload must prove the retained RAM root
+        // before routing, absence or updates can use them.
+        if digest(&bytes[..length])? != locator.digest {
             return Err(invalid(StateError::Authentication));
         }
         if bytes[0] == 1 {
@@ -185,7 +217,9 @@ impl<const N: usize> AuthenticatedIndex<N> {
             prefix: [0; 32],
             children: [None; FANOUT],
         };
-        branch.prefix.copy_from_slice(&bytes[2..34]);
+        branch
+            .prefix
+            .copy_from_slice(&bytes[2..BRANCH_HEADER_BYTES]);
         if usize::from(depth) >= LEVELS
             || prefix(branch.prefix, usize::from(depth)) != branch.prefix
         {
@@ -194,22 +228,18 @@ impl<const N: usize> AuthenticatedIndex<N> {
         for (child, slot) in branch
             .children
             .iter_mut()
-            .zip(bytes[34..].as_chunks::<40>().0)
+            .zip(bytes[BRANCH_HEADER_BYTES..].as_chunks::<CHILD_BYTES>().0)
         {
             let mut offset = [0; 8];
             offset.copy_from_slice(&slot[..8]);
             let offset = u64::from_le_bytes(offset);
-            let mut digest = [0; 32];
-            digest.copy_from_slice(&slot[8..]);
-            if offset == EMPTY_OFFSET {
-                if digest != [0; 32] {
-                    return Err(invalid(StateError::Child));
-                }
-            } else {
+            if offset != EMPTY_OFFSET {
                 self.check_offset(offset, Self::RECORD_BYTES.min(BRANCH_BYTES))?;
                 if offset == locator.offset {
                     return Err(invalid(StateError::Child));
                 }
+                let mut digest = [0; 32];
+                digest.copy_from_slice(&slot[8..]);
                 *child = Some(Locator { offset, digest });
             }
         }
@@ -292,12 +322,12 @@ impl<const N: usize> AuthenticatedIndex<N> {
             }
             Node::Branch(branch) => {
                 bytes[1] = branch.depth;
-                bytes[2..34].copy_from_slice(&branch.prefix);
-                for (child, slot) in branch
-                    .children
-                    .iter()
-                    .zip(bytes[34..].as_chunks_mut::<40>().0)
-                {
+                bytes[2..BRANCH_HEADER_BYTES].copy_from_slice(&branch.prefix);
+                for (child, slot) in branch.children.iter().zip(
+                    bytes[BRANCH_HEADER_BYTES..]
+                        .as_chunks_mut::<CHILD_BYTES>()
+                        .0,
+                ) {
                     slot[..8]
                         .copy_from_slice(&child.map_or(EMPTY_OFFSET, |c| c.offset).to_le_bytes());
                     if let Some(child) = child {
@@ -313,7 +343,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
             .ok_or_else(|| invalid(StateError::Offset))?;
         let locator = Locator {
             offset,
-            digest: digest(&bytes[..length]),
+            digest: digest(&bytes[..length])?,
         };
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&bytes[..length])?;

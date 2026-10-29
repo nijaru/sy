@@ -19,6 +19,119 @@ fn assert_terminal(index: &mut Index) {
 }
 
 #[test]
+fn canonical_digests_match_independent_transcripts_for_every_child_mask() {
+    for mask in 0..=u16::MAX {
+        let mut bytes = [0; BRANCH_BYTES];
+        bytes[1..4].copy_from_slice(&[3, 0x12, 0x30]);
+        let mut transcript = b"sy/authenticated-index/v1\0".to_vec();
+        transcript.extend_from_slice(&bytes[..34]);
+        transcript.extend_from_slice(&mask.to_le_bytes());
+        for child in 0..16 {
+            let start = 34 + child * 40;
+            if mask & (1 << child) == 0 {
+                bytes[start..start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+            } else {
+                // Distinct locators, including offset zero and child 15.
+                bytes[start..start + 8]
+                    .copy_from_slice(&(child as u64 * RECORD_BYTES as u64).to_le_bytes());
+                bytes[start + 8..start + 40].fill(child as u8 + 1);
+                transcript.extend_from_slice(&bytes[start..start + 40]);
+            }
+        }
+        assert_eq!(
+            digest(&bytes).unwrap(),
+            *blake3::hash(&transcript).as_bytes(),
+            "mask {mask:04x}"
+        );
+    }
+    let mut leaf = [0x6d; RECORD_BYTES];
+    leaf[0] = 1;
+    let mut transcript = b"sy/authenticated-index/v1\0".to_vec();
+    transcript.extend_from_slice(&leaf);
+    assert_eq!(
+        digest(&leaf).unwrap(),
+        *blake3::hash(&transcript).as_bytes()
+    );
+}
+
+#[test]
+fn every_branch_bit_is_authenticated_or_rejected_as_noncanonical() {
+    let mut index = Index::new().unwrap();
+    index.set_bytes([0; 32], state(1)).unwrap();
+    index.set_bytes([255; 32], state(2)).unwrap();
+    let root = index.root.unwrap();
+    let mut bytes = [0; BRANCH_BYTES];
+    index.file.seek(SeekFrom::Start(root.offset)).unwrap();
+    index.file.read_exact(&mut bytes).unwrap();
+    for byte in 0..bytes.len() {
+        for bit in 0..8 {
+            bytes[byte] ^= 1 << bit;
+            if let Ok(changed) = digest(&bytes) {
+                assert_ne!(changed, root.digest, "byte {byte}, bit {bit}");
+            }
+            bytes[byte] ^= 1 << bit;
+        }
+    }
+}
+
+#[test]
+fn canonical_child_slots_cannot_authorize_absence_or_updates_after_tampering() {
+    for fault in 0..5 {
+        for operation in 0..5 {
+            let mut index = Index::new().unwrap();
+            index.set_bytes([0; 32], state(1)).unwrap();
+            index.set_bytes([0x0f; 32], state(2)).unwrap();
+            let root = index.root.unwrap();
+            let end = index.end;
+            let mut bytes = [0; BRANCH_BYTES];
+            index.file.seek(SeekFrom::Start(root.offset)).unwrap();
+            index.file.read_exact(&mut bytes).unwrap();
+            match fault {
+                0 => bytes[34 + 40 + 8] = 1, // Noncanonical empty digest.
+                1 => bytes[34..42].copy_from_slice(&u64::MAX.to_le_bytes()),
+                2 => {
+                    bytes[34..74].fill(0);
+                    bytes[34..42].copy_from_slice(&u64::MAX.to_le_bytes());
+                }
+                3 => {
+                    // Preserve the ordered list of occupied locators, moving
+                    // child 0 to child 1. Only its authenticated position differs.
+                    bytes.copy_within(34..74, 74);
+                    bytes[34..74].fill(0);
+                    bytes[34..42].copy_from_slice(&u64::MAX.to_le_bytes());
+                }
+                _ => bytes.copy_within(34..74, 74), // Empty becomes occupied.
+            }
+            index.file.seek(SeekFrom::Start(root.offset)).unwrap();
+            index.file.write_all(&bytes).unwrap();
+            let mut missing = [0; 32];
+            missing[0] = 1;
+            let error = match operation {
+                0 => index.get_bytes([0; 32]).unwrap_err(),
+                1 => index.get_bytes(missing).unwrap_err(),
+                2 => index.get_bytes([0x10; 32]).unwrap_err(), // Prefix mismatch.
+                3 => index.set_bytes([0; 32], state(3)).unwrap_err(),
+                _ => index.set_bytes(missing, state(3)).unwrap_err(),
+            };
+            let error = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<StateError>()
+                .unwrap();
+            if fault <= 1 {
+                assert!(matches!(error, StateError::Child));
+            } else {
+                assert!(matches!(error, StateError::Authentication));
+            }
+            assert_eq!(index.root, Some(root));
+            assert_eq!(index.end, end);
+            assert_eq!(index.file.metadata().unwrap().len(), end);
+            assert_terminal(&mut index);
+        }
+    }
+}
+
+#[test]
 fn full_depth_lookup_update_and_absence_are_bounded_without_history_growth() {
     let mut index = Index::new().unwrap();
     index.set_bytes([0; 32], state(0)).unwrap();
@@ -195,7 +308,7 @@ fn malformed_native_extents_and_authenticated_node_structure_are_rejected() {
     index.root.as_mut().unwrap().offset = u64::MAX - 1;
     assert!(index.get_bytes([0; 32]).is_err());
     assert_terminal(&mut index);
-    for bad_depth in [false, true] {
+    for fault in 0..6 {
         let mut index = Index::new().unwrap();
         index.set_bytes([0; 32], state(1)).unwrap();
         index.set_bytes([255; 32], state(2)).unwrap();
@@ -203,16 +316,26 @@ fn malformed_native_extents_and_authenticated_node_structure_are_rejected() {
         let mut bytes = [0; BRANCH_BYTES];
         index.file.seek(SeekFrom::Start(root.offset)).unwrap();
         index.file.read_exact(&mut bytes).unwrap();
-        if bad_depth {
-            bytes[1] = 64;
-        } else {
-            bytes[34..42].copy_from_slice(&u64::MAX.wrapping_sub(1).to_le_bytes());
+        match fault {
+            0 => bytes[1] = 64,
+            1 => bytes[34..42].copy_from_slice(&u64::MAX.wrapping_sub(1).to_le_bytes()),
+            2 => bytes[34..42].copy_from_slice(&root.offset.to_le_bytes()),
+            3 => bytes[2] = 1, // Noncanonical depth-zero prefix.
+            _ => {
+                // Canonical empty encodings still cannot turn a branch into
+                // zero or one children, even with a native-owned digest.
+                let first = if fault == 4 { 0 } else { 1 };
+                for slot in bytes[34 + first * 40..].as_chunks_mut::<40>().0 {
+                    slot.fill(0);
+                    slot[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+                }
+            }
         }
         index.file.seek(SeekFrom::Start(root.offset)).unwrap();
         index.file.write_all(&bytes).unwrap();
         // Exercise structural checks independently of authentication. Scratch
         // attackers cannot rewrite this native-owned RAM digest.
-        index.root.as_mut().unwrap().digest = digest(&bytes);
+        index.root.as_mut().unwrap().digest = digest(&bytes).unwrap();
         assert!(index.get_bytes([0; 32]).is_err());
         assert_terminal(&mut index);
     }
