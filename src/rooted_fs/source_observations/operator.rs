@@ -1073,8 +1073,8 @@ impl RootedFs {
                 return Err(invalid().into());
             }
             for ordinal in 0..original.count {
-                let (key, _) = original.original_at(ordinal)?;
-                original.original_path(key)?;
+                let (key, observation) = original.original_at(ordinal)?;
+                original.original_path(key, &observation)?;
                 let mut expected = [0; 48];
                 expected[..8].copy_from_slice(&ordinal.to_le_bytes());
                 if original

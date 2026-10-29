@@ -33,7 +33,7 @@ impl Catalogue {
             if disposition == SourceDirectoryDisposition::Traversed {
                 continue;
             }
-            let path = self.original_path(parent_key)?;
+            let path = self.original_path(parent_key, &original)?;
             if disposition == SourceDirectoryDisposition::Opaque {
                 if self.empty_directory_stamp(parent_key)?.is_some() {
                     let parent = match path.parent() {

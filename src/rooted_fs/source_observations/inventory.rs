@@ -126,33 +126,42 @@ impl Catalogue {
         }
         Ok((key, observation))
     }
-    pub(super) fn original_path(&mut self, mut key: [u8; 32]) -> Result<PathBuf> {
+    /// The caller has just authenticated the first record. Replay its parents
+    /// freshly, without loading and decoding that same record a second time.
+    pub(super) fn original_path(
+        &mut self,
+        mut key: [u8; 32],
+        original: &Observation,
+    ) -> Result<PathBuf> {
         let mut names = Vec::new();
         let mut bytes = 2usize;
+        let mut parent = original.parent;
+        let mut name = std::borrow::Cow::Borrowed(original.name.as_os_str());
         while key != [0; 32] {
-            let observation = self.get(key)?.ok_or_else(invalid)?;
-            if observation.name.is_empty()
-                || observation.name.as_bytes().contains(&0)
-                || observation.name.as_bytes().contains(&b'/')
-                || observation.name == "."
-                || observation.name == ".."
-                || super::key(observation.parent, &observation.name) != key
+            if name.is_empty()
+                || name.as_bytes().contains(&0)
+                || name.as_bytes().contains(&b'/')
+                || name == OsStr::new(".")
+                || name == OsStr::new("..")
+                || super::key(parent, &name) != key
             {
                 return Err(invalid().into());
             }
             bytes = bytes
-                .checked_add(2 + observation.name.as_bytes().len())
+                .checked_add(2 + name.as_bytes().len())
                 .ok_or_else(invalid)?;
             if bytes > crate::protocol::MAX_WIRE_PATH_BYTES
                 || names.len() >= crate::protocol::MAX_WIRE_COMPONENTS
             {
                 return Err(invalid().into());
             }
-            key = observation.parent;
-            names.push(observation.name);
+            names.push(name);
+            key = parent;
+            let ancestor = self.get(key)?.ok_or_else(invalid)?;
+            parent = ancestor.parent;
+            name = std::borrow::Cow::Owned(ancestor.name);
         }
-        let root = self.get([0; 32])?.ok_or_else(invalid)?;
-        if root.parent != [0; 32] || !root.name.is_empty() {
+        if parent != [0; 32] || !name.is_empty() {
             return Err(invalid().into());
         }
         Ok(names.into_iter().rev().collect())
@@ -185,8 +194,8 @@ impl Catalogue {
 
     fn validate_original_records(&mut self, rooted: &RootedFs) -> Result<()> {
         for ordinal in 0..self.count {
-            let (key, _) = self.original_at(ordinal)?;
-            let path = self.original_path(key)?;
+            let (key, original) = self.original_at(ordinal)?;
+            let path = self.original_path(key, &original)?;
             self.check_original_ordinal(ordinal, key)?;
             let result = self.validate_native_binding(rooted, &path, true);
             self.native_result(result)?;
@@ -215,8 +224,8 @@ impl RootedFs {
         // Authenticate the exact original set before making a sealed view.
         // This is bounded replay, not checksum adoption from scratch.
         for ordinal in 0..catalogue.count {
-            let (key, _) = catalogue.original_at(ordinal)?;
-            catalogue.original_path(key)?;
+            let (key, original) = catalogue.original_at(ordinal)?;
+            catalogue.original_path(key, &original)?;
             catalogue.disposition(key)?;
         }
         catalogue.sealed = true;
@@ -298,7 +307,7 @@ impl SourceInventory {
             {
                 // Replay the genuine original operator selection, not a scope
                 // flag or a target spelling. This cannot authorize descendants.
-                let path = catalogue.original_path(key)?;
+                let path = catalogue.original_path(key, &leaf)?;
                 let terminal = catalogue
                     .selected_terminal(&self.rooted, &path)?
                     .ok_or_else(|| RootedFsError::SourceFollowUnsupported(path.clone()))?;

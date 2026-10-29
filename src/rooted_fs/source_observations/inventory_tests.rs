@@ -14,7 +14,7 @@ fn details(
     let mut owner = inventory.rooted.source_observations.lock().unwrap();
     let catalogue = owner.active().unwrap();
     let (key, original) = catalogue.original_at(ordinal).unwrap();
-    let path = catalogue.original_path(key).unwrap();
+    let path = catalogue.original_path(key, &original).unwrap();
     let root = (ordinal == 0).then_some(catalogue.scope.unwrap());
     let directory = if original.effective.kind == libc::S_IFDIR as u64
         && root != Some(SourceRootProtection::SelectedLeafAnchor)
@@ -289,6 +289,66 @@ async fn failure_and_early_close_cannot_seal_partial_inventory() {
             }
             assert!(rooted.seal_source_inventory_blocking().is_err());
         }
+    }
+}
+
+#[tokio::test]
+async fn original_path_reuse_validates_member_key_name_and_root() {
+    let root = tempfile::tempdir().unwrap();
+    let path = Path::new("parent/file");
+    std::fs::create_dir(root.path().join("parent")).unwrap();
+    std::fs::write(root.path().join(path), b"original").unwrap();
+    let rooted = source_scan(root.path(), false, Default::default()).await;
+    let inventory = rooted.seal_source_inventory_blocking().unwrap();
+    let mut owner = inventory.rooted.source_observations.lock().unwrap();
+    let c = owner.active().unwrap();
+    let key = path_key(path);
+    let mut original = c.require(path).unwrap();
+    assert_eq!(c.original_path(key, &original).unwrap(), path);
+    assert!(c.original_path([7; 32], &original).is_err());
+    // Path replay preserves native bytes even on filesystems that reject
+    // creating non-UTF-8 names. No lookup of this supplied component is needed.
+    original.name = OsStr::from_bytes(b"native-\xff").to_os_string();
+    assert_eq!(
+        c.original_path(super::key(original.parent, &original.name), &original)
+            .unwrap(),
+        Path::new("parent").join(&original.name)
+    );
+    for name in [b"".as_slice(), b".", b"..", b"a/b", b"a\0b"] {
+        original.name = OsStr::from_bytes(name).to_os_string();
+        let key = super::key(original.parent, &original.name);
+        assert!(c.original_path(key, &original).is_err(), "{name:?}");
+    }
+    let mut original = c.require(Path::new("")).unwrap();
+    assert_eq!(c.original_path([0; 32], &original).unwrap(), Path::new(""));
+    original.parent = [7; 32];
+    assert!(c.original_path([0; 32], &original).is_err());
+    original.parent = [0; 32];
+    original.name = OsString::from("not-root");
+    assert!(c.original_path([0; 32], &original).is_err());
+}
+
+#[tokio::test]
+async fn original_path_reuse_authenticates_parents_after_member_read() {
+    for ancestor in [Path::new(""), Path::new("parent")] {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("parent")).unwrap();
+        std::fs::write(root.path().join("parent/file"), b"original").unwrap();
+        let rooted = source_scan(root.path(), false, Default::default()).await;
+        let inventory = rooted.seal_source_inventory_blocking().unwrap();
+        let mut owner = inventory.rooted.source_observations.lock().unwrap();
+        let c = owner.active().unwrap();
+        let path = Path::new("parent/file");
+        let original = c.require(path).unwrap();
+        let locator = c.index.get_bytes(path_key(ancestor)).unwrap().unwrap();
+        let offset = u64::from_le_bytes(locator[..8].try_into().unwrap());
+        // The supplied FILE is already authenticated; that must not stand in
+        // for freshly authenticated parents, including the terminating ROOT.
+        c.file.write_all_at(&[99], offset).unwrap();
+        assert!(matches!(
+            c.original_path(path_key(path), &original),
+            Err(RootedFsError::Io(error)) if error.kind() == io::ErrorKind::InvalidData
+        ));
     }
 }
 
