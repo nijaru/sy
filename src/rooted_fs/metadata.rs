@@ -340,16 +340,16 @@ impl RootedFs {
                         relative.as_path().to_path_buf(),
                     ));
                 }
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 let held = modified
                     .map(|_| open_symlink_at(parent.as_raw_fd(), &leaf))
                     .transpose()?;
                 let current = if let Some(modified) = modified {
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     let file = held.as_ref().ok_or_else(|| {
                         RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
                     })?;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     if identity_from_stat(&stat_fd(file.as_raw_fd())?) != Some(expected) {
                         return Err(RootedFsError::DestinationChanged(
                             relative.as_path().to_path_buf(),
@@ -360,13 +360,13 @@ impl RootedFs {
                         kind: SourceEffectKind::SymlinkMetadata,
                         parent: parent.as_raw_fd(),
                         name: &leaf,
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", target_os = "linux"))]
                         object: Some(file.as_raw_fd()),
-                        #[cfg(not(target_os = "macos"))]
+                        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                         object: None,
                         path: relative.as_path(),
                     })?;
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     {
                         // Census/admission can outlive the observed name or
                         // its parent. Neither is a lease on SOURCE independence.
@@ -389,7 +389,7 @@ impl RootedFs {
                             RootedFsError::DestinationChanged(relative.as_path().to_path_buf())
                         })?
                     }
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     {
                         // Other Unix backends retain their no-follow, name-based
                         // operation; this is not qualified LOCAL SOURCE admission.

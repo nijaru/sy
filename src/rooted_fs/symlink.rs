@@ -149,9 +149,9 @@ impl RootedFs {
                             relative.as_path().to_path_buf(),
                         ));
                     }
-                    #[cfg(target_os = "macos")]
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
                     apply_fd_metadata(held.as_raw_fd(), None, Some(modified))?;
-                    #[cfg(not(target_os = "macos"))]
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
                     set_symlink_mtime_at(
                         namespace.staging_dir_fd.as_raw_fd(),
                         &namespace.temp_name,

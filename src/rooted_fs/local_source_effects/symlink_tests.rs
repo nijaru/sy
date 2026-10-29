@@ -4,6 +4,10 @@ use crate::endpoint::source_root::SourceRoot;
 use crate::engine::namespace::NamespaceQualification;
 use futures::TryStreamExt;
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_symlink_metadata_rechecks_creator_binding_and_source_aliases() {
     for relocate in [false, true] {
@@ -80,6 +84,10 @@ async fn private_symlink_metadata_rechecks_creator_binding_and_source_aliases() 
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn symlink_creation_cannot_adopt_foreign_entries_before_its_first_observation() {
     for source_alias in [false, true] {
@@ -156,6 +164,10 @@ async fn symlink_creation_cannot_adopt_foreign_entries_before_its_first_observat
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn symlink_timestamp_uses_the_observed_fd_and_refuses_late_source_aliases() {
     use std::os::unix::fs::MetadataExt;

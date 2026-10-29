@@ -8,7 +8,7 @@ use std::io::Read;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 use inventory::SourceExclusion;
 
 const MAX_TARGET: usize = 64 * 1024;

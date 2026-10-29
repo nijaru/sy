@@ -4138,11 +4138,26 @@ fn apply_fd_metadata(fd: RawFd, unix_mode: Option<u32>, modified: Option<Timesta
     if let Some(times) = times.filter(|times| {
         current.st_mtime != times[1].tv_sec || current.st_mtime_nsec != times[1].tv_nsec
     }) {
+        #[cfg(target_os = "linux")]
         let result = unsafe {
-            // SAFETY: `fd` is live and `times` contains exactly two initialized
-            // timespec values. UTIME_OMIT preserves the existing access time.
-            libc::futimens(fd, times.as_ptr())
+            // SAFETY: fd is held and times owns two initialized timespecs.
+            // Linux O_PATH symlink FDs need utimensat EMPTY_PATH (Linux 6.6+),
+            // not futimens or a mutable name. Neither call follows a link;
+            // UTIME_OMIT preserves the existing access time.
+            if current.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                libc::utimensat(
+                    fd,
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } else {
+                libc::futimens(fd, times.as_ptr())
+            }
         };
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: fd is held and times owns two initialized timespecs.
+        let result = unsafe { libc::futimens(fd, times.as_ptr()) };
         if result < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -4180,7 +4195,7 @@ fn ensure_symlink_at(parent: RawFd, component: &OsStr, relative: &Path) -> Resul
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn set_symlink_mtime_at(parent: RawFd, component: &OsStr, modified: Timestamp) -> Result<()> {
     let component = component_cstring(component)?;
     let times = modified_timespecs(modified)?;

@@ -61,6 +61,10 @@ fn pause(
     (wait, resume)
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn allocated_private_metadata_does_not_bypass_public_source_census() {
     let (fixture, _source, rooted) = fixture().await;
@@ -104,6 +108,10 @@ async fn allocated_private_metadata_does_not_bypass_public_source_census() {
     );
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_registration_and_other_source_owners_do_not_mint_allocation_evidence() {
     for provenance in ["borrowed", "different-owner", "no-owner-at-birth"] {
@@ -154,6 +162,10 @@ async fn private_registration_and_other_source_owners_do_not_mint_allocation_evi
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn exclusive_allocation_does_not_adopt_a_foreign_link_before_first_stat() {
     let (fixture, _source, rooted) = fixture().await;
@@ -187,6 +199,10 @@ async fn exclusive_allocation_does_not_adopt_a_foreign_link_before_first_stat() 
     );
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_metadata_rechecks_single_link_after_source_validation() {
     let (fixture, _source, rooted) = fixture().await;
@@ -226,6 +242,10 @@ async fn private_metadata_rechecks_single_link_after_source_validation() {
     );
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_creator_prefix_cannot_follow_destination_root_relocation_into_source() {
     let (fixture, _source, rooted) = fixture().await;
@@ -267,6 +287,10 @@ async fn private_creator_prefix_cannot_follow_destination_root_relocation_into_s
     staged.abort().unwrap();
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_allocation_cannot_survive_source_cancellation_or_operator_retarget() {
     for cancel in [true, false] {

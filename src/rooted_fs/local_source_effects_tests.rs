@@ -3,7 +3,11 @@ use crate::endpoint::source_root::SourceRoot;
 use crate::engine::namespace::NamespaceQualification;
 use futures::TryStreamExt;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn missing_parent_declaration_neither_creates_nor_adopts_future_directories() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -123,7 +127,11 @@ async fn native_staging_repeats_original_validation_without_preflight_permission
     .unwrap();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn directory_timestamps_have_an_inode_only_source_exclusion_footprint() {
     use std::os::unix::fs::MetadataExt;
@@ -203,6 +211,7 @@ async fn directory_timestamps_have_an_inode_only_source_exclusion_footprint() {
                 ..Default::default()
             },
         ),
+        #[cfg(target_os = "macos")]
         (
             None,
             DirectoryPreservation {
@@ -242,7 +251,11 @@ async fn directory_timestamps_have_an_inode_only_source_exclusion_footprint() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn directory_timestamp_rechecks_destination_after_source_census() {
     use std::os::unix::fs::MetadataExt;
@@ -329,7 +342,11 @@ async fn directory_timestamp_rechecks_destination_after_source_census() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn selected_late_foreign_alias_or_binding_change_precedes_native_publication() {
     for foreign_alias in [true, false] {
@@ -418,7 +435,11 @@ async fn pending_root_guard_precedes_permanent_parent_creation() {
     assert!(!fixture.path().join("missing").exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn pending_root_admission_is_completed_and_bound_to_both_run_owners() {
     let fixture = tempfile::tempdir().unwrap();
@@ -502,7 +523,11 @@ async fn pending_root_admission_is_completed_and_bound_to_both_run_owners() {
     assert!(!missing.exists());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn admitted_pending_root_does_not_adopt_a_late_source_alias() {
     let fixture = tempfile::tempdir().unwrap();
@@ -550,7 +575,11 @@ async fn admitted_pending_root_does_not_adopt_a_late_source_alias() {
     assert_eq!(std::fs::read_dir(&source_path).unwrap().count(), 1);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn regular_metadata_needs_both_object_absence_and_the_actual_named_fd() {
     let fixture = tempfile::tempdir().unwrap();
@@ -587,7 +616,11 @@ async fn regular_metadata_needs_both_object_absence_and_the_actual_named_fd() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn link_delta_admission_needs_actual_named_regular_fd_and_source_absence() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -637,7 +670,11 @@ async fn link_delta_admission_needs_actual_named_regular_fd_and_source_absence()
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn mandatory_tree_census_io_error_is_not_an_absence_certificate() {
     use std::os::unix::fs::PermissionsExt;
@@ -680,7 +717,11 @@ async fn mandatory_tree_census_io_error_is_not_an_absence_certificate() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn tree_late_new_name_cannot_hide_behind_unchanged_originals() {
     for hardlink in [false, true] {
@@ -730,7 +771,11 @@ async fn tree_late_new_name_cannot_hide_behind_unchanged_originals() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn old_state_is_rechecked_after_source_census_before_retirement_or_setters() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -830,7 +875,11 @@ async fn old_state_is_rechecked_after_source_census_before_retirement_or_setters
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn terminal_source_does_not_revoke_owned_private_abort_or_drop_cleanup() {
     for action in ["abort", "drop", "metadata", "commit", "empty-directory"] {
@@ -906,7 +955,11 @@ async fn terminal_source_does_not_revoke_owned_private_abort_or_drop_cleanup() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn acquired_private_directory_cannot_adopt_original_source_before_first_stat() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -919,7 +972,7 @@ async fn acquired_private_directory_cannot_adopt_original_source_before_first_st
         std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(mode)).unwrap();
         let held = File::open(&source_path).unwrap();
         xattr::set(&source_path, "user.sy-source-birth", b"original").unwrap();
-        #[cfg(feature = "acl")]
+        #[cfg(all(feature = "acl", target_os = "macos"))]
         acl_macos::write_fd_entries(
             held.as_raw_fd(),
             &[exacl::AclEntry::allow_group(
@@ -929,6 +982,24 @@ async fn acquired_private_directory_cannot_adopt_original_source_before_first_st
             )],
         )
         .unwrap();
+        #[cfg(all(feature = "acl", target_os = "linux"))]
+        {
+            let mut entries = exacl::from_mode(mode);
+            entries.push(exacl::AclEntry::allow_group(
+                "0",
+                exacl::Perm::READ,
+                exacl::Flag::empty(),
+            ));
+            entries.push(exacl::AclEntry::allow_mask(
+                if mode == 0o700 {
+                    exacl::Perm::empty()
+                } else {
+                    exacl::Perm::READ | exacl::Perm::EXECUTE
+                },
+                exacl::Flag::empty(),
+            ));
+            acl_linux::write_numeric_entries(&held, &entries).unwrap();
+        }
         let source = SourceRoot::open(source_path.clone()).await.unwrap();
         source
             .entries(Default::default())
@@ -997,7 +1068,11 @@ async fn acquired_private_directory_cannot_adopt_original_source_before_first_st
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_cleanup_rechecks_enclosing_destination_ancestors() {
     use crate::engine::namespace::NamespaceParent;
@@ -1062,7 +1137,11 @@ async fn private_cleanup_rechecks_enclosing_destination_ancestors() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn private_cleanup_refuses_outside_source_alias_and_relocated_creator_directory() {
     use std::os::unix::fs::MetadataExt;

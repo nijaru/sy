@@ -4,7 +4,7 @@
 use super::*;
 use crate::fs_util::directory_stream::DirectoryStream;
 mod seen;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 use crate::rooted_fs::local_source_effects::preflight::Declarations;
 use seen::SeenOriginals;

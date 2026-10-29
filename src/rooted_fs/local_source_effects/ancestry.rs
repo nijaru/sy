@@ -1,5 +1,5 @@
-//! APFS physical ROOT-prefix qualification for directory policy effects.
-//! A pathname selects the prefix; native parent IDs must certify every edge.
+//! Native physical ancestry qualification for directory policy effects.
+//! APFS certifies a physical prefix; Linux walks qualified native parents.
 use super::*;
 use native_object::NativeObjectKey;
 
@@ -193,12 +193,19 @@ mod tests {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(in crate::rooted_fs) use linux::excludes;
+#[cfg(target_os = "linux")]
+pub(super) use linux::unique_directory_parents;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(super) fn unique_directory_parents(_fd: RawFd) -> Result<bool> {
     Ok(false)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(in crate::rooted_fs) fn excludes(
     _root: RawFd,
     _expected: NativeObjectKey,

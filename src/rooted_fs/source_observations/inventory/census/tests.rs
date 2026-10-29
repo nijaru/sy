@@ -12,6 +12,10 @@ enum EndChange {
     Cancel,
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
     for change in [
@@ -121,6 +125,10 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
     }
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn census_authenticates_root_inverse_and_non_directory_disposition() {
     for root_inverse in [true, false] {

@@ -44,7 +44,7 @@ async fn source_scan(
     rooted
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn selected_followed_inventory(path: &Path) -> SourceInventory {
     let bound =
         crate::rooted_fs::operand::BoundSource::open_local_following(path.to_path_buf(), false)
@@ -69,7 +69,11 @@ async fn selected_followed_inventory(path: &Path) -> SourceInventory {
     source.rooted().seal_source_inventory_blocking().unwrap()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn followed_selection_protects_both_objects_but_not_its_parent_anchor() {
     let fixture = tempfile::tempdir().unwrap();
@@ -103,7 +107,11 @@ async fn followed_selection_protects_both_objects_but_not_its_parent_anchor() {
     inventory.validate_originals_blocking().unwrap();
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn followed_data_object_key_is_authenticated_and_cannot_be_repaired() {
     use std::os::unix::fs::FileExt;
@@ -659,7 +667,11 @@ async fn low_fd_deep_wide_original_inventory_replay() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
     use std::os::unix::fs::FileExt;
@@ -708,7 +720,11 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn allocation_and_private_metadata_authenticate_root_state_and_tape_extent() {
     use crate::endpoint::source_root::SourceRoot;

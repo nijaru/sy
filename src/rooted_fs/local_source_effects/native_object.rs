@@ -99,11 +99,15 @@ pub(in crate::rooted_fs) fn object_key(
     Ok(Some(NativeObjectKey(key)))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub(super) mod linux;
+#[cfg(target_os = "linux")]
+pub(in crate::rooted_fs) use linux::object_key;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(in crate::rooted_fs) fn object_key(
     _fd: RawFd,
     _name: Option<&OsStr>,
 ) -> Result<Option<NativeObjectKey>> {
-    // Direct ext4/XFS and Btrfs qualification are not implemented by this lane.
     Ok(None)
 }

@@ -1,6 +1,9 @@
 use super::*;
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[tokio::test]
 async fn empty_directory_effects_exclude_original_source_not_just_descendants() {
     use crate::endpoint::source_root::SourceRoot;
@@ -39,7 +42,10 @@ async fn empty_directory_effects_exclude_original_source_not_just_descendants() 
     assert!(fixture.path().join("old").is_dir());
 }
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
+)]
 #[test]
 fn empty_directory_proof_rejects_nonempty_changed_and_rebound_old() {
     for action in ["nonempty", "arrival", "empty-again", "replacement"] {
