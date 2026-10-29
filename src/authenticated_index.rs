@@ -115,13 +115,16 @@ fn prefix(key: [u8; 32], depth: usize) -> [u8; 32] {
 }
 
 fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"sy/authenticated-index/v1\0");
-    if bytes[0] == 0 {
+    const DOMAIN: &[u8] = b"sy/authenticated-index/v1\0";
+    // Every frame transcript fits in one BLAKE3 chunk; avoid incremental
+    // hashing state by assembling the same bounded transcript once.
+    let mut transcript = [0; DOMAIN.len() + BRANCH_BYTES + 2];
+    transcript[..DOMAIN.len()].copy_from_slice(DOMAIN);
+    let length = if bytes[0] == 0 {
         // Empty slots have exactly one valid encoding. Authenticate their
         // positions with a bitmap instead of hashing their constant bytes.
         // No child offset is used until the caller verifies this digest.
-        let mut compact = [0; BRANCH_BYTES + 2];
+        let compact = &mut transcript[DOMAIN.len()..];
         compact[..BRANCH_HEADER_BYTES].copy_from_slice(&bytes[..BRANCH_HEADER_BYTES]);
         let mut occupied = 0u16;
         let mut end = BRANCH_HEADER_BYTES + 2;
@@ -143,11 +146,13 @@ fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
         }
         compact[BRANCH_HEADER_BYTES..BRANCH_HEADER_BYTES + 2]
             .copy_from_slice(&occupied.to_le_bytes());
-        hash.update(&compact[..end]);
+        DOMAIN.len() + end
     } else {
-        hash.update(bytes);
-    }
-    Ok(*hash.finalize().as_bytes())
+        let end = DOMAIN.len() + bytes.len();
+        transcript[DOMAIN.len()..end].copy_from_slice(bytes);
+        end
+    };
+    Ok(*blake3::hash(&transcript[..length]).as_bytes())
 }
 
 impl<const N: usize> AuthenticatedIndex<N> {

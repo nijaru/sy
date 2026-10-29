@@ -44,14 +44,19 @@ fn canonical_digests_match_independent_transcripts_for_every_child_mask() {
             "mask {mask:04x}"
         );
     }
-    let mut leaf = [0x6d; RECORD_BYTES];
+    let mut leaf = [0x6d; BRANCH_BYTES];
     leaf[0] = 1;
-    let mut transcript = b"sy/authenticated-index/v1\0".to_vec();
-    transcript.extend_from_slice(&leaf);
-    assert_eq!(
-        digest(&leaf).unwrap(),
-        *blake3::hash(&transcript).as_bytes()
-    );
+    // Include every supported leaf payload size and all compression boundaries.
+    for length in 33..=BRANCH_BYTES {
+        let mut reference = blake3::Hasher::new();
+        reference.update(b"sy/authenticated-index/v1\0");
+        reference.update(&leaf[..length]);
+        assert_eq!(
+            digest(&leaf[..length]).unwrap(),
+            *reference.finalize().as_bytes(),
+            "leaf length {length}"
+        );
+    }
 }
 
 #[test]
