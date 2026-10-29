@@ -19,7 +19,7 @@ fn details(
     let directory = if original.effective.kind == libc::S_IFDIR as u64
         && root != Some(SourceRootProtection::SelectedLeafAnchor)
     {
-        Some(catalogue.disposition(key).unwrap())
+        Some(catalogue.original_state(key).unwrap().directory)
     } else {
         None
     };
@@ -575,11 +575,9 @@ async fn batch_rejects_substituted_ordinal_and_inverse_mapping() {
             // authenticity alone cannot establish exact original membership.
             if inverse {
                 let (key, _) = c.original_at(1).unwrap();
-                let mut wrong = [0; 48];
-                wrong[..8].copy_from_slice(&2u64.to_le_bytes());
-                c.index
-                    .set_bytes(state_key(b"ordinal", key), wrong)
-                    .unwrap();
+                let mut wrong = c.original_state(key).unwrap();
+                wrong.ordinal = 2;
+                c.set_original_state(key, wrong).unwrap();
             } else {
                 let locator = c.index.get_bytes(ordinal_key(2)).unwrap().unwrap();
                 c.index.set_bytes(ordinal_key(1), locator).unwrap();
@@ -699,15 +697,16 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
                 c.index.file.seek(SeekFrom::Start(0)).unwrap();
                 c.index.file.read_to_end(&mut bytes).unwrap();
                 let mut needle = vec![1]; // authenticated radix leaf tag
-                needle.extend_from_slice(&state_key(b"children", [0; 32]));
-                needle.extend_from_slice(&1u64.to_le_bytes());
+                needle.extend_from_slice(&state_key(b"original", [0; 32]));
+                needle.extend_from_slice(&0u64.to_le_bytes()); // root ordinal
+                needle.extend_from_slice(&1u64.to_le_bytes()); // original children
                 let offset = bytes
                     .windows(needle.len())
                     .position(|window| window == needle.as_slice())
                     .unwrap();
                 // Change only the derived original child count, keeping extent
                 // and every observation payload intact. Never mint a digest.
-                c.index.file.write_at(&[0], (offset + 33) as u64).unwrap();
+                c.index.file.write_at(&[0], (offset + 41) as u64).unwrap();
             }
         }
         assert!(inventory
@@ -776,9 +775,9 @@ async fn allocation_and_private_metadata_authenticate_root_state_and_tape_extent
                 let mut owner = source_rooted.source_observations.lock().unwrap();
                 let c = owner.active().unwrap();
                 if inverse {
-                    c.index
-                        .set_bytes(state_key(b"ordinal", [0; 32]), [42; 48])
-                        .unwrap();
+                    let mut state = c.original_state([0; 32]).unwrap();
+                    state.ordinal = 42;
+                    c.set_original_state([0; 32], state).unwrap();
                 } else {
                     c.file.set_len(c.end + 1).unwrap();
                 }

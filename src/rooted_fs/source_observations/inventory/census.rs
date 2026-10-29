@@ -268,7 +268,7 @@ impl SourceInventory {
             for ordinal in 0..c.count {
                 let (original_key, original) = c.original_at(ordinal)?;
                 c.original_path(original_key, &original)?;
-                c.check_original_ordinal(ordinal, original_key)?;
+                let state = c.check_original_ordinal(ordinal, original_key)?;
                 let physical = if original.followed {
                     c.qualifies_follow_resolution(&original)?
                         && match original.followed_object_key {
@@ -288,9 +288,9 @@ impl SourceInventory {
                         None => false,
                     };
                 if original.named.kind == libc::S_IFDIR as u64 {
-                    let children = c.child_count(original_key)?;
-                    qualified &= c.disposition(original_key)? != SourceDirectoryDisposition::Opaque
-                        || (children == 0 && c.empty_directory_stamp(original_key)?.is_some());
+                    qualified &= state.directory != SourceDirectoryDisposition::Opaque
+                        || (state.children == 0
+                            && c.empty_directory_stamp(original_key)?.is_some());
                 }
             }
             if !qualified {
@@ -306,8 +306,9 @@ impl SourceInventory {
                     continue;
                 }
                 let path = c.original_path(parent_key, &parent)?;
-                let expected = c.child_count(parent_key)?;
-                if c.disposition(parent_key)? == SourceDirectoryDisposition::Opaque {
+                let state = c.original_state(parent_key)?;
+                let expected = state.children;
+                if state.directory == SourceDirectoryDisposition::Opaque {
                     // Native attributes do not require opening the omitted
                     // directory for search/read access, or listing its names.
                     let directory = match path.parent() {
@@ -336,8 +337,7 @@ impl SourceInventory {
                     // Resolve membership before decoding the payload, so the
                     // ordinal and name-key mappings authenticate one read of
                     // the original rather than decoding the same record twice.
-                    let Some(position) = c.index.get_bytes(state_key(b"ordinal", child_key))?
-                    else {
+                    let Some(state) = c.index.get_bytes(state_key(b"original", child_key))? else {
                         // A new native child is a SOURCE race; a missing inverse
                         // for an existing original is catalogue corruption.
                         return Err(if c.get(child_key)?.is_none() {
@@ -346,11 +346,7 @@ impl SourceInventory {
                             invalid().into()
                         });
                     };
-                    if position[8..] != [0; 40] {
-                        return Err(invalid().into());
-                    }
-                    let ordinal =
-                        u64::from_le_bytes(position[..8].try_into().map_err(|_| invalid())?);
+                    let ordinal = OriginalState::decode(state)?.ordinal;
                     let (original_key, original) = c.original_at(ordinal)?;
                     if original_key != child_key {
                         return Err(invalid().into());

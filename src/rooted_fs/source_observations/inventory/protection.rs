@@ -29,7 +29,7 @@ impl Catalogue {
             if original.named.kind != libc::S_IFDIR as u64 {
                 continue;
             }
-            let disposition = self.disposition(parent_key)?;
+            let disposition = self.original_state(parent_key)?.directory;
             if disposition == SourceDirectoryDisposition::Traversed {
                 continue;
             }
@@ -118,7 +118,10 @@ impl Catalogue {
                 }
                 seen = seen.checked_add(1).ok_or_else(invalid)?;
             }
-            if seen != self.child_count(parent_key)? {
+            // Child capture updates this same state record. Reload at EOF so
+            // publishing its disposition cannot overwrite the derived count.
+            let mut state = self.original_state(parent_key)?;
+            if seen != state.children {
                 return Err(self.changed(path));
             }
             let result = self.validate_native_binding(rooted, &path, true);
@@ -126,8 +129,8 @@ impl Catalogue {
             if !self.completed {
                 // Actual census EOF, not scanner traversal, byte authority,
                 // publication, completion, or source-removal permission.
-                self.index
-                    .set_bytes(state_key(b"directory", parent_key), [2; 48])?;
+                state.directory = SourceDirectoryDisposition::Protected;
+                self.set_original_state(parent_key, state)?;
             }
         }
         Ok(active())

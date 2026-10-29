@@ -1075,17 +1075,7 @@ impl RootedFs {
             for ordinal in 0..original.count {
                 let (key, observation) = original.original_at(ordinal)?;
                 original.original_path(key, &observation)?;
-                let mut expected = [0; 48];
-                expected[..8].copy_from_slice(&ordinal.to_le_bytes());
-                if original
-                    .index
-                    .get_bytes(inventory::state_key(b"ordinal", key))?
-                    != Some(expected)
-                {
-                    return Err(invalid().into());
-                }
-                original.disposition(key)?;
-                original.child_count(key)?;
+                original.check_original_ordinal(ordinal, key)?;
             }
             original.replay_address(self, data)?
         } else {

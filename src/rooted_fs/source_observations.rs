@@ -539,21 +539,13 @@ impl Catalogue {
         let locator = self.append(key, observation)?;
         self.index
             .set_bytes(inventory::ordinal_key(self.count), locator)?;
-        let mut ordinal = [0; 48];
-        ordinal[..8].copy_from_slice(&self.count.to_le_bytes());
-        self.index
-            .set_bytes(inventory::state_key(b"ordinal", key), ordinal)?;
+        self.set_original_state(key, inventory::OriginalState::new(self.count))?;
         // Derived solely at original capture, before selection/omission. Late
         // enumeration never adopts a count or name into this authority.
         if self.count != 0 {
-            let count = self
-                .child_count(observation.parent)?
-                .checked_add(1)
-                .ok_or_else(invalid)?;
-            let mut state = [0; 48];
-            state[..8].copy_from_slice(&count.to_le_bytes());
-            self.index
-                .set_bytes(inventory::state_key(b"children", observation.parent), state)?;
+            let mut parent = self.original_state(observation.parent)?;
+            parent.children = parent.children.checked_add(1).ok_or_else(invalid)?;
+            self.set_original_state(observation.parent, parent)?;
         }
         self.count = self.count.checked_add(1).ok_or_else(invalid)?;
         Ok(())

@@ -130,8 +130,10 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
     ignore = "requires Linux 6.12+ and TMPDIR on native ext2/3/4 or Btrfs"
 )]
 #[tokio::test]
-async fn census_authenticates_root_inverse_and_non_directory_disposition() {
-    for root_inverse in [true, false] {
+async fn census_authenticates_root_inverse_and_non_directory_state() {
+    // Independently exercise the inverse, disposition and both ends of the
+    // reserved region, including state on an original that is not a directory.
+    for (ordinal, byte) in [(0, 0), (1, 16), (1, 17), (1, 47)] {
         let fixture = tempfile::tempdir().unwrap();
         let source_path = fixture.path().join("source");
         let destination = fixture.path().join("destination");
@@ -152,14 +154,13 @@ async fn census_authenticates_root_inverse_and_non_directory_disposition() {
         {
             let mut owner = inventory.rooted.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
-            let key = if root_inverse {
-                state_key(b"ordinal", [0; 32])
-            } else {
-                let (key, _) = c.original_at(1).unwrap();
-                state_key(b"directory", key)
-            };
+            let (key, _) = c.original_at(ordinal).unwrap();
+            let mut bytes = c.original_state(key).unwrap().encode();
+            bytes[byte] = 42;
             // Authenticated but inconsistent state is not membership evidence.
-            c.index.set_bytes(key, [42; 48]).unwrap();
+            c.index
+                .set_bytes(state_key(b"original", key), bytes)
+                .unwrap();
         }
         assert!(matches!(
             inventory.excludes_objects_blocking(&[candidate], SourceExclusion::Objects),

@@ -51,7 +51,9 @@ async fn protected_metadata_stays_readless_unfollowed_and_outside_sync_selection
             assert_eq!(link.target.unwrap().as_os_str(), OsStr::new("loop"));
             assert_eq!(c.protected_count, 3);
             assert_eq!(
-                c.disposition(path_key(Path::new("pruned"))).unwrap(),
+                c.original_state(path_key(Path::new("pruned")))
+                    .unwrap()
+                    .directory,
                 SourceDirectoryDisposition::Protected
             );
         }

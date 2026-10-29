@@ -5,6 +5,8 @@ use super::*;
 mod census;
 mod empty;
 mod protection;
+mod state;
+pub(super) use state::OriginalState;
 #[cfg(test)]
 #[path = "inventory_tests.rs"]
 mod tests;
@@ -76,36 +78,19 @@ pub(super) fn validate_original_path(path: &Path) -> Result<()> {
 }
 
 impl Catalogue {
-    pub(super) fn child_count(&mut self, key: [u8; 32]) -> Result<u64> {
-        match self.index.get_bytes(state_key(b"children", key))? {
-            None => Ok(0),
-            Some(bytes) if bytes[8..] == [0; 40] => Ok(u64::from_le_bytes(
-                bytes[..8].try_into().map_err(|_| invalid())?,
-            )),
-            Some(_) => Err(invalid().into()),
-        }
-    }
     pub(super) fn check_completed_traversal(&mut self) -> Result<()> {
         let mut epoch = [0; 48];
         epoch[..8].copy_from_slice(&self.epoch.to_le_bytes());
         for ordinal in 0..self.count {
             let (key, original) = self.original_at(ordinal)?;
             if original.effective.kind == libc::S_IFDIR as u64
-                && self.disposition(key)? == SourceDirectoryDisposition::Traversed
+                && self.original_state(key)?.directory == SourceDirectoryDisposition::Traversed
                 && self.index.get_bytes(state_key(b"traversal", key))? != Some(epoch)
             {
                 return Err(invalid().into());
             }
         }
         Ok(())
-    }
-    pub(super) fn disposition(&mut self, key: [u8; 32]) -> Result<SourceDirectoryDisposition> {
-        match self.index.get_bytes(state_key(b"directory", key))? {
-            None => Ok(SourceDirectoryDisposition::Opaque),
-            Some(bytes) if bytes == [1; 48] => Ok(SourceDirectoryDisposition::Traversed),
-            Some(bytes) if bytes == [2; 48] => Ok(SourceDirectoryDisposition::Protected),
-            Some(_) => Err(invalid().into()),
-        }
     }
     pub(super) fn original_at(&mut self, ordinal: u64) -> Result<([u8; 32], Observation)> {
         if ordinal >= self.count {
@@ -182,14 +167,16 @@ impl Catalogue {
         Ok(())
     }
 
-    fn check_original_ordinal(&mut self, ordinal: u64, key: [u8; 32]) -> Result<()> {
-        let mut expected = [0; 48];
-        expected[..8].copy_from_slice(&ordinal.to_le_bytes());
-        if self.index.get_bytes(state_key(b"ordinal", key))? != Some(expected) {
+    pub(super) fn check_original_ordinal(
+        &mut self,
+        ordinal: u64,
+        key: [u8; 32],
+    ) -> Result<OriginalState> {
+        let state = self.original_state(key)?;
+        if state.ordinal != ordinal {
             return Err(invalid().into());
         }
-        self.disposition(key)?;
-        Ok(())
+        Ok(state)
     }
 
     fn validate_original_records(&mut self, rooted: &RootedFs) -> Result<()> {
@@ -226,7 +213,7 @@ impl RootedFs {
         for ordinal in 0..catalogue.count {
             let (key, original) = catalogue.original_at(ordinal)?;
             catalogue.original_path(key, &original)?;
-            catalogue.disposition(key)?;
+            catalogue.original_state(key)?;
         }
         catalogue.sealed = true;
         let count = catalogue.count;
@@ -252,14 +239,14 @@ impl RootedFs {
         if !catalogue.scanning || original.effective.kind != libc::S_IFDIR as u64 {
             return Err(invalid().into());
         }
+        let mut state = catalogue.original_state(key)?;
         if catalogue.completed {
-            if catalogue.disposition(key)? != SourceDirectoryDisposition::Traversed {
+            if state.directory != SourceDirectoryDisposition::Traversed {
                 return Err(invalid().into());
             }
         } else {
-            catalogue
-                .index
-                .set_bytes(state_key(b"directory", key), [1; 48])?;
+            state.directory = SourceDirectoryDisposition::Traversed;
+            catalogue.set_original_state(key, state)?;
         }
         let mut epoch = [0; 48];
         epoch[..8].copy_from_slice(&catalogue.epoch.to_le_bytes());
@@ -358,7 +345,7 @@ impl SourceInventory {
 
     /// Allocation can record the current sealed owner, never an effect permit.
     pub(in crate::rooted_fs) fn validate_lifetime_blocking(&self) -> Result<()> {
-        self.with_original_batch(|c| c.check_original_ordinal(0, [0; 32]))
+        self.with_original_batch(|c| c.check_original_ordinal(0, [0; 32]).map(|_| ()))
     }
 
     /// Used only with independent evidence of exclusive FILE allocation after

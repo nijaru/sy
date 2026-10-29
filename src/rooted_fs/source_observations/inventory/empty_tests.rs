@@ -47,11 +47,9 @@ async fn native_empty_root_and_unreadable_pruned_directory_need_no_enumeration()
         let protected = {
             let mut owner = inventory.rooted.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
-            assert_eq!(
-                c.disposition(key).unwrap(),
-                SourceDirectoryDisposition::Opaque
-            );
-            assert_eq!(c.child_count(key).unwrap(), 0);
+            let state = c.original_state(key).unwrap();
+            assert_eq!(state.directory, SourceDirectoryDisposition::Opaque);
+            assert_eq!(state.children, 0);
             assert!(c.empty_directory_stamp(key).unwrap().is_some());
             c.require(relative).unwrap().object_key.unwrap()
         };
