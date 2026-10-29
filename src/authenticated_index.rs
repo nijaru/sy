@@ -47,6 +47,14 @@ struct Locator {
     digest: [u8; 32],
 }
 
+// Only the native writer constructs this image. Retaining the current root's
+// exact preimage enlarges the RAM authority; it never retains a scratch proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrittenNode {
+    locator: Locator,
+    bytes: [u8; BRANCH_BYTES],
+}
+
 #[derive(Clone, Copy)]
 struct Branch {
     depth: u8,
@@ -88,7 +96,7 @@ struct Proof<const N: usize> {
 pub(crate) struct AuthenticatedIndex<const N: usize> {
     // Native owners retain this descriptor; fault tests mutate the same held file.
     pub(crate) file: File,
-    root: Option<Locator>,
+    root: Option<WrittenNode>,
     end: u64,
     healthy: bool,
 }
@@ -198,10 +206,14 @@ impl<const N: usize> AuthenticatedIndex<N> {
             tag => return Err(invalid(StateError::Tag(tag))),
         };
         self.check_offset(locator.offset, length)?;
-        // Framing and canonical empty slots are checked without following any
-        // child offset. Mapping and payload must prove the retained RAM root
-        // before routing, absence or updates can use them.
-        if digest(&bytes[..length])? != locator.digest {
+        // Read the root freshly too, but authenticate it against its exact
+        // native-written preimage. The writer already checked canonical slots.
+        // Other nodes must prove their digest before any routing/offset use.
+        let authenticated = match self.root.as_ref() {
+            Some(root) if root.locator == locator => root.bytes[..length] == bytes[..length],
+            _ => digest(&bytes[..length])? == locator.digest,
+        };
+        if !authenticated {
             return Err(invalid(StateError::Authentication));
         }
         if bytes[0] == 1 {
@@ -258,7 +270,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
     ) -> io::Result<Option<(Locator, Node<N>)>> {
         let mut parent: Option<(u8, [u8; 32])> = None;
         let mut steps = 0;
-        let mut cursor = self.root;
+        let mut cursor = self.root.as_ref().map(|root| root.locator);
         while let Some(locator) = cursor {
             let node = self.read(locator)?;
             if let Some((depth, expected_prefix)) = parent {
@@ -311,7 +323,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
 
     // Hash only bytes constructed by this owner. Never reread scratch to mint
     // a new locator/digest, and never infer the append offset from its file size.
-    fn write(&mut self, offset: u64, node: Node<N>, end: &mut u64) -> io::Result<Locator> {
+    fn write(&mut self, offset: u64, node: Node<N>, end: &mut u64) -> io::Result<WrittenNode> {
         let mut bytes = [0; BRANCH_BYTES];
         let length = match node {
             Node::Leaf { key, state } => {
@@ -348,7 +360,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(&bytes[..length])?;
         *end = (*end).max(next);
-        Ok(locator)
+        Ok(WrittenNode { locator, bytes })
     }
 
     pub(crate) fn set_bytes(&mut self, key: [u8; 32], state: [u8; N]) -> io::Result<()> {
@@ -372,7 +384,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
                         prefix: prefix(key, depth),
                         children: [None; FANOUT],
                     };
-                    branch.children[nibble(&key, depth)] = Some(new_leaf);
+                    branch.children[nibble(&key, depth)] = Some(new_leaf.locator);
                     branch.children[nibble(&node.key(), depth)] = Some(old);
                     let offset = end;
                     self.write(offset, Node::Branch(branch), &mut end)?
@@ -383,7 +395,8 @@ impl<const N: usize> AuthenticatedIndex<N> {
         };
         for step in proof.path[..proof.len].iter().rev() {
             let mut step = step.ok_or_else(|| invalid(StateError::Path))?;
-            step.branch.children[nibble(&key, usize::from(step.branch.depth))] = Some(updated);
+            step.branch.children[nibble(&key, usize::from(step.branch.depth))] =
+                Some(updated.locator);
             updated = self.write(step.locator.offset, Node::Branch(step.branch), &mut end)?;
         }
         // Publication follows the COMPLETE native-owned write path, including

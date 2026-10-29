@@ -9,7 +9,8 @@ const RESIDENT_ORDINALS: u64 = 8192;
 
 enum Entries {
     Resident(Box<[u64]>),
-    Disk(AuthenticatedIndex<8>),
+    // Keep resident bookkeeping small despite the disk owner's full root image.
+    Disk(Box<AuthenticatedIndex<8>>),
 }
 
 pub(super) struct SeenOriginals {
@@ -24,7 +25,7 @@ impl SeenOriginals {
             let words = usize::try_from(non_root.div_ceil(64)).map_err(|_| invalid())?;
             Entries::Resident(vec![0; words].into_boxed_slice())
         } else {
-            Entries::Disk(AuthenticatedIndex::new()?)
+            Entries::Disk(Box::new(AuthenticatedIndex::new()?))
         };
         Ok(Self { count, entries })
     }
