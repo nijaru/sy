@@ -6,9 +6,9 @@
 //! This is runtime authentication, not a crash-durability/recovery format.
 
 use std::fs::File;
+use std::io;
 #[cfg(any(not(unix), test))]
-use std::io::Read;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
@@ -362,8 +362,13 @@ impl<const N: usize> AuthenticatedIndex<N> {
             offset,
             digest: digest(&bytes[..length])?,
         };
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&bytes[..length])?;
+        #[cfg(unix)]
+        self.file.write_all_at(&bytes[..length], offset)?;
+        #[cfg(not(unix))]
+        {
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(&bytes[..length])?;
+        }
         *end = (*end).max(next);
         Ok(WrittenNode { locator, bytes })
     }

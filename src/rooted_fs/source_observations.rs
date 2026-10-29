@@ -3,9 +3,9 @@
 //! Only scanner capture inserts records. Readers can only validate them.
 use super::*;
 use crate::authenticated_index::AuthenticatedIndex;
+use std::io;
 #[cfg(test)]
-use std::io::Read;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -526,8 +526,7 @@ impl Catalogue {
             .end
             .checked_add(bytes.len() as u64)
             .ok_or_else(invalid)?;
-        self.file.seek(SeekFrom::Start(self.end))?;
-        self.file.write_all(&bytes)?;
+        self.file.write_all_at(&bytes, self.end)?;
         if self.index.get_bytes(key)?.is_some() {
             return Err(invalid().into());
         }
