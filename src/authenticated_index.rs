@@ -62,6 +62,60 @@ struct Branch {
     children: [Option<Locator>; FANOUT],
 }
 
+// This view borrows only the current freshly authenticated and validated frame.
+// Writers copy its children into their bounded proof; lookups select just one.
+#[derive(Clone, Copy)]
+struct BranchView<'a> {
+    depth: u8,
+    prefix: [u8; 32],
+    slots: &'a [[u8; CHILD_BYTES]],
+}
+
+impl BranchView<'_> {
+    fn child(self, position: usize) -> Option<Locator> {
+        let slot = &self.slots[position];
+        let mut offset = [0; 8];
+        offset.copy_from_slice(&slot[..8]);
+        let offset = u64::from_le_bytes(offset);
+        if offset == EMPTY_OFFSET {
+            return None;
+        }
+        let mut digest = [0; 32];
+        digest.copy_from_slice(&slot[8..]);
+        Some(Locator { offset, digest })
+    }
+
+    fn into_owned(self) -> Branch {
+        Branch {
+            depth: self.depth,
+            prefix: self.prefix,
+            children: std::array::from_fn(|position| self.child(position)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadNode<'a, const N: usize> {
+    Branch(BranchView<'a>),
+    Leaf { key: [u8; 32], state: [u8; N] },
+}
+
+impl<const N: usize> ReadNode<'_, N> {
+    fn key(&self) -> [u8; 32] {
+        match self {
+            Self::Branch(branch) => branch.prefix,
+            Self::Leaf { key, .. } => *key,
+        }
+    }
+
+    fn into_owned(self) -> Node<N> {
+        match self {
+            Self::Branch(branch) => Node::Branch(branch.into_owned()),
+            Self::Leaf { key, state } => Node::Leaf { key, state },
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 #[expect(
     clippy::large_enum_variant,
@@ -73,10 +127,10 @@ enum Node<const N: usize> {
 }
 
 impl<const N: usize> Node<N> {
-    fn key(self) -> [u8; 32] {
+    fn key(&self) -> [u8; 32] {
         match self {
             Self::Branch(branch) => branch.prefix,
-            Self::Leaf { key, .. } => key,
+            Self::Leaf { key, .. } => *key,
         }
     }
 }
@@ -189,9 +243,12 @@ impl<const N: usize> AuthenticatedIndex<N> {
         Ok(())
     }
 
-    fn read(&mut self, locator: Locator) -> io::Result<Node<N>> {
+    fn read<'a>(
+        &mut self,
+        locator: Locator,
+        bytes: &'a mut [u8; BRANCH_BYTES],
+    ) -> io::Result<ReadNode<'a, N>> {
         self.check_offset(locator.offset, 1)?;
-        let mut bytes = [0; BRANCH_BYTES];
         // Bound the read by the native-owned extent, not an untrusted tag. A
         // packed leaf may include bytes from its neighbour in this one read;
         // only its own authenticated frame is subsequently interpreted.
@@ -226,13 +283,13 @@ impl<const N: usize> AuthenticatedIndex<N> {
             key.copy_from_slice(&bytes[1..33]);
             let mut state = [0; N];
             state.copy_from_slice(&bytes[33..length]);
-            return Ok(Node::Leaf { key, state });
+            return Ok(ReadNode::Leaf { key, state });
         }
         let depth = bytes[1];
-        let mut branch = Branch {
+        let mut branch = BranchView {
             depth,
             prefix: [0; 32],
-            children: [None; FANOUT],
+            slots: bytes[BRANCH_HEADER_BYTES..].as_chunks::<CHILD_BYTES>().0,
         };
         branch
             .prefix
@@ -242,11 +299,8 @@ impl<const N: usize> AuthenticatedIndex<N> {
         {
             return Err(invalid(StateError::Path));
         }
-        for (child, slot) in branch
-            .children
-            .iter_mut()
-            .zip(bytes[BRANCH_HEADER_BYTES..].as_chunks::<CHILD_BYTES>().0)
-        {
+        let mut count = 0;
+        for slot in branch.slots {
             let mut offset = [0; 8];
             offset.copy_from_slice(&slot[..8]);
             let offset = u64::from_le_bytes(offset);
@@ -255,15 +309,13 @@ impl<const N: usize> AuthenticatedIndex<N> {
                 if offset == locator.offset {
                     return Err(invalid(StateError::Child));
                 }
-                let mut digest = [0; 32];
-                digest.copy_from_slice(&slot[8..]);
-                *child = Some(Locator { offset, digest });
+                count += 1;
             }
         }
-        if branch.children.iter().flatten().count() < 2 {
+        if count < 2 {
             return Err(invalid(StateError::Child));
         }
-        Ok(Node::Branch(branch))
+        Ok(ReadNode::Branch(branch))
     }
 
     /// Authenticate every edge, retaining only the previous routing boundary.
@@ -271,32 +323,35 @@ impl<const N: usize> AuthenticatedIndex<N> {
     fn walk(
         &mut self,
         key: [u8; 32],
-        mut visit: impl FnMut(Step),
+        mut visit: impl FnMut(Locator, BranchView<'_>),
     ) -> io::Result<Option<(Locator, Node<N>)>> {
         let mut parent: Option<(u8, [u8; 32])> = None;
         let mut steps = 0;
         let mut cursor = self.root.as_ref().map(|root| root.locator);
+        let mut bytes = [0; BRANCH_BYTES];
         while let Some(locator) = cursor {
-            let node = self.read(locator)?;
+            let node = self.read(locator, &mut bytes)?;
             if let Some((depth, expected_prefix)) = parent {
                 if prefix(node.key(), usize::from(depth)) != expected_prefix
                     || nibble(&node.key(), usize::from(depth)) != nibble(&key, usize::from(depth))
-                    || matches!(node, Node::Branch(branch) if branch.depth <= depth)
+                    || matches!(node, ReadNode::Branch(branch) if branch.depth <= depth)
                 {
                     return Err(invalid(StateError::Path));
                 }
             }
             match node {
-                Node::Branch(branch) if prefix(key, usize::from(branch.depth)) == branch.prefix => {
+                ReadNode::Branch(branch)
+                    if prefix(key, usize::from(branch.depth)) == branch.prefix =>
+                {
                     if steps == LEVELS {
                         return Err(invalid(StateError::Path));
                     }
                     steps += 1;
-                    visit(Step { locator, branch });
+                    visit(locator, branch);
                     parent = Some((branch.depth, branch.prefix));
-                    cursor = branch.children[nibble(&key, usize::from(branch.depth))];
+                    cursor = branch.child(nibble(&key, usize::from(branch.depth)));
                 }
-                _ => return Ok(Some((locator, node))),
+                _ => return Ok(Some((locator, node.into_owned()))),
             }
         }
         Ok(None)
@@ -308,8 +363,11 @@ impl<const N: usize> AuthenticatedIndex<N> {
             len: 0,
             terminal: None,
         };
-        proof.terminal = self.walk(key, |step| {
-            proof.path[proof.len] = Some(step);
+        proof.terminal = self.walk(key, |locator, branch| {
+            proof.path[proof.len] = Some(Step {
+                locator,
+                branch: branch.into_owned(),
+            });
             proof.len += 1;
         })?;
         Ok(proof)
@@ -317,7 +375,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
 
     pub(crate) fn get_bytes(&mut self, key: [u8; 32]) -> io::Result<Option<[u8; N]>> {
         self.begin()?;
-        let terminal = self.walk(key, |_| {})?;
+        let terminal = self.walk(key, |_, _| {})?;
         let state = match terminal {
             Some((_, Node::Leaf { key: found, state })) if key == found => Some(state),
             _ => None,

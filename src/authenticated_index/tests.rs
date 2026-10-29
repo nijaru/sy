@@ -259,9 +259,11 @@ fn authenticated_child_edges_cannot_become_false_absence_or_update_paths() {
             index.set_bytes([0; 32], state(1)).unwrap();
             index.set_bytes([0x0f; 32], state(2)).unwrap();
             let root = index.root.unwrap();
-            let Node::Branch(mut branch) = index.read(root.locator).unwrap() else {
+            let mut frame = [0; BRANCH_BYTES];
+            let ReadNode::Branch(branch) = index.read(root.locator, &mut frame).unwrap() else {
                 panic!("two distinct keys require a branch");
             };
+            let mut branch = branch.into_owned();
             assert_eq!(branch.depth, 1);
             let malformed = if fault == 2 {
                 // A locally valid child branch must still advance its parent's
@@ -297,6 +299,65 @@ fn authenticated_child_edges_cannot_become_false_absence_or_update_paths() {
                     .and_then(|error| error.downcast_ref::<StateError>()),
                 Some(StateError::Path)
             ));
+            assert_terminal(&mut index);
+        }
+    }
+}
+
+#[test]
+fn invalid_siblings_and_cardinality_block_lookup_absence_and_updates() {
+    for fault in 0..5 {
+        for operation in 0..6 {
+            let mut index = Index::new().unwrap();
+            index.set_bytes([0; 32], state(1)).unwrap();
+            index.set_bytes([0x0f; 32], state(2)).unwrap();
+            let root = index.root.unwrap();
+            let mut frame = [0; BRANCH_BYTES];
+            let ReadNode::Branch(branch) = index.read(root.locator, &mut frame).unwrap() else {
+                panic!("two distinct keys require a branch");
+            };
+            let mut branch = branch.into_owned();
+            assert_eq!(branch.depth, 1);
+            // All operations below select child 0 or 1, or mismatch the prefix.
+            // Forge native authority to isolate validation from authentication.
+            match fault {
+                0..=2 => {
+                    branch.children[15].as_mut().unwrap().offset = match fault {
+                        0 => u64::MAX - 1,
+                        1 => index.end - RECORD_BYTES as u64 + 1,
+                        _ => root.locator.offset,
+                    };
+                }
+                3 => branch.children[15] = None,
+                _ => branch.children.fill(None),
+            }
+            let mut end = index.end;
+            index.root = Some(
+                index
+                    .write(root.locator.offset, Node::Branch(branch), &mut end)
+                    .unwrap(),
+            );
+            let root = index.root;
+            let error = match operation {
+                0 => index.get_bytes([0; 32]).unwrap_err(),
+                1 => index.get_bytes([1; 32]).unwrap_err(),
+                2 => index.get_bytes([0x10; 32]).unwrap_err(),
+                3 => index.set_bytes([0; 32], state(3)).unwrap_err(),
+                4 => index.set_bytes([1; 32], state(3)).unwrap_err(),
+                _ => index.set_bytes([0x10; 32], state(3)).unwrap_err(),
+            };
+            let error = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<StateError>()
+                .unwrap();
+            if fault >= 2 {
+                assert!(matches!(error, StateError::Child));
+            } else {
+                assert!(matches!(error, StateError::Offset));
+            }
+            assert_eq!(index.root, root);
+            assert_eq!(index.end, end);
             assert_terminal(&mut index);
         }
     }
