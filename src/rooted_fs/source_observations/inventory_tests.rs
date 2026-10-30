@@ -653,6 +653,60 @@ async fn canonical_original_replay_requires_both_associations_and_original_prese
 }
 
 #[tokio::test]
+async fn lifetime_rejects_noncanonical_root_namespace_without_repair() {
+    for wrong_parent in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        let rooted = source_scan(fixture.path(), false, Default::default()).await;
+        let inventory = rooted.seal_source_inventory_blocking().unwrap();
+        inventory.validate_lifetime_blocking().unwrap();
+        let (original_entry, original_end) = {
+            let mut owner = rooted.source_observations.lock().unwrap();
+            let c = owner.active().unwrap();
+            let original_entry = c.entry([0; 32]).unwrap().unwrap();
+            let original_end = c.end;
+            let mut original = c.read_locator(original_entry.locator).unwrap();
+            if wrong_parent {
+                original.parent = [7; 32];
+            } else {
+                original.name = OsString::from("not-root");
+            }
+            // Keep the genuine native ROOT identity and original ordinal.
+            // Native signing isolates canonical namespace validation from hash
+            // failure; no scratch reader may mint this replacement authority.
+            let bytes = original.encode();
+            c.file.write_all_at(&bytes, original_end).unwrap();
+            c.end += bytes.len() as u64;
+            let mut replacement = original_entry;
+            replacement.locator[..8].copy_from_slice(&original_end.to_le_bytes());
+            replacement.locator[8..16].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+            replacement.locator[16..].copy_from_slice(blake3::hash(&bytes).as_bytes());
+            c.set_index_record([0; 32], IndexRecord::Entry(replacement))
+                .unwrap();
+            (original_entry, original_end)
+        };
+        let result = inventory.validate_lifetime_blocking();
+        assert!(
+            matches!(result, Err(RootedFsError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData),
+            "wrong_parent={wrong_parent}: {result:?}"
+        );
+        {
+            let mut owner = rooted.source_observations.lock().unwrap();
+            let CatalogueState::Active(c) = &mut *owner else {
+                panic!("retained original owner")
+            };
+            c.set_index_record([0; 32], IndexRecord::Entry(original_entry))
+                .unwrap();
+            c.file.set_len(original_end).unwrap();
+            c.end = original_end;
+        }
+        assert!(matches!(
+            inventory.validate_lifetime_blocking(),
+            Err(RootedFsError::SourceCatalogueTerminal)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn low_fd_deep_wide_original_inventory_replay() {
     if let Some(root) = std::env::var_os("SY_TEST_SOURCE_INVENTORY_ROOT") {
         for local in [false, true] {

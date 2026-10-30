@@ -110,7 +110,7 @@ impl Catalogue {
         if state.ordinal != ordinal {
             return Err(invalid().into());
         }
-        let observation = self.read_locator(entry.locator)?;
+        let observation = self.read_entry(key, entry)?;
         let actual = if ordinal == 0 {
             [0; 32]
         } else {

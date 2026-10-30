@@ -523,7 +523,16 @@ impl Catalogue {
         let Some(entry) = self.entry(key)? else {
             return Ok(None);
         };
-        self.read_locator(entry.locator).map(Some)
+        self.read_entry(key, entry).map(Some)
+    }
+    fn read_entry(&self, key: [u8; 32], entry: CatalogueEntry) -> Result<Observation> {
+        let observation = self.read_locator(entry.locator)?;
+        // ROOT has a fixed synthetic namespace. Native identity equality alone
+        // does not validate these fields in readers that never rebuild a path.
+        if key == [0; 32] && (observation.parent != [0; 32] || !observation.name.is_empty()) {
+            return Err(invalid().into());
+        }
+        Ok(observation)
     }
     fn read_locator(&self, locator: [u8; 48]) -> Result<Observation> {
         let offset = u64::from_le_bytes(locator[..8].try_into().map_err(|_| invalid())?);
