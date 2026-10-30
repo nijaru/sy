@@ -1073,9 +1073,7 @@ impl RootedFs {
         let terminal_data = if retry {
             // Authenticate the full retained catalogue without opening CHILD
             // names or repairing scratch. No failed-run observations go live.
-            if original.file.metadata()?.len() != original.end {
-                return Err(invalid().into());
-            }
+            original.check_scratch_extents()?;
             for ordinal in 0..original.count {
                 let (key, observation, _) = original.original_at(ordinal)?;
                 original.original_path(key, &observation)?;

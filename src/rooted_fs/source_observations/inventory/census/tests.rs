@@ -9,6 +9,8 @@ enum EndChange {
     OperatorAncestor,
     MemberDirectory,
     TapeExtent,
+    HintExtent,
+    HintKey,
     Cancel,
 }
 
@@ -22,6 +24,8 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
         EndChange::OperatorAncestor,
         EndChange::MemberDirectory,
         EndChange::TapeExtent,
+        EndChange::HintExtent,
+        EndChange::HintKey,
         EndChange::Cancel,
     ] {
         let fixture = tempfile::tempdir().unwrap();
@@ -37,10 +41,15 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
             .unwrap();
         let effects = LocalSourceEffects::seal(&source).await.unwrap();
         let source = source.rooted();
-        let (tape, cancelled) = {
+        let (tape, hints, original_hint, cancelled) = {
             let mut owner = source.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
-            (c.file.try_clone().unwrap(), Arc::clone(&c.cancelled))
+            (
+                c.file.try_clone().unwrap(),
+                c.original_hints.try_clone().unwrap(),
+                c.original_hint(1).unwrap(),
+                Arc::clone(&c.cancelled),
+            )
         };
         let destination = fixture.path().join("destination");
         std::fs::create_dir(&destination).unwrap();
@@ -80,6 +89,14 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
                 tape.set_len(tape.metadata().unwrap().len() + 1).unwrap();
                 source_path.join("member/file")
             }
+            EndChange::HintExtent => {
+                hints.set_len(hints.metadata().unwrap().len() + 1).unwrap();
+                source_path.join("member/file")
+            }
+            EndChange::HintKey => {
+                hints.write_all_at(&[0; 32], 32).unwrap();
+                source_path.join("member/file")
+            }
             EndChange::Cancel => {
                 cancelled.store(true, Ordering::Release);
                 source_path.join("member/file")
@@ -102,7 +119,7 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
                 matches!(&error, RootedFsError::SourceBindingChanged(path) if path == Path::new("member")),
                 "{error}"
             ),
-            EndChange::TapeExtent => assert!(
+            EndChange::TapeExtent | EndChange::HintExtent | EndChange::HintKey => assert!(
                 matches!(&error, RootedFsError::Io(error) if error.kind() == io::ErrorKind::InvalidData),
                 "{error}"
             ),
@@ -112,8 +129,11 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
             ),
         }
         // Removing the temporary fault cannot revive a partially checked batch.
-        if matches!(change, EndChange::Cancel) {
-            cancelled.store(false, Ordering::Release);
+        match change {
+            EndChange::Cancel => cancelled.store(false, Ordering::Release),
+            EndChange::HintExtent => hints.set_len(hints.metadata().unwrap().len() - 1).unwrap(),
+            EndChange::HintKey => hints.write_all_at(&original_hint, 32).unwrap(),
+            _ => {}
         }
         assert!(effects.validate_originals_blocking().is_err(), "{change:?}");
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
@@ -164,7 +184,7 @@ async fn census_authenticates_root_inverse_and_non_directory_state() {
                     bytes[0] = 0; // Genuine derived entry: not an original.
                     bytes[49..].fill(0);
                 }
-                _ => bytes = IndexRecord::Ordinal(key).encode(),
+                _ => bytes = IndexRecord::Epoch(0).encode(),
             }
             // Native signing isolates association/shape checks from BLAKE3.
             c.index.set_bytes(key, bytes).unwrap();

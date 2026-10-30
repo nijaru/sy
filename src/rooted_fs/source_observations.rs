@@ -387,6 +387,9 @@ impl Drop for SourceScanAttempt {
 pub(super) struct Catalogue {
     index: AuthenticatedIndex<{ index_record::RECORD_BYTES }>,
     file: File,
+    // Untrusted ordinal lookup candidates; only canonical index entries bind
+    // original ordinals. One held descriptor, never one resident key per entry.
+    original_hints: File,
     end: u64,
     healthy: bool,
     run: RunState,
@@ -410,6 +413,7 @@ impl Catalogue {
         Ok(Self {
             index: AuthenticatedIndex::new()?,
             file: tempfile::tempfile()?,
+            original_hints: tempfile::tempfile()?,
             end: 0,
             healthy: true,
             run: RunState::Usable,
@@ -490,10 +494,13 @@ impl Catalogue {
             return Err(RootedFsError::SourceCatalogueTerminal);
         }
         self.healthy = false;
+        self.check_scratch_extents()
+    }
+    fn check_scratch_extents(&self) -> Result<()> {
         if self.file.metadata()?.len() != self.end {
             return Err(invalid().into());
         }
-        Ok(())
+        self.check_original_hints()
     }
     fn index_record(&mut self, key: [u8; 32]) -> Result<Option<IndexRecord>> {
         self.index
@@ -578,14 +585,16 @@ impl Catalogue {
         Ok(())
     }
     fn insert(&mut self, key: [u8; 32], observation: &Observation) -> Result<()> {
+        let next_count = self.count.checked_add(1).ok_or_else(invalid)?;
+        next_count.checked_mul(32).ok_or_else(invalid)?;
+        self.check_original_hints()?;
+        // Candidate bytes may be written first: they cannot become original
+        // authority without the complete canonical write and count publication.
+        self.original_hints.write_all_at(&key, self.count * 32)?;
         self.append(
             key,
             observation,
             Some(inventory::OriginalState::new(self.count)),
-        )?;
-        self.set_index_record(
-            inventory::ordinal_key(self.count),
-            IndexRecord::Ordinal(key),
         )?;
         // Derived solely at original capture, before selection/omission. Late
         // enumeration never adopts a count or name into this authority.
@@ -594,7 +603,7 @@ impl Catalogue {
             parent.children = parent.children.checked_add(1).ok_or_else(invalid)?;
             self.set_original_state(observation.parent, parent)?;
         }
-        self.count = self.count.checked_add(1).ok_or_else(invalid)?;
+        self.count = next_count;
         Ok(())
     }
     fn require(&mut self, path: &Path) -> Result<Observation> {

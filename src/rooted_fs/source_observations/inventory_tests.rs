@@ -571,16 +571,16 @@ async fn batch_rejects_substituted_ordinal_and_inverse_mapping() {
         {
             let mut owner = rooted.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
-            // Deliberately construct authenticated but inconsistent mappings;
-            // authenticity alone cannot establish exact original membership.
+            // Neither an authenticated inconsistent ordinal nor an untrusted
+            // candidate substitution can establish exact original membership.
             if inverse {
                 let (key, _, _) = c.original_at(1).unwrap();
                 let mut entry = c.entry(key).unwrap().unwrap();
                 entry.original.as_mut().unwrap().ordinal = 2;
                 c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
             } else {
-                let reference = c.index.get_bytes(ordinal_key(2)).unwrap().unwrap();
-                c.index.set_bytes(ordinal_key(1), reference).unwrap();
+                let reference = c.original_hint(2).unwrap();
+                c.original_hints.write_all_at(&reference, 32).unwrap();
             }
         }
         assert!(inventory.validate_originals_blocking().is_err());
@@ -614,9 +614,7 @@ async fn canonical_original_replay_requires_both_associations_and_original_prese
             let (other, _, _) = c.original_at(2).unwrap();
             let mut entry = c.entry(key).unwrap().unwrap();
             match fault {
-                0 => c
-                    .set_index_record(ordinal_key(1), IndexRecord::Ordinal(other))
-                    .unwrap(),
+                0 => c.original_hints.write_all_at(&other, 32).unwrap(),
                 1 => {
                     entry.original.as_mut().unwrap().ordinal = 2;
                     c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
@@ -624,8 +622,7 @@ async fn canonical_original_replay_requires_both_associations_and_original_prese
                 2 => {
                     // Even a matching extra mapping cannot extend native count.
                     entry.original.as_mut().unwrap().ordinal = c.count;
-                    c.set_index_record(ordinal_key(c.count), IndexRecord::Ordinal(key))
-                        .unwrap();
+                    c.original_hints.write_all_at(&key, c.count * 32).unwrap();
                     c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
                 }
                 3 => {
@@ -638,7 +635,8 @@ async fn canonical_original_replay_requires_both_associations_and_original_prese
                 }
                 _ => c.set_index_record(key, IndexRecord::Epoch(0)).unwrap(),
             }
-            // These are native-signed inconsistent records, not hash failures.
+            // Canonical records are native-signed to isolate binding/shape
+            // checks. Candidate bytes are never signed or accepted as proof.
             let result = if named {
                 c.original_named(key).map(|_| ())
             } else {

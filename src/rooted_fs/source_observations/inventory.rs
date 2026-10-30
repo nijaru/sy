@@ -1,9 +1,11 @@
 //! Local original protection evidence, not byte, mutation or completion authority.
-//! The ordinal mapping shares the catalogue's authenticated index; no second
-//! observation owner or per-entry resident state is introduced.
+//! Ordinal candidates come from a held disk tape; only the freshly authenticated
+//! canonical entry owns the ordinal binding. No second observation authority.
 use super::*;
 mod census;
 mod empty;
+#[cfg(test)]
+mod hints_tests;
 mod protection;
 mod state;
 pub(super) use state::OriginalState;
@@ -40,12 +42,6 @@ pub(crate) struct SourceInventory {
     count: u64,
 }
 
-pub(super) fn ordinal_key(ordinal: u64) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"sy/source-observation/ordinal/v1\0");
-    hash.update(&ordinal.to_le_bytes());
-    *hash.finalize().as_bytes()
-}
 pub(super) fn state_key(domain: &[u8], key: [u8; 32]) -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"sy/source-observation/state/v1\0");
@@ -90,14 +86,25 @@ impl Catalogue {
         }
         Ok(())
     }
-    fn original_key(&mut self, ordinal: u64) -> Result<[u8; 32]> {
+    pub(super) fn check_original_hints(&self) -> Result<()> {
+        let end = self.count.checked_mul(32).ok_or_else(invalid)?;
+        if self.original_hints.metadata()?.len() != end {
+            return Err(invalid().into());
+        }
+        Ok(())
+    }
+
+    // A candidate is not a reference/proof. Callers must freshly authenticate
+    // the canonical entry and bind its immutable original ordinal before use.
+    fn original_hint(&self, ordinal: u64) -> Result<[u8; 32]> {
         if ordinal >= self.count {
             return Err(invalid().into());
         }
-        match self.index_record(ordinal_key(ordinal))? {
-            Some(IndexRecord::Ordinal(key)) => Ok(key),
-            _ => Err(invalid().into()),
-        }
+        self.check_original_hints()?;
+        let offset = ordinal.checked_mul(32).ok_or_else(invalid)?;
+        let mut key = [0; 32];
+        self.original_hints.read_exact_at(&mut key, offset)?;
+        Ok(key)
     }
 
     fn decode_original(
@@ -126,20 +133,20 @@ impl Catalogue {
         &mut self,
         ordinal: u64,
     ) -> Result<([u8; 32], Observation, OriginalState)> {
-        let key = self.original_key(ordinal)?;
+        let key = self.original_hint(ordinal)?;
         let entry = self.entry(key)?.ok_or_else(invalid)?;
         self.decode_original(key, ordinal, entry)
     }
 
     // In a native census the name is known first. Authenticate its canonical
-    // entry once, then the inverse ordinal association, before decoding names.
+    // entry once, then check that its ordinal's candidate is this same key.
     // The receipt lives only in this call; no observation/proof is cached.
     fn original_named(&mut self, key: [u8; 32]) -> Result<Option<(Observation, OriginalState)>> {
         let Some(entry) = self.entry(key)? else {
             return Ok(None);
         };
         let state = entry.original.ok_or_else(invalid)?;
-        if self.original_key(state.ordinal)? != key {
+        if self.original_hint(state.ordinal)? != key {
             return Err(invalid().into());
         }
         let (_, observation, state) = self.decode_original(key, state.ordinal, entry)?;
@@ -429,9 +436,7 @@ impl SourceInventory {
         c.check_inventory_root(&self.rooted)?;
         let result = validate(c);
         let value = c.native_result(result)?;
-        if c.file.metadata()?.len() != c.end {
-            return Err(invalid().into());
-        }
+        c.check_scratch_extents()?;
         c.check_inventory_root(&self.rooted)?;
         if self.rooted.source_path_continuity {
             owner.validate_original_operator(&self.rooted)?;

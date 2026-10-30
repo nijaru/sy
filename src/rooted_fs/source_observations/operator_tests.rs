@@ -1116,7 +1116,13 @@ async fn cancelled_run_cutoff_is_nonblocking_and_never_enables_successor() {
 
 #[tokio::test]
 async fn race_successor_rejects_corrupt_scratch_without_repair() {
-    for corruption in ["bytes", "truncate", "ordinal"] {
+    for corruption in [
+        "bytes",
+        "truncate",
+        "ordinal",
+        "hint-truncate",
+        "hint-extend",
+    ] {
         let fixture = tempfile::tempdir().unwrap();
         std::fs::write(fixture.path().join("file"), b"old").unwrap();
         let source = SourceRoot::open(fixture.path().to_path_buf())
@@ -1144,9 +1150,10 @@ async fn race_successor_rejects_corrupt_scratch_without_repair() {
                     c.file.write_all(&[255]).unwrap();
                 }
                 "truncate" => c.file.set_len(c.end - 1).unwrap(),
+                "hint-truncate" => c.original_hints.set_len(c.count * 32 - 1).unwrap(),
+                "hint-extend" => c.original_hints.set_len(c.count * 32 + 1).unwrap(),
                 "ordinal" => {
-                    c.set_index_record(inventory::ordinal_key(1), IndexRecord::Ordinal([0; 32]))
-                        .unwrap();
+                    c.original_hints.write_all_at(&[0; 32], 32).unwrap();
                 }
                 _ => unreachable!(),
             }

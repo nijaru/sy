@@ -1,5 +1,5 @@
 //! One canonical entry owns its observation locator and optional original state.
-//! Ordinals reference entry keys, never a second copy of either authority.
+//! Original ordinals are authenticated here, never by the candidate-key tape.
 use super::{invalid, inventory::OriginalState, Result};
 
 pub(super) const RECORD_BYTES: usize = 66;
@@ -13,7 +13,6 @@ pub(super) struct Entry {
 #[derive(Clone, Copy)]
 pub(super) enum IndexRecord {
     Entry(Entry),
-    Ordinal([u8; 32]),
     Epoch(u64),
     EmptyStamp([u8; 32]),
 }
@@ -28,10 +27,6 @@ impl IndexRecord {
                     bytes[0] = 1;
                     bytes[49..].copy_from_slice(&original.encode());
                 }
-            }
-            Self::Ordinal(key) => {
-                bytes[0] = 2;
-                bytes[1..33].copy_from_slice(&key);
             }
             Self::Epoch(epoch) => {
                 bytes[0] = 3;
@@ -59,10 +54,6 @@ impl IndexRecord {
                     },
                 }),
                 if tag == 1 { RECORD_BYTES } else { 49 },
-            ),
-            2 => (
-                Self::Ordinal(bytes[1..33].try_into().map_err(|_| invalid())?),
-                33,
             ),
             3 => (
                 Self::Epoch(u64::from_le_bytes(
@@ -133,7 +124,6 @@ mod tests {
                 0,
                 49,
             ),
-            (IndexRecord::Ordinal([8; 32]), 2, 33),
             (IndexRecord::Epoch(0x0807_0605_0403_0201), 3, 9),
             (IndexRecord::EmptyStamp([9; 32]), 4, 33),
         ];
@@ -145,7 +135,6 @@ mod tests {
                     assert_eq!(entry.locator, [7; 48]);
                     assert!(entry.original.is_none());
                 }
-                IndexRecord::Ordinal(key) => assert_eq!(key, [8; 32]),
                 IndexRecord::Epoch(epoch) => assert_eq!(epoch, 0x0807_0605_0403_0201),
                 IndexRecord::EmptyStamp(stamp) => assert_eq!(stamp, [9; 32]),
             }
@@ -160,7 +149,7 @@ mod tests {
             }
         }
         let mut bytes = [0; RECORD_BYTES];
-        for tag in 5..=255 {
+        for tag in std::iter::once(2).chain(5..=255) {
             bytes[0] = tag;
             assert!(IndexRecord::decode(bytes).is_err(), "tag {tag}");
         }

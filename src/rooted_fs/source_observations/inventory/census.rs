@@ -332,8 +332,8 @@ impl SourceInventory {
                     let child_path = path.join(&name);
                     validate_original_path(&child_path)?;
                     let child_key = key(parent_key, &name);
-                    // The entry and inverse ordinal are both freshly proved;
-                    // original_named reuses only this operation's canonical entry.
+                    // The canonical entry freshly proves the original ordinal;
+                    // its candidate must point back to this independently known key.
                     let Some((original, state)) = c.original_named(child_key)? else {
                         return Err(RootedFsError::SourceBindingChanged(child_path));
                     };
