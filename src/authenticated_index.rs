@@ -1,6 +1,6 @@
 //! Run-owned authenticated fixed-payload Merkle radix. The root and extent are native-owned RAM
-//! authority, never recovered from scratch. A compressed 16-way radix needs at
-//! most 64 branches per path, one FD, and storage proportional to distinct keys.
+//! authority, never recovered from scratch. A compressed 64-way radix needs at
+//! most 43 branches per path, one FD, and storage proportional to distinct keys.
 //! Updates overwrite authenticated ancestors: failure poisons the owner, keeps
 //! the old root, and permits neither rollback nor adoption of partial writes.
 //! This is runtime authentication, not a crash-durability/recovery format.
@@ -12,8 +12,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
-const LEVELS: usize = 64;
-const FANOUT: usize = 16;
+const DIGIT_BITS: usize = 6;
+const LEVELS: usize = 256usize.div_ceil(DIGIT_BITS);
+const FANOUT: usize = 1 << DIGIT_BITS;
+const BITMAP_BYTES: usize = FANOUT / 8;
 const BRANCH_HEADER_BYTES: usize = 2 + 32;
 const CHILD_BYTES: usize = 8 + 32;
 const BRANCH_BYTES: usize = BRANCH_HEADER_BYTES + FANOUT * CHILD_BYTES;
@@ -155,24 +157,33 @@ pub(crate) struct AuthenticatedIndex<const N: usize> {
     healthy: bool,
 }
 
-fn nibble(key: &[u8; 32], depth: usize) -> usize {
-    usize::from((key[depth / 2] >> (if depth.is_multiple_of(2) { 4 } else { 0 })) & 15)
+fn digit(key: &[u8; 32], depth: usize) -> usize {
+    let bit = depth * DIGIT_BITS;
+    let byte = bit / 8;
+    // The final digit has four key bits followed by two canonical zero bits.
+    let next = if byte + 1 < key.len() {
+        usize::from(key[byte + 1])
+    } else {
+        0
+    };
+    let pair = (usize::from(key[byte]) << 8) | next;
+    (pair >> (16 - DIGIT_BITS - bit % 8)) & (FANOUT - 1)
 }
 
 fn prefix(key: [u8; 32], depth: usize) -> [u8; 32] {
     let mut result = key;
-    if !depth.is_multiple_of(2) {
-        result[depth / 2] &= 0xf0;
+    let bits = (depth * DIGIT_BITS).min(key.len() * 8);
+    if !bits.is_multiple_of(8) {
+        result[bits / 8] &= 0xff << (8 - bits % 8);
     }
-    result[depth.div_ceil(2)..].fill(0);
+    result[bits.div_ceil(8)..].fill(0);
     result
 }
 
 fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
     const DOMAIN: &[u8] = b"sy/authenticated-index/v1\0";
-    // Every frame transcript fits in one BLAKE3 chunk; avoid incremental
-    // hashing state by assembling the same bounded transcript once.
-    let mut transcript = [0; DOMAIN.len() + BRANCH_BYTES + 2];
+    // Avoid incremental hashing state by assembling the bounded transcript once.
+    let mut transcript = [0; DOMAIN.len() + BRANCH_BYTES + BITMAP_BYTES];
     transcript[..DOMAIN.len()].copy_from_slice(DOMAIN);
     let length = if bytes[0] == 0 {
         // Empty slots have exactly one valid encoding. Authenticate their
@@ -180,8 +191,8 @@ fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
         // No child offset is used until the caller verifies this digest.
         let compact = &mut transcript[DOMAIN.len()..];
         compact[..BRANCH_HEADER_BYTES].copy_from_slice(&bytes[..BRANCH_HEADER_BYTES]);
-        let mut occupied = 0u16;
-        let mut end = BRANCH_HEADER_BYTES + 2;
+        let mut occupied = 0u64;
+        let mut end = BRANCH_HEADER_BYTES + BITMAP_BYTES;
         for (position, slot) in bytes[BRANCH_HEADER_BYTES..]
             .as_chunks::<CHILD_BYTES>()
             .0
@@ -198,8 +209,8 @@ fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
                 end += CHILD_BYTES;
             }
         }
-        compact[BRANCH_HEADER_BYTES..BRANCH_HEADER_BYTES + 2]
-            .copy_from_slice(&occupied.to_le_bytes());
+        compact[BRANCH_HEADER_BYTES..BRANCH_HEADER_BYTES + BITMAP_BYTES]
+            .copy_from_slice(&occupied.to_le_bytes()[..BITMAP_BYTES]);
         DOMAIN.len() + end
     } else {
         let end = DOMAIN.len() + bytes.len();
@@ -300,13 +311,16 @@ impl<const N: usize> AuthenticatedIndex<N> {
             return Err(invalid(StateError::Path));
         }
         let mut count = 0;
-        for slot in branch.slots {
+        for (position, slot) in branch.slots.iter().enumerate() {
             let mut offset = [0; 8];
             offset.copy_from_slice(&slot[..8]);
             let offset = u64::from_le_bytes(offset);
             if offset != EMPTY_OFFSET {
                 self.check_offset(offset, Self::RECORD_BYTES.min(BRANCH_BYTES))?;
-                if offset == locator.offset {
+                let padding = LEVELS * DIGIT_BITS - 256;
+                if offset == locator.offset
+                    || (usize::from(depth) == LEVELS - 1 && position & ((1 << padding) - 1) != 0)
+                {
                     return Err(invalid(StateError::Child));
                 }
                 count += 1;
@@ -333,7 +347,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
             let node = self.read(locator, &mut bytes)?;
             if let Some((depth, expected_prefix)) = parent {
                 if prefix(node.key(), usize::from(depth)) != expected_prefix
-                    || nibble(&node.key(), usize::from(depth)) != nibble(&key, usize::from(depth))
+                    || digit(&node.key(), usize::from(depth)) != digit(&key, usize::from(depth))
                     || matches!(node, ReadNode::Branch(branch) if branch.depth <= depth)
                 {
                     return Err(invalid(StateError::Path));
@@ -349,7 +363,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
                     steps += 1;
                     visit(locator, branch);
                     parent = Some((branch.depth, branch.prefix));
-                    cursor = branch.child(nibble(&key, usize::from(branch.depth)));
+                    cursor = branch.child(digit(&key, usize::from(branch.depth)));
                 }
                 _ => return Ok(Some((locator, node.into_owned()))),
             }
@@ -445,15 +459,15 @@ impl<const N: usize> AuthenticatedIndex<N> {
                 let new_leaf = self.write(offset, leaf, &mut end)?;
                 if let Some((old, node)) = terminal {
                     let depth = (0..LEVELS)
-                        .find(|&d| nibble(&key, d) != nibble(&node.key(), d))
+                        .find(|&d| digit(&key, d) != digit(&node.key(), d))
                         .ok_or_else(|| invalid(StateError::Path))?;
                     let mut branch = Branch {
                         depth: depth as u8,
                         prefix: prefix(key, depth),
                         children: [None; FANOUT],
                     };
-                    branch.children[nibble(&key, depth)] = Some(new_leaf.locator);
-                    branch.children[nibble(&node.key(), depth)] = Some(old);
+                    branch.children[digit(&key, depth)] = Some(new_leaf.locator);
+                    branch.children[digit(&node.key(), depth)] = Some(old);
                     let offset = end;
                     self.write(offset, Node::Branch(branch), &mut end)?
                 } else {
@@ -463,7 +477,7 @@ impl<const N: usize> AuthenticatedIndex<N> {
         };
         for step in proof.path[..proof.len].iter().rev() {
             let mut step = step.ok_or_else(|| invalid(StateError::Path))?;
-            step.branch.children[nibble(&key, usize::from(step.branch.depth))] =
+            step.branch.children[digit(&key, usize::from(step.branch.depth))] =
                 Some(updated.locator);
             updated = self.write(step.locator.offset, Node::Branch(step.branch), &mut end)?;
         }
