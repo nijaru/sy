@@ -16,20 +16,18 @@ impl Catalogue {
         if !self.scanning {
             return Err(invalid().into());
         }
-        let mut epoch = [0; 48];
-        epoch[..8].copy_from_slice(&self.epoch.to_le_bytes());
         let mut ordinal = 0;
         while ordinal < self.count {
             if !active() {
                 return Ok(false);
             }
             self.check_run()?;
-            let (parent_key, original) = self.original_at(ordinal)?;
+            let (parent_key, original, state) = self.original_at(ordinal)?;
             ordinal += 1;
             if original.named.kind != libc::S_IFDIR as u64 {
                 continue;
             }
-            let disposition = self.original_state(parent_key)?.directory;
+            let disposition = state.directory;
             if disposition == SourceDirectoryDisposition::Traversed {
                 continue;
             }
@@ -78,10 +76,10 @@ impl Catalogue {
                 validate_original_path(&child_path)?;
                 let child_key = key(parent_key, &name);
                 let seen_key = state_key(b"protection-seen", child_key);
-                if self.index.get_bytes(seen_key)? == Some(epoch) {
+                if self.epoch_at(seen_key)? == Some(self.epoch) {
                     return Err(self.changed(child_path));
                 }
-                self.index.set_bytes(seen_key, epoch)?;
+                self.set_index_record(seen_key, IndexRecord::Epoch(self.epoch))?;
                 let (observed, stat, _) = inspect_with_stat(
                     ResolutionRoot::Held(rooted.root_fd.as_raw_fd()),
                     directory.as_raw_fd(),

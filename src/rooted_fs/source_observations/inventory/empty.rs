@@ -120,19 +120,17 @@ impl Catalogue {
         {
             return Err(self.changed(path.to_path_buf()));
         }
-        let mut evidence = [0; 48];
-        evidence[..32].copy_from_slice(&stamp(before));
-        self.index
-            .set_bytes(state_key(b"empty", path_key(path)), evidence)?;
+        self.set_index_record(
+            state_key(b"empty", path_key(path)),
+            IndexRecord::EmptyStamp(stamp(before)),
+        )?;
         Ok(())
     }
 
     pub(super) fn empty_directory_stamp(&mut self, key: [u8; 32]) -> Result<Option<[u8; 32]>> {
-        match self.index.get_bytes(state_key(b"empty", key))? {
+        match self.index_record(state_key(b"empty", key))? {
             None => Ok(None),
-            Some(bytes) if bytes[32..] == [0; 16] => {
-                Ok(Some(bytes[..32].try_into().map_err(|_| invalid())?))
-            }
+            Some(IndexRecord::EmptyStamp(stamp)) => Ok(Some(stamp)),
             Some(_) => Err(invalid().into()),
         }
     }

@@ -79,37 +79,71 @@ pub(super) fn validate_original_path(path: &Path) -> Result<()> {
 
 impl Catalogue {
     pub(super) fn check_completed_traversal(&mut self) -> Result<()> {
-        let mut epoch = [0; 48];
-        epoch[..8].copy_from_slice(&self.epoch.to_le_bytes());
         for ordinal in 0..self.count {
-            let (key, original) = self.original_at(ordinal)?;
+            let (key, original, state) = self.original_at(ordinal)?;
             if original.effective.kind == libc::S_IFDIR as u64
-                && self.original_state(key)?.directory == SourceDirectoryDisposition::Traversed
-                && self.index.get_bytes(state_key(b"traversal", key))? != Some(epoch)
+                && state.directory == SourceDirectoryDisposition::Traversed
+                && self.epoch_at(state_key(b"traversal", key))? != Some(self.epoch)
             {
                 return Err(invalid().into());
             }
         }
         Ok(())
     }
-    pub(super) fn original_at(&mut self, ordinal: u64) -> Result<([u8; 32], Observation)> {
+    fn original_key(&mut self, ordinal: u64) -> Result<[u8; 32]> {
         if ordinal >= self.count {
             return Err(invalid().into());
         }
-        let locator = self
-            .index
-            .get_bytes(ordinal_key(ordinal))?
-            .ok_or_else(invalid)?;
-        let observation = self.read_locator(locator)?;
-        let key = if ordinal == 0 {
-            [0; 32]
-        } else {
-            key(observation.parent, &observation.name)
-        };
-        if self.index.get_bytes(key)? != Some(locator) {
+        match self.index_record(ordinal_key(ordinal))? {
+            Some(IndexRecord::Ordinal(key)) => Ok(key),
+            _ => Err(invalid().into()),
+        }
+    }
+
+    fn decode_original(
+        &self,
+        key: [u8; 32],
+        ordinal: u64,
+        entry: CatalogueEntry,
+    ) -> Result<([u8; 32], Observation, OriginalState)> {
+        let state = entry.original.ok_or_else(invalid)?;
+        if state.ordinal != ordinal {
             return Err(invalid().into());
         }
-        Ok((key, observation))
+        let observation = self.read_locator(entry.locator)?;
+        let actual = if ordinal == 0 {
+            [0; 32]
+        } else {
+            super::key(observation.parent, &observation.name)
+        };
+        if actual != key {
+            return Err(invalid().into());
+        }
+        Ok((key, observation, state))
+    }
+
+    pub(super) fn original_at(
+        &mut self,
+        ordinal: u64,
+    ) -> Result<([u8; 32], Observation, OriginalState)> {
+        let key = self.original_key(ordinal)?;
+        let entry = self.entry(key)?.ok_or_else(invalid)?;
+        self.decode_original(key, ordinal, entry)
+    }
+
+    // In a native census the name is known first. Authenticate its canonical
+    // entry once, then the inverse ordinal association, before decoding names.
+    // The receipt lives only in this call; no observation/proof is cached.
+    fn original_named(&mut self, key: [u8; 32]) -> Result<Option<(Observation, OriginalState)>> {
+        let Some(entry) = self.entry(key)? else {
+            return Ok(None);
+        };
+        let state = entry.original.ok_or_else(invalid)?;
+        if self.original_key(state.ordinal)? != key {
+            return Err(invalid().into());
+        }
+        let (_, observation, state) = self.decode_original(key, state.ordinal, entry)?;
+        Ok(Some((observation, state)))
     }
     /// The caller has just authenticated the first record. Replay its parents
     /// freshly, without loading and decoding that same record a second time.
@@ -153,7 +187,7 @@ impl Catalogue {
     }
 
     fn check_inventory_root(&mut self, rooted: &RootedFs) -> Result<()> {
-        let (_, root) = self.original_at(0)?;
+        let (_, root, _) = self.original_at(0)?;
         if !root
             .effective
             .same_binding(NativeObservation::from_stat(&stat_fd(
@@ -181,9 +215,8 @@ impl Catalogue {
 
     fn validate_original_records(&mut self, rooted: &RootedFs) -> Result<()> {
         for ordinal in 0..self.count {
-            let (key, original) = self.original_at(ordinal)?;
+            let (key, original, _) = self.original_at(ordinal)?;
             let path = self.original_path(key, &original)?;
-            self.check_original_ordinal(ordinal, key)?;
             let result = self.validate_native_binding(rooted, &path, true);
             self.native_result(result)?;
             #[cfg(test)]
@@ -211,9 +244,8 @@ impl RootedFs {
         // Authenticate the exact original set before making a sealed view.
         // This is bounded replay, not checksum adoption from scratch.
         for ordinal in 0..catalogue.count {
-            let (key, original) = catalogue.original_at(ordinal)?;
+            let (key, original, _) = catalogue.original_at(ordinal)?;
             catalogue.original_path(key, &original)?;
-            catalogue.original_state(key)?;
         }
         catalogue.sealed = true;
         let count = catalogue.count;
@@ -248,11 +280,10 @@ impl RootedFs {
             state.directory = SourceDirectoryDisposition::Traversed;
             catalogue.set_original_state(key, state)?;
         }
-        let mut epoch = [0; 48];
-        epoch[..8].copy_from_slice(&catalogue.epoch.to_le_bytes());
-        catalogue
-            .index
-            .set_bytes(state_key(b"traversal", key), epoch)?;
+        catalogue.set_index_record(
+            state_key(b"traversal", key),
+            IndexRecord::Epoch(catalogue.epoch),
+        )?;
         catalogue.healthy = true;
         Ok(())
     }
@@ -281,8 +312,8 @@ impl SourceInventory {
         let proof = if catalogue.scope == Some(SourceRootProtection::SelectedLeafAnchor)
             && self.count == 2
         {
-            let (_, root) = catalogue.original_at(0)?;
-            let (key, leaf) = catalogue.original_at(1)?;
+            let (_, root, _) = catalogue.original_at(0)?;
+            let (key, leaf, _) = catalogue.original_at(1)?;
             if root.object_key != object_key(self.rooted.root_fd.as_raw_fd(), None)? {
                 return Err(catalogue.changed(PathBuf::new()));
             }
@@ -360,7 +391,7 @@ impl SourceInventory {
             if c.scope != Some(SourceRootProtection::Tree) {
                 return Ok(false);
             }
-            let (_, root) = c.original_at(0)?;
+            let (_, root, _) = c.original_at(0)?;
             let Some(source) = root.object_key else {
                 return Ok(false);
             };

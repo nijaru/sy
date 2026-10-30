@@ -131,9 +131,10 @@ async fn census_end_barriers_precede_private_creation_and_remain_terminal() {
 )]
 #[tokio::test]
 async fn census_authenticates_root_inverse_and_non_directory_state() {
-    // Independently exercise the inverse, disposition and both ends of the
-    // reserved region, including state on an original that is not a directory.
-    for (ordinal, byte) in [(0, 0), (1, 16), (1, 17), (1, 47)] {
+    // Independently exercise the inverse, non-directory disposition, missing
+    // original state, and a valid record from the wrong namespace. Actual
+    // variant padding is exhaustively checked by the index-record codec tests.
+    for (ordinal, fault) in [(0, 0), (1, 1), (1, 2), (1, 3)] {
         let fixture = tempfile::tempdir().unwrap();
         let source_path = fixture.path().join("source");
         let destination = fixture.path().join("destination");
@@ -154,13 +155,19 @@ async fn census_authenticates_root_inverse_and_non_directory_state() {
         {
             let mut owner = inventory.rooted.source_observations.lock().unwrap();
             let c = owner.active().unwrap();
-            let (key, _) = c.original_at(ordinal).unwrap();
-            let mut bytes = c.original_state(key).unwrap().encode();
-            bytes[byte] = 42;
-            // Authenticated but inconsistent state is not membership evidence.
-            c.index
-                .set_bytes(state_key(b"original", key), bytes)
-                .unwrap();
+            let (key, _, _) = c.original_at(ordinal).unwrap();
+            let mut bytes = c.index.get_bytes(key).unwrap().unwrap();
+            match fault {
+                0 => bytes[49] = 42, // Original ordinal, after tag and locator.
+                1 => bytes[65] = 42, // Invalid disposition on a FILE original.
+                2 => {
+                    bytes[0] = 0; // Genuine derived entry: not an original.
+                    bytes[49..].fill(0);
+                }
+                _ => bytes = IndexRecord::Ordinal(key).encode(),
+            }
+            // Native signing isolates association/shape checks from BLAKE3.
+            c.index.set_bytes(key, bytes).unwrap();
         }
         assert!(matches!(
             inventory.excludes_objects_blocking(&[candidate], SourceExclusion::Objects),

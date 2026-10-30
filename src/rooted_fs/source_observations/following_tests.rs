@@ -320,10 +320,10 @@ async fn sibling_chain_spilled_hops_are_authenticated_before_replay() {
         let mut owner = rooted.source_observations.lock().unwrap();
         let c = owner.active().unwrap();
         let locator = c
-            .index
-            .get_bytes(path_key(Path::new("first")))
+            .entry(path_key(Path::new("first")))
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .locator;
         let offset = u64::from_le_bytes(locator[..8].try_into().unwrap());
         let observation = c.require(Path::new("first")).unwrap();
         let bytes = observation.encode();

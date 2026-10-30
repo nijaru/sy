@@ -256,7 +256,7 @@ impl SourceInventory {
                 c.validate_original_records(&self.rooted)?;
                 return Ok(false);
             }
-            let (_, root) = c.original_at(0)?;
+            let (_, root, _) = c.original_at(0)?;
             let Some(view) = root.object_key else {
                 c.validate_original_records(&self.rooted)?;
                 return Ok(false);
@@ -266,9 +266,8 @@ impl SourceInventory {
             // discovery is not enumeration or closure of an opaque subtree.
             let mut qualified = true;
             for ordinal in 0..c.count {
-                let (original_key, original) = c.original_at(ordinal)?;
+                let (original_key, original, state) = c.original_at(ordinal)?;
                 c.original_path(original_key, &original)?;
-                let state = c.check_original_ordinal(ordinal, original_key)?;
                 let physical = if original.followed {
                     c.qualifies_follow_resolution(&original)?
                         && match original.followed_object_key {
@@ -301,12 +300,11 @@ impl SourceInventory {
             let mut seen = SeenOriginals::new(c.count)?;
             let mut total = 0u64;
             for ordinal in 0..c.count {
-                let (parent_key, parent) = c.original_at(ordinal)?;
+                let (parent_key, parent, state) = c.original_at(ordinal)?;
                 if parent.named.kind != libc::S_IFDIR as u64 {
                     continue;
                 }
                 let path = c.original_path(parent_key, &parent)?;
-                let state = c.original_state(parent_key)?;
                 let expected = state.children;
                 if state.directory == SourceDirectoryDisposition::Opaque {
                     // Native attributes do not require opening the omitted
@@ -334,23 +332,12 @@ impl SourceInventory {
                     let child_path = path.join(&name);
                     validate_original_path(&child_path)?;
                     let child_key = key(parent_key, &name);
-                    // Resolve membership before decoding the payload, so the
-                    // ordinal and name-key mappings authenticate one read of
-                    // the original rather than decoding the same record twice.
-                    let Some(state) = c.index.get_bytes(state_key(b"original", child_key))? else {
-                        // A new native child is a SOURCE race; a missing inverse
-                        // for an existing original is catalogue corruption.
-                        return Err(if c.get(child_key)?.is_none() {
-                            RootedFsError::SourceBindingChanged(child_path)
-                        } else {
-                            invalid().into()
-                        });
+                    // The entry and inverse ordinal are both freshly proved;
+                    // original_named reuses only this operation's canonical entry.
+                    let Some((original, state)) = c.original_named(child_key)? else {
+                        return Err(RootedFsError::SourceBindingChanged(child_path));
                     };
-                    let ordinal = OriginalState::decode(state)?.ordinal;
-                    let (original_key, original) = c.original_at(ordinal)?;
-                    if original_key != child_key {
-                        return Err(invalid().into());
-                    }
+                    let ordinal = state.ordinal;
                     if original.parent != parent_key || original.name != name {
                         return Err(RootedFsError::SourceBindingChanged(child_path));
                     }
@@ -396,7 +383,7 @@ impl SourceInventory {
             // A held cursor must not hide a directory moved out during census:
             // close its original parent/name binding after all enumeration too.
             for ordinal in 1..c.count {
-                let (key, original) = c.original_at(ordinal)?;
+                let (key, original, _) = c.original_at(ordinal)?;
                 if !seen.contains(key, ordinal)? {
                     return Err(invalid().into());
                 }

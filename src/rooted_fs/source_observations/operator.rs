@@ -298,7 +298,7 @@ pub(in crate::rooted_fs) fn acquire(
     let start = catalogue.end;
     let count = records.len() as u64;
     for (ordinal, record) in records.iter().enumerate() {
-        catalogue.append(record_key(ordinal as u64), record)?;
+        catalogue.append(record_key(ordinal as u64), record, None)?;
     }
     drop(records);
     catalogue.operator = Some(OriginalAddress {
@@ -412,7 +412,11 @@ impl Catalogue {
         let mut previous = [0; 32];
         for ordinal in 0..count {
             let key = record_key(ordinal);
-            let locator = self.index.get_bytes(key)?.ok_or_else(invalid)?;
+            let entry = self.entry(key)?.ok_or_else(invalid)?;
+            if entry.original.is_some() {
+                return Err(invalid().into());
+            }
+            let locator = entry.locator;
             let record_offset = u64::from_le_bytes(locator[..8].try_into().map_err(|_| invalid())?);
             let length = u64::from_le_bytes(locator[8..16].try_into().map_err(|_| invalid())?);
             offset = offset.checked_add(length).ok_or_else(invalid)?;
@@ -1073,9 +1077,8 @@ impl RootedFs {
                 return Err(invalid().into());
             }
             for ordinal in 0..original.count {
-                let (key, observation) = original.original_at(ordinal)?;
+                let (key, observation, _) = original.original_at(ordinal)?;
                 original.original_path(key, &observation)?;
-                original.check_original_ordinal(ordinal, key)?;
             }
             original.replay_address(self, data)?
         } else {
@@ -1126,7 +1129,7 @@ impl RootedFs {
                 record.named = observed;
                 record.effective = observed;
             }
-            next.append(key, &record)?;
+            next.append(key, &record, None)?;
         }
         next.operator = Some(OriginalAddress {
             cwd,

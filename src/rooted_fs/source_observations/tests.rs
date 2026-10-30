@@ -205,10 +205,10 @@ async fn catalogue_corruption_and_truncation_poison_real_read_callers() {
                 catalogue.file.set_len(catalogue.end - 1).unwrap();
             } else {
                 let locator = catalogue
-                    .index
-                    .get_bytes(path_key(Path::new("file")))
+                    .entry(path_key(Path::new("file")))
                     .unwrap()
-                    .unwrap();
+                    .unwrap()
+                    .locator;
                 let offset = u64::from_le_bytes(locator[..8].try_into().unwrap());
                 catalogue.file.seek(SeekFrom::Start(offset)).unwrap();
                 catalogue.file.write_all(&[99]).unwrap();

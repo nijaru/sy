@@ -31,7 +31,9 @@ const MAX_RECORD: usize = 32
 use super::local_source_effects::native_object::{object_key, NativeObjectKey};
 
 mod following;
+mod index_record;
 use following::{inspect_file, same_resolution, ResolutionRoot, ResolutionStep};
+use index_record::{Entry as CatalogueEntry, IndexRecord};
 pub(super) mod inventory;
 pub(super) mod operator;
 use inventory::SourceRootProtection;
@@ -338,7 +340,7 @@ impl SourceScanAttempt {
         let catalogue = owner.active()?;
         catalogue.begin()?;
         let expected = match catalogue.selected {
-            Some(key) => u64::from(catalogue.index.get_bytes(key)?.is_some()),
+            Some(key) => u64::from(catalogue.entry(key)?.is_some()),
             None => catalogue
                 .count
                 .checked_sub(1)
@@ -383,7 +385,7 @@ impl Drop for SourceScanAttempt {
 }
 
 pub(super) struct Catalogue {
-    index: AuthenticatedIndex<48>,
+    index: AuthenticatedIndex<{ index_record::RECORD_BYTES }>,
     file: File,
     end: u64,
     healthy: bool,
@@ -493,11 +495,35 @@ impl Catalogue {
         }
         Ok(())
     }
+    fn index_record(&mut self, key: [u8; 32]) -> Result<Option<IndexRecord>> {
+        self.index
+            .get_bytes(key)?
+            .map(IndexRecord::decode)
+            .transpose()
+    }
+    fn set_index_record(&mut self, key: [u8; 32], record: IndexRecord) -> Result<()> {
+        self.index.set_bytes(key, record.encode())?;
+        Ok(())
+    }
+    fn entry(&mut self, key: [u8; 32]) -> Result<Option<CatalogueEntry>> {
+        match self.index_record(key)? {
+            None => Ok(None),
+            Some(IndexRecord::Entry(entry)) => Ok(Some(entry)),
+            Some(_) => Err(invalid().into()),
+        }
+    }
+    fn epoch_at(&mut self, key: [u8; 32]) -> Result<Option<u64>> {
+        match self.index_record(key)? {
+            None => Ok(None),
+            Some(IndexRecord::Epoch(epoch)) => Ok(Some(epoch)),
+            Some(_) => Err(invalid().into()),
+        }
+    }
     fn get(&mut self, key: [u8; 32]) -> Result<Option<Observation>> {
-        let Some(locator) = self.index.get_bytes(key)? else {
+        let Some(entry) = self.entry(key)? else {
             return Ok(None);
         };
-        self.read_locator(locator).map(Some)
+        self.read_locator(entry.locator).map(Some)
     }
     fn read_locator(&self, locator: [u8; 48]) -> Result<Observation> {
         let offset = u64::from_le_bytes(locator[..8].try_into().map_err(|_| invalid())?);
@@ -513,7 +539,12 @@ impl Catalogue {
         }
         Ok(Observation::decode(&bytes)?)
     }
-    fn append(&mut self, key: [u8; 32], observation: &Observation) -> Result<[u8; 48]> {
+    fn append(
+        &mut self,
+        key: [u8; 32],
+        observation: &Observation,
+        original: Option<inventory::OriginalState>,
+    ) -> Result<()> {
         let bytes = observation.encode();
         if bytes.len() > MAX_RECORD {
             return Err(invalid().into());
@@ -530,15 +561,23 @@ impl Catalogue {
         if self.index.get_bytes(key)?.is_some() {
             return Err(invalid().into());
         }
-        self.index.set_bytes(key, locator)?;
+        self.set_index_record(
+            key,
+            IndexRecord::Entry(CatalogueEntry { locator, original }),
+        )?;
         self.end = end;
-        Ok(locator)
+        Ok(())
     }
     fn insert(&mut self, key: [u8; 32], observation: &Observation) -> Result<()> {
-        let locator = self.append(key, observation)?;
-        self.index
-            .set_bytes(inventory::ordinal_key(self.count), locator)?;
-        self.set_original_state(key, inventory::OriginalState::new(self.count))?;
+        self.append(
+            key,
+            observation,
+            Some(inventory::OriginalState::new(self.count)),
+        )?;
+        self.set_index_record(
+            inventory::ordinal_key(self.count),
+            IndexRecord::Ordinal(key),
+        )?;
         // Derived solely at original capture, before selection/omission. Late
         // enumeration never adopts a count or name into this authority.
         if self.count != 0 {
@@ -952,12 +991,10 @@ impl RootedFs {
             return Err(invalid().into());
         }
         let seen_key = inventory::state_key(b"seen", path_key(path));
-        let mut epoch = [0; 48];
-        epoch[..8].copy_from_slice(&catalogue.epoch.to_le_bytes());
-        if catalogue.index.get_bytes(seen_key)? == Some(epoch) {
+        if catalogue.epoch_at(seen_key)? == Some(catalogue.epoch) {
             return Err(invalid().into());
         }
-        catalogue.index.set_bytes(seen_key, epoch)?;
+        catalogue.set_index_record(seen_key, IndexRecord::Epoch(catalogue.epoch))?;
         catalogue.seen = catalogue.seen.checked_add(1).ok_or_else(invalid)?;
         catalogue.healthy = true;
         Ok(())

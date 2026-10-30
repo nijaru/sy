@@ -293,7 +293,8 @@ async fn absolute_qualification_cannot_adopt_a_fresh_native_view_over_the_origin
     // fresh equality must never replace the original authority.
     original.object_key.as_mut().unwrap().0[16] ^= 1;
     let bytes = original.encode();
-    let mut locator = c.index.get_bytes([0; 32]).unwrap().unwrap();
+    let mut entry = c.entry([0; 32]).unwrap().unwrap();
+    let locator = &mut entry.locator;
     assert_eq!(
         bytes.len() as u64,
         u64::from_le_bytes(locator[8..16].try_into().unwrap())
@@ -302,7 +303,8 @@ async fn absolute_qualification_cannot_adopt_a_fresh_native_view_over_the_origin
         .write_all_at(&bytes, u64::from_le_bytes(locator[..8].try_into().unwrap()))
         .unwrap();
     locator[16..].copy_from_slice(blake3::hash(&bytes).as_bytes());
-    c.index.set_bytes([0; 32], locator).unwrap();
+    c.set_index_record([0; 32], IndexRecord::Entry(entry))
+        .unwrap();
     let address = LinkTarget::new(fixture.path().as_os_str());
     assert!(matches!(
         c.qualify_absolute_root(&rooted, &address, Path::new("entry")),

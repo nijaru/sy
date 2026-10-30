@@ -1145,8 +1145,7 @@ async fn race_successor_rejects_corrupt_scratch_without_repair() {
                 }
                 "truncate" => c.file.set_len(c.end - 1).unwrap(),
                 "ordinal" => {
-                    c.index
-                        .set_bytes(inventory::ordinal_key(1), [0; 48])
+                    c.set_index_record(inventory::ordinal_key(1), IndexRecord::Ordinal([0; 32]))
                         .unwrap();
                 }
                 _ => unreachable!(),

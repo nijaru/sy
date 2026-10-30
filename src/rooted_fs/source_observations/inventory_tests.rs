@@ -13,13 +13,13 @@ fn details(
 ) {
     let mut owner = inventory.rooted.source_observations.lock().unwrap();
     let catalogue = owner.active().unwrap();
-    let (key, original) = catalogue.original_at(ordinal).unwrap();
+    let (key, original, state) = catalogue.original_at(ordinal).unwrap();
     let path = catalogue.original_path(key, &original).unwrap();
     let root = (ordinal == 0).then_some(catalogue.scope.unwrap());
     let directory = if original.effective.kind == libc::S_IFDIR as u64
         && root != Some(SourceRootProtection::SelectedLeafAnchor)
     {
-        Some(catalogue.original_state(key).unwrap().directory)
+        Some(state.directory)
     } else {
         None
     };
@@ -124,14 +124,14 @@ async fn followed_data_object_key_is_authenticated_and_cannot_be_repaired() {
     let (offset, byte) = {
         let mut owner = inventory.rooted.source_observations.lock().unwrap();
         let c = owner.active().unwrap();
-        let (key, leaf) = c.original_at(1).unwrap();
+        let (key, leaf, _) = c.original_at(1).unwrap();
         let object = leaf.followed_object_key.unwrap();
         let bytes = leaf.encode();
         let position = bytes
             .windows(32)
             .position(|bytes| bytes == object.0)
             .unwrap();
-        let locator = c.index.get_bytes(key).unwrap().unwrap();
+        let locator = c.entry(key).unwrap().unwrap().locator;
         let offset = u64::from_le_bytes(locator[..8].try_into().unwrap()) + position as u64;
         let byte = bytes[position];
         c.file.write_all_at(&[byte ^ 1], offset).unwrap();
@@ -348,7 +348,7 @@ async fn original_path_reuse_authenticates_parents_after_member_read() {
         let c = owner.active().unwrap();
         let path = Path::new("parent/file");
         let original = c.require(path).unwrap();
-        let locator = c.index.get_bytes(path_key(ancestor)).unwrap().unwrap();
+        let locator = c.entry(path_key(ancestor)).unwrap().unwrap().locator;
         let offset = u64::from_le_bytes(locator[..8].try_into().unwrap());
         // The supplied FILE is already authenticated; that must not stand in
         // for freshly authenticated parents, including the terminating ROOT.
@@ -376,10 +376,10 @@ async fn scratch_extent_authentication_and_exact_replay_remain_terminal() {
                 1 => catalogue.file.set_len(catalogue.end + 1).unwrap(),
                 2 => {
                     let locator = catalogue
-                        .index
-                        .get_bytes(path_key(Path::new("file")))
+                        .entry(path_key(Path::new("file")))
                         .unwrap()
-                        .unwrap();
+                        .unwrap()
+                        .locator;
                     let offset = u64::from_le_bytes(locator[..8].try_into().unwrap());
                     catalogue.file.seek(SeekFrom::Start(offset)).unwrap();
                     catalogue.file.write_all(&[99]).unwrap();
@@ -574,13 +574,13 @@ async fn batch_rejects_substituted_ordinal_and_inverse_mapping() {
             // Deliberately construct authenticated but inconsistent mappings;
             // authenticity alone cannot establish exact original membership.
             if inverse {
-                let (key, _) = c.original_at(1).unwrap();
-                let mut wrong = c.original_state(key).unwrap();
-                wrong.ordinal = 2;
-                c.set_original_state(key, wrong).unwrap();
+                let (key, _, _) = c.original_at(1).unwrap();
+                let mut entry = c.entry(key).unwrap().unwrap();
+                entry.original.as_mut().unwrap().ordinal = 2;
+                c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
             } else {
-                let locator = c.index.get_bytes(ordinal_key(2)).unwrap().unwrap();
-                c.index.set_bytes(ordinal_key(1), locator).unwrap();
+                let reference = c.index.get_bytes(ordinal_key(2)).unwrap().unwrap();
+                c.index.set_bytes(ordinal_key(1), reference).unwrap();
             }
         }
         assert!(inventory.validate_originals_blocking().is_err());
@@ -588,6 +588,67 @@ async fn batch_rejects_substituted_ordinal_and_inverse_mapping() {
             inventory.validate_originals_blocking(),
             Err(RootedFsError::SourceCatalogueTerminal)
         ));
+    }
+}
+
+#[tokio::test]
+async fn canonical_original_replay_requires_both_associations_and_original_presence() {
+    for named in [false, true] {
+        for fault in 0..6 {
+            let fixture = tempfile::tempdir().unwrap();
+            for name in ["a", "b"] {
+                std::fs::write(fixture.path().join(name), b"SOURCE").unwrap();
+            }
+            let rooted = source_scan(fixture.path(), false, Default::default()).await;
+            rooted.seal_source_inventory_blocking().unwrap();
+            let mut owner = rooted.source_observations.lock().unwrap();
+            let c = owner.active().unwrap();
+            let (key, original, state) = c.original_at(1).unwrap();
+            let (observed, observed_state) = c.original_named(key).unwrap().unwrap();
+            assert_eq!(observed.name, original.name);
+            assert_eq!(observed_state.ordinal, state.ordinal);
+            assert!(c
+                .original_named(path_key(Path::new("unknown")))
+                .unwrap()
+                .is_none());
+            let (other, _, _) = c.original_at(2).unwrap();
+            let mut entry = c.entry(key).unwrap().unwrap();
+            match fault {
+                0 => c
+                    .set_index_record(ordinal_key(1), IndexRecord::Ordinal(other))
+                    .unwrap(),
+                1 => {
+                    entry.original.as_mut().unwrap().ordinal = 2;
+                    c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
+                }
+                2 => {
+                    // Even a matching extra mapping cannot extend native count.
+                    entry.original.as_mut().unwrap().ordinal = c.count;
+                    c.set_index_record(ordinal_key(c.count), IndexRecord::Ordinal(key))
+                        .unwrap();
+                    c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
+                }
+                3 => {
+                    entry.locator = c.entry(other).unwrap().unwrap().locator;
+                    c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
+                }
+                4 => {
+                    entry.original = None;
+                    c.set_index_record(key, IndexRecord::Entry(entry)).unwrap();
+                }
+                _ => c.set_index_record(key, IndexRecord::Epoch(0)).unwrap(),
+            }
+            // These are native-signed inconsistent records, not hash failures.
+            let result = if named {
+                c.original_named(key).map(|_| ())
+            } else {
+                c.original_at(1).map(|_| ())
+            };
+            assert!(
+                matches!(result, Err(RootedFsError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData),
+                "named={named}, fault={fault}: expected corrupt-catalogue rejection"
+            );
+        }
     }
 }
 
@@ -697,16 +758,16 @@ async fn derived_child_count_corruption_cannot_be_resealed_or_adopted() {
                 c.index.file.seek(SeekFrom::Start(0)).unwrap();
                 c.index.file.read_to_end(&mut bytes).unwrap();
                 let mut needle = vec![1]; // authenticated radix leaf tag
-                needle.extend_from_slice(&state_key(b"original", [0; 32]));
-                needle.extend_from_slice(&0u64.to_le_bytes()); // root ordinal
-                needle.extend_from_slice(&1u64.to_le_bytes()); // original children
+                needle.extend_from_slice(&[0; 32]); // canonical root entry key
+                needle.extend_from_slice(&c.index.get_bytes([0; 32]).unwrap().unwrap());
                 let offset = bytes
                     .windows(needle.len())
                     .position(|window| window == needle.as_slice())
                     .unwrap();
                 // Change only the derived original child count, keeping extent
                 // and every observation payload intact. Never mint a digest.
-                c.index.file.write_at(&[0], (offset + 41) as u64).unwrap();
+                // Leaf header33 + entry tag1 + locator48 + ordinal8.
+                c.index.file.write_at(&[0], (offset + 90) as u64).unwrap();
             }
         }
         assert!(inventory
@@ -775,9 +836,10 @@ async fn allocation_and_private_metadata_authenticate_root_state_and_tape_extent
                 let mut owner = source_rooted.source_observations.lock().unwrap();
                 let c = owner.active().unwrap();
                 if inverse {
-                    let mut state = c.original_state([0; 32]).unwrap();
-                    state.ordinal = 42;
-                    c.set_original_state([0; 32], state).unwrap();
+                    let mut entry = c.entry([0; 32]).unwrap().unwrap();
+                    entry.original.as_mut().unwrap().ordinal = 42;
+                    c.set_index_record([0; 32], IndexRecord::Entry(entry))
+                        .unwrap();
                 } else {
                     c.file.set_len(c.end + 1).unwrap();
                 }
